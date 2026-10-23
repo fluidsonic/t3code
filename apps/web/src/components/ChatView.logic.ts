@@ -77,6 +77,10 @@ import {
 } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { threadHasStarted } from "../lib/chatThreadActions";
+import {
+  TYPE_TO_FOCUS_EDITABLE_SELECTOR,
+  TYPE_TO_FOCUS_INTERACTIVE_SELECTOR,
+} from "./chat/composerFocusRedirect";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
 import {
@@ -1144,6 +1148,15 @@ export function hasServerAcknowledgedLocalDispatch(input: {
   );
 }
 
+/** A press on one of these chose its own focus target, e.g. a menu that takes focus a frame later. */
+export function isFocusTakingPressTarget(target: Pick<Element, "closest">): boolean {
+  return (
+    target.closest(
+      `${TYPE_TO_FOCUS_EDITABLE_SELECTOR},${TYPE_TO_FOCUS_INTERACTIVE_SELECTOR},[tabindex]:not([tabindex="-1"]),[aria-haspopup]`,
+    ) !== null
+  );
+}
+
 // Window return puts the caret in the composer unless focus or a selection is deliberate: another
 // text field, a terminal, an open dialog, menu, or popup, a region, timeline, or sidebar row reached
 // from the keyboard, a region with its own keys (aria-keyshortcuts), or selected text the composer
@@ -1153,7 +1166,9 @@ export function shouldRefocusComposerOnWindowFocus(
     | (Pick<Element, "tagName" | "closest" | "getAttribute"> & { isContentEditable?: boolean })
     | null,
   selection: Pick<Selection, "isCollapsed"> | null,
+  pressedFocusTakingTarget: boolean,
 ): boolean {
+  if (pressedFocusTakingTarget) return false;
   if (selection !== null && !selection.isCollapsed) return false;
   if (activeElement === null || activeElement.tagName === "BODY") return true;
   if (
