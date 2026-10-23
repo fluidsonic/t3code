@@ -63,6 +63,9 @@ export const installPreviewEventForwarding = Effect.fn(
   yield* manager.subscribeFindResults((event) =>
     electronWindow.sendAll(IpcChannels.PREVIEW_FIND_RESULT_CHANNEL, event),
   );
+  yield* manager.subscribeTabShortcuts((event) =>
+    electronWindow.sendAll(IpcChannels.PREVIEW_TAB_SHORTCUT_CHANNEL, event),
+  );
 });
 
 const setForwardedShortcuts = DesktopIpc.makeIpcMethod({

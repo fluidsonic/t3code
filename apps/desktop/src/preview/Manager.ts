@@ -14,6 +14,7 @@ import type {
   DesktopPreviewFavicon,
   DesktopPreviewFindResultEvent,
   DesktopPreviewOpenLinkEvent,
+  DesktopPreviewTabShortcutEvent,
   DesktopPreviewPointerEvent,
   PreviewAnnotationPayload,
   PreviewAnnotationRect,
@@ -26,6 +27,7 @@ import type {
   PreviewForwardedShortcut,
   PreviewAutomationLoadError,
 } from "@t3tools/contracts";
+import { PREVIEW_TAB_SHORTCUT_COMMANDS } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { matchesKeybindingShortcut } from "@t3tools/shared/keybindings";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
@@ -439,6 +441,12 @@ type RecordingInputListener = (event: DesktopPreviewRecordingInputEvent) => Effe
 type PointerEventListener = (event: DesktopPreviewPointerEvent) => Effect.Effect<void>;
 
 type OpenLinkListener = (event: DesktopPreviewOpenLinkEvent) => Effect.Effect<void>;
+type TabShortcutListener = (event: DesktopPreviewTabShortcutEvent) => Effect.Effect<void>;
+
+const isTabShortcutCommand = (
+  command: string,
+): command is DesktopPreviewTabShortcutEvent["command"] =>
+  (PREVIEW_TAB_SHORTCUT_COMMANDS as ReadonlyArray<string>).includes(command);
 
 type FindResultListener = (event: DesktopPreviewFindResultEvent) => Effect.Effect<void>;
 
@@ -574,6 +582,40 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const resolvedArtifactDirectory = path.resolve(artifactDirectory);
 
   let forwardedShortcuts: ReadonlyArray<PreviewForwardedShortcut> = [];
+  // Mirrors the zoom accelerators in DesktopApplicationMenu; a key added there belongs here too.
+  const isAppZoomChord = (input: Electron.Input) =>
+    input.type === "keyDown" &&
+    (hostPlatform === "darwin" ? input.meta : input.control) &&
+    !input.alt &&
+    (["=", "+", "-", "0"].includes(input.key) ||
+      ["Numpad0", "NumpadAdd", "NumpadSubtract"].includes(input.code));
+  const findForwardedShortcut = (keys: Parameters<typeof matchesKeybindingShortcut>[0]) =>
+    // On Windows and Linux, Ctrl+Alt is AltGr, which types characters rather than shortcuts.
+    !(
+      hostPlatform !== "darwin" &&
+      keys.ctrlKey &&
+      keys.altKey &&
+      /^(?:[^a-zA-Z0-9]|Dead)$/u.test(keys.key)
+    )
+      ? forwardedShortcuts.find(({ shortcut }) =>
+          matchesKeybindingShortcut(
+            keys,
+            shortcut,
+            hostPlatform === "darwin" ? "MacIntel" : hostPlatform,
+          ),
+        )
+      : undefined;
+  const findForwardedInputShortcut = (input: Electron.Input) =>
+    input.type === "keyDown" && !input.isComposing
+      ? findForwardedShortcut({
+          key: input.key,
+          code: input.code,
+          metaKey: input.meta,
+          ctrlKey: input.control,
+          shiftKey: input.shift,
+          altKey: input.alt,
+        })
+      : undefined;
   const annotationThemeRef = yield* Ref.make(DEFAULT_ANNOTATION_THEME);
   const annotationSendEnabled = new Map<string, boolean>();
   const mainWindowRef = yield* Ref.make<Option.Option<BrowserWindow>>(Option.none());
@@ -583,6 +625,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const pointerEventListenersRef = yield* Ref.make<ReadonlySet<PointerEventListener>>(new Set());
   const openLinkListenersRef = yield* Ref.make<ReadonlySet<OpenLinkListener>>(new Set());
   const findResultListenersRef = yield* Ref.make<ReadonlySet<FindResultListener>>(new Set());
+  const tabShortcutListenersRef = yield* Ref.make<ReadonlySet<TabShortcutListener>>(new Set());
   const recordingInputListenersRef = yield* Ref.make<ReadonlySet<RecordingInputListener>>(
     new Set(),
   );
@@ -850,7 +893,13 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   });
 
   const deliverEvent = (
-    eventKind: "state-change" | "recording-input" | "pointer-event" | "open-link" | "find-result",
+    eventKind:
+      | "state-change"
+      | "recording-input"
+      | "pointer-event"
+      | "open-link"
+      | "find-result"
+      | "tab-shortcut",
     tabId: string,
     delivery: () => Effect.Effect<void>,
   ) =>
@@ -1535,51 +1584,31 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         syncMenuShortcuts(window.webContents, input);
       });
     };
-    const findForwardedShortcut = (keys: Parameters<typeof matchesKeybindingShortcut>[0]) =>
-      !(
-        hostPlatform !== "darwin" &&
-        keys.ctrlKey &&
-        keys.altKey &&
-        /^(?:[^a-zA-Z0-9]|Dead)$/u.test(keys.key)
-      ) &&
-      forwardedShortcuts.find(({ shortcut }) =>
-        matchesKeybindingShortcut(
-          keys,
-          shortcut,
-          hostPlatform === "darwin" ? "MacIntel" : hostPlatform,
-        ),
-      );
     const beforeInput = (event: Electron.Event, input: Electron.Input): void => {
       syncMenuShortcuts(wc, input);
       const host = wc.hostWebContents;
       const forwarded =
-        input.type === "keyDown" &&
-        !input.isComposing &&
-        host &&
-        !host.isDestroyed() &&
-        holdsKeyboardFocus(wc) &&
-        findForwardedShortcut({
-          key: input.key,
-          code: input.code,
-          metaKey: input.meta,
-          ctrlKey: input.control,
-          shiftKey: input.shift,
-          altKey: input.alt,
-        });
+        host && !host.isDestroyed() && holdsKeyboardFocus(wc)
+          ? findForwardedInputShortcut(input)
+          : undefined;
       if (forwarded && host) {
         // The page keeps these keys. Only the main-frame preload can report one it
         // left unhandled, so a focused iframe (e.g. Google Docs' input) keeps its own find or zoom.
         if (PAGE_FIRST_FORWARDED_COMMANDS.has(forwarded.command)) return;
         event.preventDefault();
-        if (!input.isAutoRepeat) {
-          if (
-            forwarded.command === "workspace.focusNext" ||
-            forwarded.command === "workspace.focusPrevious" ||
-            forwarded.command === "preview.focusUrl"
-          ) {
-            // DOM focus in the renderer cannot by itself release the guest's native keyboard focus.
-            host.focus();
-          }
+        if (input.isAutoRepeat) return;
+        if (
+          forwarded.command === "workspace.focusNext" ||
+          forwarded.command === "workspace.focusPrevious" ||
+          forwarded.command === "preview.focusUrl"
+        ) {
+          // DOM focus in the renderer cannot by itself release the guest's native keyboard focus.
+          host.focus();
+        }
+        // These act on this tab, which the app cannot tell from a menu action.
+        if (isTabShortcutCommand(forwarded.command)) {
+          runFork(emitTabShortcut({ tabId, command: forwarded.command }));
+        } else {
           host.send(MENU_ACTION_CHANNEL, forwarded.command);
         }
         return;
@@ -1601,7 +1630,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       if (Option.isNone(keys)) return;
       const forwarded = findForwardedShortcut(keys.value);
       if (!forwarded || !PAGE_FIRST_FORWARDED_COMMANDS.has(forwarded.command)) return;
-      host.send(MENU_ACTION_CHANNEL, forwarded.command);
+      if (isTabShortcutCommand(forwarded.command)) {
+        runFork(emitTabShortcut({ tabId, command: forwarded.command }));
+      } else {
+        host.send(MENU_ACTION_CHANNEL, forwarded.command);
+      }
     };
     yield* Scope.addFinalizer(
       scope,
@@ -3060,6 +3093,27 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
               });
             }
             pipWebContents.on("did-finish-load", onDidFinishLoad);
+            // A macOS panel does not become the key window when clicked, so its keys would
+            // keep going to the main window.
+            pipWebContents.on("input-event", (_event, input) => {
+              if (input.type === "mouseDown" && !pictureInPictureWindow.isFocused()) {
+                pictureInPictureWindow.focus();
+              }
+            });
+            // The window shows this tab's page, so its tab shortcuts act on the tab;
+            // the app menu would otherwise take them, e.g. zooming the main window.
+            pipWebContents.on("before-input-event", (event, input) => {
+              const forwarded = findForwardedInputShortcut(input);
+              if (forwarded && isTabShortcutCommand(forwarded.command)) {
+                event.preventDefault();
+                if (!input.isAutoRepeat) {
+                  runFork(emitTabShortcut({ tabId, command: forwarded.command }));
+                }
+              } else if (isAppZoomChord(input)) {
+                // e.g. Cmd+Shift+=, or a zoom key the person unbound from the tab.
+                event.preventDefault();
+              }
+            });
           },
         ).pipe(
           Effect.onError(() =>
@@ -3479,6 +3533,16 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     );
   });
 
+  const emitTabShortcut = Effect.fn("PreviewManager.emitTabShortcut")(function* (
+    event: DesktopPreviewTabShortcutEvent,
+  ) {
+    const listeners = yield* Ref.get(tabShortcutListenersRef);
+    yield* Effect.forEach(
+      listeners,
+      (listener) => deliverEvent("tab-shortcut", event.tabId, () => listener(event)),
+      { discard: true },
+    );
+  });
   const emitOpenLink = Effect.fn("PreviewManager.emitOpenLink")(function* (
     event: DesktopPreviewOpenLinkEvent,
   ) {
@@ -3522,6 +3586,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         Ref.set(pointerEventListenersRef, new Set()),
         Ref.set(openLinkListenersRef, new Set()),
         Ref.set(findResultListenersRef, new Set()),
+        Ref.set(tabShortcutListenersRef, new Set()),
         Ref.set(recordingInputListenersRef, new Set()),
       ],
       { discard: true },
@@ -3574,6 +3639,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     subscribeOpenLinks: (listener: OpenLinkListener) => subscribe(openLinkListenersRef, listener),
     subscribeFindResults: (listener: FindResultListener) =>
       subscribe(findResultListenersRef, listener),
+    subscribeTabShortcuts: (listener: TabShortcutListener) =>
+      subscribe(tabShortcutListenersRef, listener),
     subscribeRecordingInputs: (listener: RecordingInputListener) =>
       subscribe(recordingInputListenersRef, listener),
     subscribeStateChanges: (listener: Listener) => subscribe(listenersRef, listener),
@@ -3829,6 +3896,9 @@ export class PreviewManager extends Context.Service<
     readonly subscribeFindResults: (
       listener: FindResultListener,
     ) => Effect.Effect<void, never, Scope.Scope>;
+    readonly subscribeTabShortcuts: (
+      listener: TabShortcutListener,
+    ) => Effect.Effect<void, never, Scope.Scope>;
     readonly subscribeRecordingInputs: (
       listener: RecordingInputListener,
     ) => Effect.Effect<void, never, Scope.Scope>;
@@ -3982,6 +4052,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     subscribePointerEvents: operations.subscribePointerEvents,
     subscribeOpenLinks: operations.subscribeOpenLinks,
     subscribeFindResults: operations.subscribeFindResults,
+    subscribeTabShortcuts: operations.subscribeTabShortcuts,
     subscribeRecordingInputs: operations.subscribeRecordingInputs,
   });
 }).pipe(Effect.withSpan("PreviewManager.make"));
