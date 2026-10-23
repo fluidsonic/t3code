@@ -123,6 +123,7 @@ export const PREVIEW_STATE_CHANGE_CHANNEL = "desktop:preview-state-change";
 export const PREVIEW_POINTER_EVENT_CHANNEL = "desktop:preview-pointer-event";
 export const PREVIEW_OPEN_LINK_CHANNEL = "desktop:preview-open-link";
 export const PREVIEW_FIND_RESULT_CHANNEL = "desktop:preview-find-result";
+export const PREVIEW_TAB_SHORTCUT_CHANNEL = "desktop:preview-tab-shortcut";
 
 export const MAC_PERMISSION_HELPER_CHANNEL = "desktop:mac-permission-helper";
 
