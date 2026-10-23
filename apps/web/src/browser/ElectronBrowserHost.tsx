@@ -1,8 +1,10 @@
 import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
   AuthPreviewOperateScope,
+  DEFAULT_PREVIEW_ZOOM_FACTOR,
   type DesktopPreviewBridge,
   type DesktopPreviewOpenLinkEvent,
+  type DesktopPreviewTabShortcutEvent,
   type EnvironmentId,
   FILL_PREVIEW_VIEWPORT,
 } from "@t3tools/contracts";
@@ -23,6 +25,7 @@ import {
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { previewEnvironment } from "~/state/preview";
 import { useEnvironmentScope } from "~/state/session";
+import { zoomPreviewTab } from "~/components/preview/previewTabZoom";
 
 import { readPreviewAnnotationTheme } from "./annotationTheme";
 import { useBrowserDefaults } from "./browserDefaults";
@@ -109,7 +112,28 @@ function openLinkInPreview({ tabId, url, background }: DesktopPreviewOpenLinkEve
   });
 }
 
-/** App-lifetime listeners for the desktop preview bridge: annotation theme, agent pointer, links. */
+// The desktop names the tab whose page or separate preview window took the shortcut.
+function zoomTabFromShortcut({ tabId, command }: DesktopPreviewTabShortcutEvent): void {
+  const source = hostedBrowserSessions(
+    readActivePreviewSessions(),
+    appAtomRegistry.get(primaryEnvironmentIdAtom),
+  ).find((session) => session.runtimeTabId === tabId);
+  if (!source) return;
+  zoomPreviewTab(
+    {
+      threadRef: source.threadRef,
+      tabId: source.snapshot.tabId,
+      runtimeTabId: tabId,
+      serverZoomFactor:
+        source.snapshot.runtime === "server"
+          ? (source.snapshot.zoomFactor ?? DEFAULT_PREVIEW_ZOOM_FACTOR)
+          : null,
+    },
+    command === "preview.zoomIn" ? 1 : command === "preview.zoomOut" ? -1 : 0,
+  );
+}
+
+/** App-lifetime listeners for the desktop preview bridge: annotation theme, agent pointer, links, zoom keys. */
 export function startElectronBrowserHost(): () => void {
   const preview = window.desktopBridge?.preview;
   if (!preview) return () => {};
@@ -119,6 +143,7 @@ export function startElectronBrowserHost(): () => void {
       useBrowserPointerStore.getState().apply(event);
     }),
     preview.onOpenLink(openLinkInPreview),
+    preview.onTabShortcut(zoomTabFromShortcut),
   ];
   return () => {
     for (const dispose of disposers) dispose();
