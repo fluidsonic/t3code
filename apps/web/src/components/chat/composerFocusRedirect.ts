@@ -8,7 +8,7 @@ export const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   '[contenteditable="plaintext-only"]',
   '[role="textbox"]',
 ].join(",");
-const TYPE_TO_FOCUS_INTERACTIVE_SELECTOR = [
+export const TYPE_TO_FOCUS_INTERACTIVE_SELECTOR = [
   "button",
   "a[href]",
   "summary",
