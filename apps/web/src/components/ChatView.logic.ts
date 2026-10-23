@@ -72,6 +72,10 @@ import {
   type DraftThreadState,
 } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
+import {
+  TYPE_TO_FOCUS_EDITABLE_SELECTOR,
+  TYPE_TO_FOCUS_INTERACTIVE_SELECTOR,
+} from "./chat/composerFocusRedirect";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadShells, environmentThreadDetails } from "../state/threads";
 import { waitForAtomValue } from "../state/waitForAtomValue";
@@ -1165,11 +1169,22 @@ export function hasServerAcknowledgedLocalDispatch(input: {
   );
 }
 
+/** A press on one of these chose its own focus target, e.g. a menu that takes focus a frame later. */
+export function isFocusTakingPressTarget(target: Pick<Element, "closest">): boolean {
+  return (
+    target.closest(
+      `${TYPE_TO_FOCUS_EDITABLE_SELECTOR},${TYPE_TO_FOCUS_INTERACTIVE_SELECTOR},[tabindex]:not([tabindex="-1"]),[aria-haspopup]`,
+    ) !== null
+  );
+}
+
 export function shouldRefocusComposerOnWindowFocus(
   activeElement:
     | (Pick<Element, "tagName" | "closest" | "getAttribute"> & { isContentEditable?: boolean })
     | null,
+  pressedFocusTakingTarget: boolean,
 ): boolean {
+  if (pressedFocusTakingTarget) return false;
   if (activeElement === null || activeElement.tagName === "BODY") return true;
   if (
     activeElement.tagName === "INPUT" ||
