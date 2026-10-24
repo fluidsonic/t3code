@@ -2,3 +2,4 @@
 # One substring of the failing test's full name per line. A sync ignores only these failures.
 skips the primary native probe for cross-architecture Windows payloads
 DesktopLinuxUrlHandler theme icons
+excludes sandboxes reached through a symlink into the worktrees dir
