@@ -1,0 +1,4 @@
+# Tests that also fail on upstream main on this Mac (they pass in upstream CI on Linux).
+# One substring of the failing test's full name per line. A sync ignores only these failures.
+skips the primary native probe for cross-architecture Windows payloads
+DesktopLinuxUrlHandler theme icons
