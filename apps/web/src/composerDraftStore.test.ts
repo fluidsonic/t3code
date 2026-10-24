@@ -1,3 +1,4 @@
+import { composerDraftIsShellCommand } from "@t3tools/client-runtime/user-shell-command";
 import { PrimaryConnectionTarget } from "@t3tools/client-runtime/connection";
 import { createEnvironmentThreadShellAtoms } from "@t3tools/client-runtime/state/threads";
 import {
@@ -720,6 +721,106 @@ describe("composerDraftStore context persistence", () => {
       expect(draft?.terminalContexts).toEqual([terminal]);
       expect(draft?.previewAnnotations).toEqual([annotation]);
     }
+  });
+});
+
+describe("composerDraftStore shell mode", () => {
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("thread-shell"));
+  const draft = () => useComposerDraftStore.getState().getComposerDraft(threadRef);
+
+  const AVAILABLE = { shellCommandsAvailable: true } as const;
+
+  beforeEach(resetComposerDraftStore);
+
+  it("keeps `!` as typed prose where shell commands are unavailable", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "!");
+    store.setPrompt(threadRef, "!  urgent");
+    // Stored exactly as typed, as before shell commands: the spaces after `!` stay.
+    expect(draft()).toMatchObject({ prompt: "!  urgent" });
+    store.setPrompt(threadRef, "! urgent");
+    expect(draft()).toMatchObject({ prompt: "! urgent" });
+    expect(draft()?.shellMode).toBeUndefined();
+    // Its `!` was prose when typed, so edits once shell commands are available keep it prose.
+    store.setPrompt(threadRef, "! urgent fix", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+  });
+
+  it("keeps a command a command once shell commands become unavailable, until the `!` goes", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "!", AVAILABLE);
+    store.setPrompt(threadRef, "!git status");
+    expect(draft()).toMatchObject({ prompt: "!git status", shellMode: true });
+    store.setPrompt(threadRef, "git status");
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+    store.setPrompt(threadRef, "!git status");
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+  });
+
+  it("enters on a `!` in an empty composer and leaves when the `!` goes", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "!", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(true);
+    store.setPrompt(threadRef, "! git status", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(true);
+    store.setPrompt(threadRef, " git status", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+    // A `!` put in front of existing text stays prose.
+    store.setPrompt(threadRef, "! git status", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+  });
+
+  it("keeps a `!` the person turned back into prose until the `!` or the draft goes", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "!", AVAILABLE);
+    store.setPrompt(threadRef, "!", { shellMode: false });
+    store.setPrompt(threadRef, "!important", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+    store.clearComposerContent(threadRef);
+    store.setPrompt(threadRef, "!", AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(true);
+  });
+
+  it("keeps a command a command when context is added, which sending then refuses", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "! ls", AVAILABLE);
+    store.addThreadContexts(threadRef, [
+      threadContextRecord(scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("other")), "Other"),
+    ]);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(true);
+    expect(draft()!.threadContexts).toHaveLength(1);
+  });
+
+  it("keeps a `!` typed in front of a context reference as prose", () => {
+    const store = useComposerDraftStore.getState();
+    store.addThreadContexts(threadRef, [
+      threadContextRecord(scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("other")), "Other"),
+    ]);
+    store.setPrompt(threadRef, `!${draft()!.prompt}`, AVAILABLE);
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+  });
+
+  it("survives persistence", () => {
+    useComposerDraftStore.getState().setPrompt(threadRef, "! npm test", AVAILABLE);
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+    const state = merge(
+      JSON.parse(
+        JSON.stringify(partializeComposerDraftStoreState(useComposerDraftStore.getState())),
+      ),
+      useComposerDraftStore.getInitialState(),
+    );
+    expect(state.draftsByThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+      prompt: "!npm test",
+      shellMode: true,
+    });
+  });
+
+  it("drops the spaces after a command's `!`, which the composer draws as a gap", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "!  git status", AVAILABLE);
+    expect(draft()?.prompt).toBe("!git status");
+    store.setPrompt(threadRef, "! x", { shellMode: false });
+    expect(draft()?.prompt).toBe("! x");
   });
 });
 

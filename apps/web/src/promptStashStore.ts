@@ -26,8 +26,37 @@ const StashEntrySchema = Schema.Struct({
   unreadableImageNames: Schema.optionalKey(Schema.Array(Schema.String)),
   pendingImageCount: Schema.optionalKey(Schema.Number),
   records: Schema.optionalKey(ForwardCompatibleArray(ComposerContextRecord)),
+  /** `prompt` is a `! cmd` shell command, stored as `!cmd`. */
+  shellCommand: Schema.optionalKey(Schema.Boolean),
 });
 export type PromptStashEntry = typeof StashEntrySchema.Type;
+
+/**
+ * The prompt and mode after restoring a stash, or why it can't be. A command and prose never
+ * merge, since that would run the prose or send the command to the agent. A restored command
+ * stays one where shell commands are unavailable; the composer then blocks it.
+ */
+export function promptAfterStashRestore(input: {
+  readonly currentPrompt: string;
+  readonly currentShellMode: boolean;
+  readonly restoredPrompt: string;
+  readonly restoredShellCommand: boolean;
+}): { readonly prompt: string; readonly shellMode: boolean } | { readonly refused: string } {
+  const { currentPrompt, restoredPrompt } = input;
+  if (restoredPrompt.length === 0) {
+    return { prompt: currentPrompt, shellMode: input.currentShellMode };
+  }
+  if (currentPrompt.trim().length === 0) {
+    return { prompt: restoredPrompt, shellMode: input.restoredShellCommand };
+  }
+  if (input.restoredShellCommand) {
+    return { refused: "Clear the composer to restore this command." };
+  }
+  if (input.currentShellMode) {
+    return { refused: "Run or clear the command in the composer to restore this prompt." };
+  }
+  return { prompt: `${currentPrompt.replace(/\s+$/, "")}\n\n${restoredPrompt}`, shellMode: false };
+}
 
 const PersistedPromptStashState = Schema.Struct({
   entries: Schema.Array(StashEntrySchema),
