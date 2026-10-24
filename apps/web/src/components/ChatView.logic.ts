@@ -4,6 +4,7 @@ import {
   deriveThreadRuntime,
 } from "@t3tools/client-runtime/state/thread-execution";
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { shellCommandFromPrompt } from "@t3tools/shared/shellCommand";
 import {
   latestUnheldRun,
   usageLimitRunPresentedAsLatest,
@@ -752,6 +753,8 @@ export function deriveComposerSendState(options: {
   imageCount: number;
   terminalContexts: ReadonlyArray<TerminalContextDraft>;
   elementContextCount?: number;
+  /** The prompt is a `! cmd` shell command, which needs a command after its `!`. */
+  shellCommand?: boolean;
 }): {
   trimmedPrompt: string;
   sendableTerminalContexts: TerminalContextDraft[];
@@ -768,10 +771,12 @@ export function deriveComposerSendState(options: {
     sendableTerminalContexts,
     expiredTerminalContextCount,
     hasSendableContent:
-      trimmedPrompt.length > 0 ||
-      options.imageCount > 0 ||
-      sendableTerminalContexts.length > 0 ||
-      elementContextCount > 0,
+      options.shellCommand === true
+        ? shellCommandFromPrompt(options.prompt) !== null
+        : trimmedPrompt.length > 0 ||
+          options.imageCount > 0 ||
+          sendableTerminalContexts.length > 0 ||
+          elementContextCount > 0,
   };
 }
 

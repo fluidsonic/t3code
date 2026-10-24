@@ -118,6 +118,7 @@ async function beginChangedEdit(hook: { current: HookResult | null }) {
       runId: RUN,
       messageId: MessageId.make("message-1"),
       text: "original",
+      shellCommand: false,
       attachments: [],
     }),
   );

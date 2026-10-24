@@ -484,6 +484,9 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
       ? ["Response streaming"]
       : []),
+    ...(settings.enableShellCommands !== DEFAULT_UNIFIED_SETTINGS.enableShellCommands
+      ? ["Shell commands"]
+      : []),
     ...(settings.enableProviderUpdateChecks !== DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks
       ? ["Provider update checks"]
       : []),
@@ -606,6 +609,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
       snoozePresets: DEFAULT_UNIFIED_SETTINGS.snoozePresets,
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
+      enableShellCommands: DEFAULT_UNIFIED_SETTINGS.enableShellCommands,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       continueThreadsAfterServerUpdate: DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate,
       backgroundActivity: DEFAULT_UNIFIED_SETTINGS.backgroundActivity,
@@ -1105,6 +1109,34 @@ export function ChatSettingsPanel() {
                 ))}
               </SelectPopup>
             </Select>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          settingKeys={["enableShellCommands"]}
+          {...searchableSetting("shell-commands")}
+          description="Type ! into an empty composer to run a shell command in the thread's workspace and send its output to the agent. Commands run outside provider sandboxes and approvals."
+          resetAction={
+            settings.enableShellCommands !== DEFAULT_UNIFIED_SETTINGS.enableShellCommands ? (
+              <SettingResetButton
+                label="shell commands"
+                onClick={() =>
+                  updateSettings({
+                    enableShellCommands: DEFAULT_UNIFIED_SETTINGS.enableShellCommands,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["enableShellCommands"]}
+              checked={settings.enableShellCommands}
+              onCheckedChange={(checked) =>
+                updateSettings({ enableShellCommands: Boolean(checked) })
+              }
+              aria-label="Shell commands (beta)"
+            />
           }
         />
         <AdvancedSettings targetIds={[searchableSetting("skills-in-slash-menu").id]}>

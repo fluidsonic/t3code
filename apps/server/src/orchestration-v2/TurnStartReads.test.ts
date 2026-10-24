@@ -333,6 +333,23 @@ it.effect.each(["sqlite"] as const)(
         });
         assert.isFalse((yield* store.getTurnStartContext(threadId, runId)).hasConversation);
       }
+      // A shell command message counts as conversation, and only threads that have one can.
+      yield* store.apply({
+        id: EventId.make("event:thread:shell-commands"),
+        type: "thread.metadata-updated",
+        threadId,
+        occurredAt: now,
+        payload: { ...thread, hasShellCommands: true },
+      });
+      yield* store.apply({
+        id: EventId.make("shell-compact-input"),
+        type: "message.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: { ...message, text: "/compact", shellCommand: true },
+      });
+      assert.isTrue((yield* store.getTurnStartContext(threadId, runId)).hasConversation);
       const marker = {
         ...message,
         id: MessageId.make("old-compact"),

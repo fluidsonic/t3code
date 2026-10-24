@@ -148,6 +148,7 @@ import { editingQueuedMessageIdsAtom } from "./use-thread-outbox";
 import {
   completeQueuedMessageDelivery,
   prepareQueuedMessageAttachments,
+  queuedMessageServerContent,
   recoverEditedCreationAfterDelivery,
   removeAcknowledgedExistingThreadMessage,
   restoreRejectedQueuedMessage,
@@ -712,6 +713,62 @@ describe("thread outbox recovery rollback", () => {
     ).toEqual({ message: "rejected", messageId: message.messageId });
   });
 
+  it("brings a rejected `! cmd` back as a command in an empty composer", async () => {
+    const message = {
+      ...queuedMessage({ messageId: "message-command-restore", text: "npm test" }),
+      shellCommand: true,
+    };
+    const threadKey = `${message.environmentId}:${message.threadId}`;
+    await harness.manager.enqueue(message);
+
+    await expect(restoreRejectedQueuedMessage(message, "rejected")).resolves.toBe("restored");
+
+    expect(composerDrafts.getComposerDraftSnapshot(threadKey)).toMatchObject({
+      text: "!npm test",
+      shellMode: true,
+    });
+  });
+
+  it("reports a rejected Run all instead of putting one of its commands in the composer", async () => {
+    const message = {
+      ...queuedMessage({ messageId: "message-group-restore", text: "! npm test" }),
+      shellCommand: true,
+      followingShellCommands: [{ messageId: MessageId.make("message-group-next"), text: "! ls" }],
+    };
+    const threadKey = `${message.environmentId}:${message.threadId}`;
+    await harness.manager.enqueue(message);
+
+    await expect(restoreRejectedQueuedMessage(message, "rejected")).resolves.toBe("restored");
+
+    expect(composerDrafts.getComposerDraftSnapshot(threadKey).text).toBe("");
+    expect(remainingMessages()).toEqual([]);
+    expect(appAtomRegistry.get(threadComposerErrorsAtom)[threadKey]).toEqual({
+      message: "rejected",
+      messageId: message.messageId,
+    });
+  });
+
+  it("keeps a rejected message queued rather than joining it to a draft of the other kind", async () => {
+    const message = queuedMessage({ messageId: "message-onto-command", text: "fix the bug" });
+    const threadKey = `${message.environmentId}:${message.threadId}`;
+    appAtomRegistry.set(composerDrafts.composerDraftsAtom, {
+      [threadKey]: { text: "!ls", shellMode: true, attachments: [] },
+    });
+    await harness.manager.enqueue(message);
+
+    await expect(restoreRejectedQueuedMessage(message, "rejected")).resolves.toBe("blocked");
+
+    expect(composerDrafts.getComposerDraftSnapshot(threadKey)).toEqual({
+      text: "!ls",
+      shellMode: true,
+      attachments: [],
+    });
+    expect(remainingMessages()).toEqual([message]);
+    expect(appAtomRegistry.get(threadComposerErrorsAtom)[threadKey]?.messageId).toBe(
+      message.messageId,
+    );
+  });
+
   it("leaves no error when the restored text is resent before recovery finishes", async () => {
     const message = queuedMessage({ messageId: "message-resent", text: "resend me" });
     const threadKey = `${message.environmentId}:${message.threadId}`;
@@ -768,5 +825,39 @@ describe("thread outbox recovery rollback", () => {
     );
     expect(remainingMessages()).toEqual([]);
     expect(appAtomRegistry.get(threadComposerErrorsAtom)[draftKey]?.message).toBe("too large");
+  });
+});
+
+describe("queued message delivery payload", () => {
+  const context = {
+    version: 1 as const,
+    records: [
+      {
+        version: 1 as const,
+        kind: "skill" as const,
+        contextId: "skill-1",
+        label: "review",
+        name: "review",
+      },
+    ],
+  } as never;
+
+  it("delivers a `! cmd` exactly as typed, flagged as a command and without context", () => {
+    expect(
+      queuedMessageServerContent({
+        text: "git log --oneline [x](t3-context://v1/skill/skill-1)",
+        shellCommand: true,
+        context,
+      }),
+    ).toEqual({ text: "git log --oneline [x](t3-context://v1/skill/skill-1)", shellCommand: true });
+  });
+
+  it("serializes prose as before", () => {
+    expect(
+      queuedMessageServerContent({
+        text: "Run checks",
+        context: undefined,
+      }),
+    ).toEqual({ text: "Run checks" });
   });
 });

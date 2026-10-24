@@ -73,6 +73,8 @@ export interface ThreadLaunchInitialMessage {
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly senderThreadId?: ThreadId;
   readonly text: string;
+  /** Only a person's client launch sets it; the orchestrator refuses it from anyone else. */
+  readonly shellCommand?: boolean;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly context?: import("@t3tools/contracts").OrchestrationMessageContext | undefined;
 }
@@ -190,6 +192,9 @@ export class ThreadLaunchService extends Context.Service<
 >()("t3/orchestration-v2/ThreadLaunchService") {}
 
 const isThreadLaunchError = Schema.is(ThreadLaunchError);
+
+export const initialMessageCommandId = (launchCommandId: CommandId): CommandId =>
+  CommandId.make(`${launchCommandId}:initial-message`);
 
 function failureDetail(error: unknown): string {
   if (isThreadLaunchError(error)) {
@@ -943,7 +948,7 @@ const make = Effect.gen(function* () {
         let runId: RunId | null = null;
         let messageWasAlreadyAccepted = false;
         if (input.initialMessage !== undefined) {
-          const messageCommandId = CommandId.make(`${input.commandId}:initial-message`);
+          const messageCommandId = initialMessageCommandId(input.commandId);
           const messageReceipt = yield* readReceipt(input, messageCommandId);
           messageWasAlreadyAccepted = Option.isSome(messageReceipt);
           const messageId =
@@ -958,6 +963,7 @@ const make = Effect.gen(function* () {
               threadId,
               messageId,
               text: input.initialMessage.text,
+              ...(input.initialMessage.shellCommand === true ? { shellCommand: true } : {}),
               ...(input.initialMessage.scheduledTaskId === undefined
                 ? {}
                 : { scheduledTaskId: input.initialMessage.scheduledTaskId }),

@@ -183,7 +183,7 @@ import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { shortcutLabelForCommand } from "../keybindings";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
-import { toastManager } from "./ui/toast";
+import { stackedThreadToast, toastManager } from "./ui/toast";
 import { projectScriptIdFromCommand } from "~/projectScripts";
 import { newMessageId } from "~/lib/utils";
 import {
@@ -212,6 +212,7 @@ import {
 } from "../sidebarPendingFileDropStore";
 import {
   composerDraftHasUserContent,
+  composerTargetKey,
   type ComposerFileAttachment,
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
@@ -219,6 +220,9 @@ import {
   DraftId,
 } from "../composerDraftStore";
 import { type TerminalContextDraft } from "../lib/terminalContext";
+import { isRunningUserShellCommand } from "@t3tools/client-runtime/user-shell-command";
+import { shellCommandPrompt } from "@t3tools/shared/shellCommand";
+import type { CodeBlockShellActions } from "./chat/MarkdownCodeBlock.logic";
 import { collectInlineContextIds } from "../lib/composerContextReferences";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
@@ -266,6 +270,7 @@ import {
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { useCitedHistory } from "./chat/citationProcedure";
 import type { MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
+import { deriveUserShellCommandOwnsWorkingSlot } from "./chat/MessagesTimeline.logic";
 import { ThreadTimeline } from "./chat/ThreadTimeline";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
@@ -300,6 +305,9 @@ import {
   shouldShowThreadErrorBanner,
 } from "./chat/ThreadErrorBanner";
 import { QueuedRunsControl, type QueuedRunsControlHandle } from "./chat/QueuedRunsControl";
+import { ShellCommandsControl } from "./chat/ShellCommandsControl";
+import { useStoppedShellCommands } from "./chat/useStoppedShellCommands";
+import { shellCommandsUnavailableReason } from "./chat/useComposerShellMode";
 import { useThreadLinkedPullRequest } from "./pullRequest/useThreadLinkedPullRequest";
 import { useProactivePanels } from "../hooks/useProactivePanels";
 import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEntries";
@@ -336,7 +344,8 @@ import {
   codexArtifactTemplatePromptToAppend,
   shouldRefocusComposerOnWindowFocus,
 } from "./ChatView.logic";
-import { useLocalStorage } from "~/hooks/useLocalStorage";
+import { getLocalStorageItem, setLocalStorageItem, useLocalStorage } from "~/hooks/useLocalStorage";
+import { requestConfirmDialog } from "~/confirmDialog";
 import { useComposerHandleContext } from "../composerHandleContext";
 import { clampFileAttachmentUploadBytes } from "@t3tools/client-runtime/state/attachments";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -399,6 +408,8 @@ type ChatViewProps =
       routeKind: "draft";
       draftId: DraftId;
     };
+
+const SHELL_COMMAND_RUN_EXPLAINED_KEY = "t3code:shell-command-run-explained";
 
 export default function ChatView(props: ChatViewProps) {
   const {
@@ -1179,6 +1190,13 @@ export default function ChatView(props: ChatViewProps) {
   const pullRequestsCapabilityKnown = serverConfig !== null;
   const supportsPullRequests = serverConfig !== null;
   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
+  // New `! cmd` sends need terminal access and the environment's opt-in; commands already in the
+  // thread render and stop regardless.
+  const unavailableShellCommandsReason = shellCommandsUnavailableReason({
+    enabled: attachmentEnvironmentConfig?.settings.enableShellCommands === true,
+    canOperateTerminal,
+  });
+  const canRunShellCommands = unavailableShellCommandsReason === null;
   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
   const supportsQuestionAttachments = attachmentEnvironmentConfig !== null;
   const supportsAttachmentUploads = attachmentEnvironmentConfig !== null;
@@ -1259,7 +1277,13 @@ export default function ChatView(props: ChatViewProps) {
     canOperateThread &&
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
-  const phase = derivePhase(activeRuntime);
+  // A person's `! cmd` can run before the provider connects; that is work, not connecting.
+  const runtimePhase = derivePhase(activeRuntime);
+  const phase =
+    runtimePhase === "connecting" &&
+    (serverProjection?.turnItems ?? []).some(isRunningUserShellCommand)
+      ? "running"
+      : runtimePhase;
   const serverThreadId = serverThread?.id;
   const serverThreadEnvironmentId = serverThread?.environmentId;
   const setThreadError = makeThreadErrorSetter({
@@ -1394,6 +1418,10 @@ export default function ChatView(props: ChatViewProps) {
   const isCompacting =
     (isSendBusy || phase === "connecting" || phase === "running") &&
     (compactionRunning || (compactRequestIsActive && !compactionSettled));
+  const userShellCommandOwnsWorkingSlot = deriveUserShellCommandOwnsWorkingSlot({
+    projection: serverProjection,
+    optimisticMessages: optimisticUserMessages,
+  });
   const isWorking =
     phase === "running" || isSendBusy || isCompacting || runlessWorkStartedAt !== null;
   const activeContextWindow = deriveLatestContextWindowSnapshot(
@@ -1481,14 +1509,18 @@ export default function ChatView(props: ChatViewProps) {
     ...timelineEntriesInput,
     visibleTurnItems: serverTimelineRows,
   });
-  const draftTimelineEntries = optimisticUserMessages.map(
-    (message) =>
-      ({
-        id: message.id,
-        kind: "message",
-        createdAt: message.createdAt,
-        message,
-      }) as const,
+  // A command waits above the composer until its result reaches the agent.
+  const draftTimelineEntries = optimisticUserMessages.flatMap((message) =>
+    message.shellCommand === true
+      ? []
+      : [
+          {
+            id: message.id,
+            kind: "message",
+            createdAt: message.createdAt,
+            message,
+          } as const,
+        ],
   );
   const timelineEntries = isServerThread ? serverTimelineEntries : draftTimelineEntries;
   const timelineMessages = timelineEntries.flatMap((entry) =>
@@ -1742,6 +1774,40 @@ export default function ChatView(props: ChatViewProps) {
     composerRef.current?.focusAtEnd();
   };
   const focusComposerStable = useStableCallback(focusComposer);
+  /**
+   * Puts `command` into the composer as a command, if it still shows `target`'s draft and can run
+   * commands. A toast can call this after the person switched threads, began a queued edit, left
+   * the view, or lost shell commands; it then does nothing.
+   */
+  const placeUserShellCommand = (target: ScopedThreadRef | DraftId, command: string): boolean => {
+    if (
+      !canRunShellCommands ||
+      currentRouteThreadKeyRef.current === null ||
+      queuedRunEdit.isEditing ||
+      composerTargetKey(composerDraftTarget) !== composerTargetKey(target)
+    ) {
+      return false;
+    }
+    const store = useComposerDraftStore.getState();
+    const prompt = shellCommandPrompt(command);
+    store.clearComposerContent(target);
+    store.setPrompt(target, prompt, { shellMode: true });
+    promptRef.current = prompt;
+    composerRef.current?.resetCursorState({ cursor: prompt.length, prompt });
+    window.requestAnimationFrame(() => composerRef.current?.focusAtEnd());
+    return true;
+  };
+  const placeUserShellCommandStable = useStableCallback(placeUserShellCommand);
+  const stoppedShellCommands = useStoppedShellCommands({
+    environmentId,
+    composerDraftTarget,
+    composerAvailable: !queuedRunEdit.isEditing && canRunShellCommands,
+    placeInComposer: placeUserShellCommandStable,
+    canStopCommands: canOperateTerminal,
+  });
+  const returnStoppedShellCommandStable = useStableCallback(
+    stoppedShellCommands.returnStoppedCommand,
+  );
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
   const onInterrupt = async () => {
@@ -1750,6 +1816,8 @@ export default function ChatView(props: ChatViewProps) {
       !readEnvironmentScope(activeThread.environmentId, AuthOrchestrationOperateScope)
     )
       return;
+    // A person's commands alone stop as their own Stop would, with nothing sent to the agent.
+    if (stoppedShellCommands.stopCommandsInsteadOfThread(serverProjection)) return;
     const result = await interruptThreadTurn({
       environmentId,
       input: { threadId: activeThread.id },
@@ -1821,6 +1889,9 @@ export default function ChatView(props: ChatViewProps) {
     lastInvokedScriptByProjectId,
     runProjectScriptStable,
     runShellCommandStable,
+    editShellCommandInTerminalStable,
+    copyToVisibleTerminalStable,
+    canCopyToVisibleTerminalStable,
     splitPanelTerminalStable,
     splitPanelTerminalVerticalStable,
     toggleTerminalVisibilityStable,
@@ -1834,6 +1905,7 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadRef,
     activeProject,
     activeRightPanelSurface,
+    rightPanelOpen,
     runningTerminalIds,
     activeServerOrderedTerminalIds,
     activeTerminalLabelsById,
@@ -2707,7 +2779,7 @@ export default function ChatView(props: ChatViewProps) {
     activeEnvironmentUnavailable,
     defaultRuntimeMode,
   });
-  const { onSend } = useComposerSend({
+  const { onSend, runShellCommand: runUserShellCommand } = useComposerSend({
     environmentId,
     routeThreadKey,
     currentRouteThreadKeyRef,
@@ -2782,6 +2854,81 @@ export default function ChatView(props: ChatViewProps) {
     persistThreadSettingsForNextTurn,
   });
   const onImplementPlanInNewThreadStable = useStableCallback(onImplementPlanInNewThread);
+  const shellRunExplanationRef = useRef<Promise<boolean> | undefined>(undefined);
+  // A code block's button says only "Run", so the first run on this device says where the
+  // results go. Runs clicked before the answer wait for that one dialog.
+  const explainShellRunOnce = async () => {
+    try {
+      if (getLocalStorageItem(SHELL_COMMAND_RUN_EXPLAINED_KEY, Schema.Boolean) === true) {
+        return true;
+      }
+    } catch {}
+    shellRunExplanationRef.current ??= requestConfirmDialog(
+      "Run in this thread's workspace?\nCommands from code blocks run here, and their output is sent to the agent, which replies to it. You won't be asked again.",
+    )?.finally(() => {
+      shellRunExplanationRef.current = undefined;
+    });
+    const answer = await shellRunExplanationRef.current;
+    // Only an explanation that was shown counts as given.
+    try {
+      if (answer === true) {
+        setLocalStorageItem(SHELL_COMMAND_RUN_EXPLAINED_KEY, true, Schema.Boolean);
+      }
+    } catch {}
+    return answer !== false;
+  };
+  const runUserShellCommandStable = useStableCallback((command: string) => {
+    void runUserShellCommand([command], explainShellRunOnce);
+  });
+  const runUserShellCommandsStable = useStableCallback((commands: ReadonlyArray<string>) => {
+    void runUserShellCommand(commands, explainShellRunOnce);
+  });
+  // Edit-in-composer never discards a draft: it fills an empty composer, and otherwise asks
+  // before replacing what is there.
+  const editUserShellCommand = (command: string) => {
+    if (queuedRunEdit.isEditing) {
+      toastManager.add(
+        stackedThreadToast({ type: "info", title: "Finish editing the queued message first." }),
+      );
+      return;
+    }
+    const target = composerDraftTarget;
+    if (!composerDraftHasUserContent(useComposerDraftStore.getState().getComposerDraft(target))) {
+      placeUserShellCommand(target, command);
+      return;
+    }
+    const toastId = toastManager.add(
+      stackedThreadToast({
+        type: "info",
+        title: "The composer already has a draft",
+        description: "Replace it with this command?",
+        // Only on this thread, whose draft it would replace.
+        data: { threadRef: routeThreadRef },
+        actionProps: {
+          children: "Replace draft",
+          onClick: () => {
+            toastManager.close(toastId);
+            placeUserShellCommandStable(target, command);
+          },
+        },
+      }),
+    );
+  };
+  const editUserShellCommandStable = useStableCallback(editUserShellCommand);
+  // Without shell commands, code blocks keep only their one-click Run in terminal.
+  const codeBlockShellActions: CodeBlockShellActions | undefined = canRunShellCommands
+    ? {
+        runInTerminal: activeProject ? runShellCommandStable : undefined,
+        runCommand: canOperateThread && isServerThread ? runUserShellCommandStable : undefined,
+        runCommands: canOperateThread && isServerThread ? runUserShellCommandsStable : undefined,
+        editCommand: editUserShellCommandStable,
+        editInTerminal: activeProject ? editShellCommandInTerminalStable : undefined,
+        copyToTerminal: copyToVisibleTerminalStable,
+        canCopyToTerminal: canCopyToVisibleTerminalStable,
+      }
+    : activeProject
+      ? { runInTerminal: runShellCommandStable }
+      : undefined;
 
   const onWorktreeSetupWorkLocally = () => {
     if (!worktreeSetup || worktreeSetup.phase !== "running" || !draftId) {
@@ -2831,9 +2978,17 @@ export default function ChatView(props: ChatViewProps) {
       .some((id) => id !== "" && !previousIds.has(id));
     if (hasNewMessage && timelineLiveFollowEnabled) scrollToEnd(true);
   }, [routeThreadKey, pendingGuestMessageKey, timelineLiveFollowEnabled, scrollToEnd]);
-  const queuedRunsControl =
-    isServerThread && activeThread ? (
-      <>
+  // A new thread's draft shows only the command it is sending; it has nothing queued yet.
+  const queuedRunsControl = activeThread ? (
+    <>
+      <ShellCommandsControl
+        environmentId={activeThread.environmentId}
+        threadDetailRef={routeThreadDetailRef}
+        composerDraftTarget={composerDraftTarget}
+        optimisticMessages={optimisticUserMessages}
+        onStoppedRunningCommand={returnStoppedShellCommandStable}
+      />
+      {isServerThread ? (
         <QueuedRunsControl
           ref={queuedRunsControlRef}
           steerShortcutLabel={shortcutLabelForCommand(keybindings, "thread.steerQueuedMessage", {
@@ -2849,13 +3004,15 @@ export default function ChatView(props: ChatViewProps) {
           editBlockedReason={queuedRunEditBlockedReason({
             openQuestionCount: pendingUserInputs.length,
           })}
+          canEditShellCommands={canRunShellCommands}
           onEditQueuedRun={queuedRunEdit.beginEdit}
           onCancelEdit={queuedRunEdit.cancelEdit}
           timestampFormat={timestampFormat}
           onOpenThread={onOpenRelatedThreadStable}
         />
-      </>
-    ) : null;
+      ) : null}
+    </>
+  ) : null;
   const resendAfterWorkLocally = () => {
     setWorkLocallyResendDraftId(null);
     void onComposerSendStable();
@@ -3217,7 +3374,7 @@ export default function ChatView(props: ChatViewProps) {
                 citationRequest={citationRequest}
                 citationHistory={citationHistory}
                 onCiteAssistantText={citeAssistantTextStable}
-                {...(activeProject ? { onRunShellCommand: runShellCommandStable } : {})}
+                {...(codeBlockShellActions ? { codeBlockShellActions } : {})}
                 isWorking={isWorking}
                 runlessWorkActive={runlessWorkStartedAt !== null}
                 isCompacting={isCompacting}
@@ -3235,6 +3392,7 @@ export default function ChatView(props: ChatViewProps) {
                 }
                 activeTurnStartedAt={activeWorkStartedAt}
                 worktreeSetup={worktreeSetup}
+                userShellCommandOwnsWorkingSlot={userShellCommandOwnsWorkingSlot}
                 onCancelWorktreeSetup={onCancelWorktreeSetupStable}
                 retryableWorkspacePreparationRunIds={retryableWorkspacePreparationRunIds}
                 onRetryWorkspacePreparation={onRetryWorkspacePreparationStable}
@@ -3377,6 +3535,7 @@ export default function ChatView(props: ChatViewProps) {
                           {!composerMounted ? null : (
                             <ChatComposer
                               canOperateThread={canOperateThread}
+                              shellCommandsUnavailableReason={unavailableShellCommandsReason}
                               reportedModelSelection={reportedModelSelection}
                               multipleModelSelections={multipleModelSelections}
                               supportsMultipleModels={
@@ -3397,7 +3556,9 @@ export default function ChatView(props: ChatViewProps) {
                               activeThreadId={activeThreadId}
                               activeThread={activeThread}
                               activeThreadShell={activeThreadShell}
-                              promptHistoryMessages={timelineMessages}
+                              promptHistoryMessages={stoppedShellCommands.withStoppedCommands(
+                                timelineMessages,
+                              )}
                               forceExpandedOnMobile={
                                 forceExpandedMobileComposer && isDraftHeroState
                               }
@@ -3525,6 +3686,7 @@ export default function ChatView(props: ChatViewProps) {
                               onExpandImage={onExpandTimelineImageStable}
                               onFileOpen={openFileAttachmentStable}
                               editingQueuedAttachments={queuedRunEdit.editingAttachments}
+                              editingQueuedShellCommand={queuedRunEdit.isEditingShellCommand}
                               onRemoveEditingQueuedAttachment={
                                 queuedRunEdit.removeEditingAttachment
                               }

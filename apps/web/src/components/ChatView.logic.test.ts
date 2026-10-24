@@ -125,6 +125,22 @@ describe("deriveComposerSendState", () => {
     expect(state.expiredTerminalContextCount).toBe(1);
     expect(state.hasSendableContent).toBe(true);
   });
+
+  it("has nothing to send for a shell command without a command after its `!`", () => {
+    const send = (prompt: string, imageCount = 0) =>
+      deriveComposerSendState({ prompt, imageCount, terminalContexts: [], shellCommand: true })
+        .hasSendableContent;
+    expect(send("!")).toBe(false);
+    expect(send("!  ")).toBe(false);
+    // Attachments are refused when sending a command, so they don't make an empty one sendable.
+    expect(send("!", 1)).toBe(false);
+    expect(send("!ls")).toBe(true);
+    // The same `!` as prose is a message.
+    expect(
+      deriveComposerSendState({ prompt: "!", imageCount: 0, terminalContexts: [] })
+        .hasSendableContent,
+    ).toBe(true);
+  });
 });
 
 describe("hasServerAcknowledgedLocalDispatch", () => {

@@ -1,7 +1,22 @@
 import { useComposerAttachmentActions } from "./use-composer-attachment-actions";
 import * as Dialog from "../components/ui/Dialog";
-import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, AuthTerminalOperateScope } from "@t3tools/contracts";
+import {
+  isRunningUserShellCommand,
+  liveUserShellCommands,
+  stopComposerShellCommands,
+  userShellCommandOwnsWorkingSlot as deriveUserShellCommandOwnsWorkingSlot,
+} from "@t3tools/client-runtime/user-shell-command";
+import * as DateTime from "effect/DateTime";
+import {
+  SHELL_COMMAND_CONTENT_BLOCKED,
+  queuedShellCommandEditText,
+  resolveComposerShellSend,
+  shellCommandsDisabledReason,
+} from "../lib/composerShellCommand";
+import { shellCommandMessageText, shellCommandPrompt } from "@t3tools/shared/shellCommand";
 import { readEnvironmentScope } from "./session";
+import { readCanRunShellCommands } from "./shell-commands";
 import { useAtomValue } from "@effect/atom-react";
 import { threadRuntimeIsActive } from "@t3tools/client-runtime/state/shell";
 import type { ThreadCheckpointSummary } from "@t3tools/client-runtime/state/thread-checkpoints";
@@ -62,13 +77,17 @@ import {
 import {
   appendComposerDraftAttachments,
   insertComposerDraftContext,
+  rememberComposerDraftSelection,
   clearComposerDraft,
   clearComposerDraftContent,
+  ComposerDraftKindConflictError,
+  composerDraftIsBlank,
   composerContextImportsAtom,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   removeComposerDraftAttachment,
   scheduleUnusedComposerAttachmentCleanup,
+  returnStoppedShellCommandToDraft,
   setComposerDraftText,
   updateComposerDraftSettings,
   useComposerDraft,
@@ -101,7 +120,7 @@ import {
   useSelectedThreadVisibleTurnItems,
 } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
-import { enqueueThreadOutboxMessage } from "./thread-outbox";
+import { enqueueThreadOutboxMessage, threadOutboxManager } from "./thread-outbox";
 import { dispatchingQueuedMessageIdAtom, useThreadOutboxMessages } from "./use-thread-outbox";
 import { threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
@@ -110,6 +129,7 @@ const EMPTY_QUEUE_WORKFLOW_ATOM = Atom.make<null>(null).pipe(
   Atom.withLabel("mobile-thread-queue-workflow:empty"),
 );
 const EMPTY_CHECKPOINT_SUMMARIES_ATOM = Atom.make<ReadonlyArray<ThreadCheckpointSummary>>([]);
+const EMPTY_LIVE_SHELL_COMMANDS: ReturnType<typeof liveUserShellCommands> = [];
 
 export function appendReviewCommentToDraft(input: {
   readonly environmentId: EnvironmentId;
@@ -148,6 +168,17 @@ function activeComposerDraftKey(thread: {
   const threadKey = scopedThreadKey(thread.environmentId, thread.id);
   const edit = getQueuedRunEdit(threadKey);
   return edit === null ? threadKey : queuedEditDraftKey(threadKey, edit.runId);
+}
+
+/** Whether the thread's composer can send `! cmd`; never while editing a queued message's prose. */
+function composerCanRunShellCommands(thread: {
+  readonly environmentId: EnvironmentId;
+  readonly id: ThreadId;
+}): boolean {
+  const edit = getQueuedRunEdit(scopedThreadKey(thread.environmentId, thread.id));
+  return (
+    readCanRunShellCommands(thread.environmentId) && (edit === null || edit.shellCommand === true)
+  );
 }
 
 export function useThreadDraftForThread(input: {
@@ -203,6 +234,10 @@ export function useThreadComposerState() {
     label: "edit queued message",
     reportFailure: false,
   });
+  const stopUserShellCommand = useAtomCommand(
+    threadEnvironment.stopUserShellCommand,
+    "stop command",
+  );
   const [isSavingQueuedEdit, setIsSavingQueuedEdit] = useState(false);
   const savingQueuedEditRef = useRef(false);
 
@@ -315,6 +350,7 @@ export function useThreadComposerState() {
     const queuedCompact = selectedThreadQueuedMessages.some(
       (message) =>
         message.messageId === dispatchingQueuedMessageId &&
+        message.shellCommand !== true &&
         message.text.trim().toLowerCase() === "/compact" &&
         message.attachments.length === 0,
     );
@@ -333,6 +369,7 @@ export function useThreadComposerState() {
       ({ item }) =>
         item.runId === activeRunId &&
         item.type === "user_message" &&
+        item.shellCommand !== true &&
         item.text.trim().toLowerCase() === "/compact" &&
         item.attachments.length === 0,
     );
@@ -360,11 +397,18 @@ export function useThreadComposerState() {
     if (!selectedThreadShell) {
       return null;
     }
+    // A person's `! cmd` can run before the agent's turn starts; that is work too.
+    const runningShellCommand =
+      selectedThreadProjection?.projection.turnItems.find(isRunningUserShellCommand);
     return (
       resolveThreadWorkingStartedAt({
         latestRun: selectedThreadActivityRun,
         runtime: selectedThreadRuntime,
-      }) ?? runlessWorkStartedAt
+      }) ??
+      runlessWorkStartedAt ??
+      (runningShellCommand
+        ? DateTime.formatIso(runningShellCommand.startedAt ?? runningShellCommand.updatedAt)
+        : null)
     );
   })();
   const runlessWorkActive = runlessWorkStartedAt !== null;
@@ -395,9 +439,19 @@ export function useThreadComposerState() {
     const edit = getQueuedRunEdit(threadKey);
     if (edit === null) return;
     const draft = getComposerDraftSnapshot(queuedEditDraftKey(threadKey, edit.runId));
-    const text = draft.text.trim();
+    const shellCommand = edit.shellCommand === true;
+    const text = shellCommand ? queuedShellCommandEditText(draft.text) : draft.text.trim();
     if (text.length === 0) {
-      Dialog.alert("Add a message", "A queued message cannot be left empty.");
+      Dialog.alert(
+        shellCommand ? "Add a command" : "Add a message",
+        shellCommand
+          ? "A queued command cannot be left empty."
+          : "A queued message cannot be left empty.",
+      );
+      return;
+    }
+    if (shellCommand && draft.attachments.length > 0) {
+      Dialog.alert("Remove attachments", SHELL_COMMAND_CONTENT_BLOCKED);
       return;
     }
     if (
@@ -428,7 +482,7 @@ export function useThreadComposerState() {
       finishSave(false);
       const error = squashAtomCommandFailure(prepared);
       Dialog.alert(
-        "Could not save the queued message",
+        `Could not save the queued ${shellCommand ? "command" : "message"}`,
         error instanceof Error ? error.message : "Your edit is still in the composer.",
       );
       return;
@@ -450,7 +504,8 @@ export function useThreadComposerState() {
       input: {
         threadId: thread.id,
         runId: edit.runId,
-        text,
+        text: shellCommand ? shellCommandMessageText(text) : text,
+        ...(shellCommand ? { shellCommand: true } : {}),
         edit: {
           messageId: edit.messageId,
           attachments: payload.attachments,
@@ -463,9 +518,11 @@ export function useThreadComposerState() {
     if (result._tag !== "Success") {
       // The run left the queue during the save; its exit already told the composer what happened.
       if (!finishSave(false)) return;
+      // A queued command still runs once the setting is off, but editing it needs the setting.
+      const disabled = shellCommandsDisabledReason(squashAtomCommandFailure(result));
       Dialog.alert(
-        "Could not save the queued message",
-        "It may have already started. Your edit is still in the composer.",
+        `Could not save the queued ${shellCommand ? "command" : "message"}`,
+        `${disabled ?? "It may have already started."} Your edit is still in the composer.`,
       );
       return;
     }
@@ -476,6 +533,210 @@ export function useThreadComposerState() {
       });
     }
     scheduleUnusedComposerAttachmentCleanup(draft.attachments);
+  };
+
+  // Resolve at send time because outbox delivery may be delayed.
+  // Steering uses "auto" so an ended turn queues a run instead of restoring the draft.
+  const resolveFollowUpDispatchMode = (
+    activeTurnDefault: ActiveTurnComposerAction,
+    followUpOverride: ActiveTurnComposerAction | undefined,
+  ): "queue" | "auto" | null => {
+    const followUpAction = resolveComposerDispatchMode({
+      running: activeThreadBusy && canSteerActiveTurn,
+      alternateModifier: followUpOverride !== undefined && followUpOverride !== activeTurnDefault,
+      activeTurnDefault,
+    });
+    const setupRunning = [selectedThreadActivityRun?.status, selectedThreadRuntime?.status].some(
+      (status) => status === "preparing" || status === "starting",
+    );
+    return setupRunning
+      ? "queue"
+      : followUpAction === "auto"
+        ? null
+        : followUpAction === "queue"
+          ? "queue"
+          : "auto";
+  };
+
+  /**
+   * Runs `commands` as if each were typed as `! command` and sent, without touching the draft.
+   * Assistant code blocks only exist in started threads, so there is no thread to create.
+   * Several go in one send as a group: each runs after the one before succeeds.
+   */
+  const runShellCommand = async (commands: ReadonlyArray<string>): Promise<MessageId | null> => {
+    const [command, ...following] = commands;
+    const thread = selectedThreadShell;
+    if (command === undefined) return null;
+    if (
+      !thread ||
+      selectedThreadCreation !== null ||
+      !readCanRunShellCommands(thread.environmentId) ||
+      (selectedEnvironmentRuntime?.connectionState === "connected" &&
+        !readEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope))
+    ) {
+      return null;
+    }
+    const threadKey = scopedThreadKey(thread.environmentId, thread.id);
+    const texts = JSON.stringify(commands.map(shellCommandMessageText));
+    // A double tap must not run a code block twice. Read live: the outbox holds the first tap's
+    // send at once, and a tap held up by the first-run dialog runs after this render's is stale.
+    const alreadyQueued = (
+      appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom)[threadKey] ?? []
+    ).some(
+      (message) =>
+        message.shellCommand === true &&
+        JSON.stringify([
+          message.text,
+          ...(message.followingShellCommands ?? []).map((next) => next.text),
+        ]) === texts,
+    );
+    if (alreadyQueued) return null;
+    const settings = getComposerDraftSnapshot(threadKey);
+    const modelSelection = settings.modelSelection ?? thread.modelSelection;
+    const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
+      (entry) => entry.instanceId === modelSelection.instanceId,
+    );
+    const dispatchMode = resolveFollowUpDispatchMode(followUpBehavior, undefined);
+    const metadata = makeQueuedMessageMetadata();
+    const messageId = MessageId.make(metadata.messageId);
+    clearThreadComposerError(threadKey);
+    const queued = await settlePromise(() =>
+      enqueueThreadOutboxMessage({
+        environmentId: thread.environmentId,
+        threadId: thread.id,
+        messageId,
+        commandId: CommandId.make(metadata.commandId),
+        text: shellCommandMessageText(command),
+        shellCommand: true,
+        ...(following.length === 0
+          ? {}
+          : {
+              followingShellCommands: following.map((next) => ({
+                messageId: MessageId.make(makeQueuedMessageMetadata().messageId),
+                text: shellCommandMessageText(next),
+              })),
+            }),
+        attachments: [],
+        modelSelection,
+        runtimeMode: settings.runtimeMode ?? thread.runtimeMode,
+        interactionMode: resolveProviderInteractionMode(
+          provider,
+          settings.interactionMode ?? thread.interactionMode,
+        ),
+        ...(dispatchMode === null ? {} : { dispatchMode }),
+        createdAt: metadata.createdAt,
+      }),
+    );
+    if (AsyncResult.isFailure(queued)) {
+      const error = squashAtomCommandFailure(queued);
+      setThreadComposerError(
+        threadKey,
+        error instanceof Error ? error.message : "Failed to save the command.",
+      );
+      return null;
+    }
+    return messageId;
+  };
+
+  // Commands above the composer until their results reach the agent.
+  const liveShellCommands = selectedThreadProjection
+    ? liveUserShellCommands(selectedThreadProjection.projection)
+    : EMPTY_LIVE_SHELL_COMMANDS;
+  // The outbox and acknowledged sends stand in for web's optimistic ones; a send queued behind a
+  // turn waits with the queued messages instead.
+  const userShellCommandOwnsWorkingSlot = deriveUserShellCommandOwnsWorkingSlot({
+    projection: selectedThreadProjection?.projection ?? null,
+    sendingShellMessageIds: [
+      ...(selectedThreadKey === null ? [] : (queuedMessagesByThreadKey[selectedThreadKey] ?? [])),
+      ...acknowledgedMessages.filter(
+        (message) => scopedThreadKey(message.environmentId, message.threadId) === selectedThreadKey,
+      ),
+    ].flatMap((message) =>
+      message.shellCommand === true && message.dispatchMode !== "queue" ? [message.messageId] : [],
+    ),
+  });
+
+  /** Puts `command` into the composer in shell mode, asking before replacing a draft. */
+  const offerShellCommand = (
+    command: string,
+    prompt: { readonly title: string; readonly message: string },
+    onPlaced?: () => void,
+  ) => {
+    const thread = selectedThreadShell;
+    if (!thread) return;
+    const threadKey = scopedThreadKey(thread.environmentId, thread.id);
+    if (getQueuedRunEdit(threadKey) !== null) {
+      Dialog.alert("Finish editing the queued message first.");
+      return;
+    }
+    const place = () => {
+      clearComposerDraftContent(threadKey);
+      setComposerDraftText(threadKey, shellCommandPrompt(command), {
+        shellMode: true,
+        canRunShellCommands: composerCanRunShellCommands(thread),
+      });
+      // Against the text the draft kept, or the editor ignores the caret and leaves it at the start.
+      const stored = getComposerDraftSnapshot(threadKey).text;
+      rememberComposerDraftSelection(threadKey, stored, {
+        start: stored.length,
+        end: stored.length,
+      });
+      onPlaced?.();
+    };
+    if (composerDraftIsBlank(getComposerDraftSnapshot(threadKey))) {
+      place();
+      return;
+    }
+    Dialog.alert(prompt.title, prompt.message, [
+      { text: "Keep mine", style: "cancel" },
+      { text: "Replace", style: "destructive", onPress: place },
+    ]);
+  };
+
+  const editShellCommand = (command: string, onPlaced?: () => void) =>
+    offerShellCommand(
+      command,
+      { title: "Replace your draft?", message: "The composer already has a draft." },
+      onPlaced,
+    );
+
+  // Mobile has no prompt history to keep a stopped command in while a draft is there, so it asks.
+  const returnStoppedShellCommand = (command: string) => {
+    const thread = selectedThreadShell;
+    if (!thread) return;
+    const threadKey = scopedThreadKey(thread.environmentId, thread.id);
+    if (getQueuedRunEdit(threadKey) !== null) return;
+    const returned = returnStoppedShellCommandToDraft(threadKey, command, {
+      canRunShellCommands: readCanRunShellCommands(thread.environmentId),
+    });
+    if (returned !== "draft") return;
+    offerShellCommand(command, {
+      title: "Replace your draft with the stopped command?",
+      message: shellCommandPrompt(command),
+    });
+  };
+
+  /**
+   * The composer's Stop while the thread's commands are all it does: they stop as their own Stop
+   * would. False where Stop interrupts the thread instead.
+   */
+  const stopShellCommandsInsteadOfThread = (): boolean => {
+    const thread = selectedThreadShell;
+    if (!thread || !readEnvironmentScope(thread.environmentId, AuthTerminalOperateScope)) {
+      return false;
+    }
+    const stopping = stopComposerShellCommands({
+      projection: selectedThreadProjection?.projection ?? null,
+      stop: async (command) =>
+        (
+          await stopUserShellCommand({
+            environmentId: thread.environmentId,
+            input: { threadId: command.threadId, turnItemId: command.id },
+          })
+        )._tag === "Success",
+      onStoppedRunning: (command) => returnStoppedShellCommand(command.input),
+    });
+    return stopping !== null;
   };
 
   const onSendMessage = async (
@@ -524,6 +785,16 @@ export function useThreadComposerState() {
     if (text.length === 0 && attachments.length === 0) {
       return null;
     }
+    const shellSend = resolveComposerShellSend({
+      draft,
+      canRunShellCommands: readCanRunShellCommands(selectedThreadShell.environmentId),
+    });
+    if (shellSend.kind === "empty") return null;
+    if (shellSend.kind === "blocked") {
+      Dialog.alert("Can't run this command", shellSend.reason);
+      return null;
+    }
+    const shellCommand = shellSend.kind === "command" ? shellSend.command : null;
     // Recovery preserves over-cap attachments; require trimming or outbox delivery would reject indefinitely.
     if (attachments.length > PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
       Dialog.alert(
@@ -557,7 +828,7 @@ export function useThreadComposerState() {
       (entry) => entry.instanceId === modelSelection.instanceId,
     );
     const feedbackCommand =
-      attachments.length === 0 && provider?.driver === "codex"
+      shellCommand === null && attachments.length === 0 && provider?.driver === "codex"
         ? parseCodexFeedbackCommand(text)
         : null;
     if (feedbackCommand) {
@@ -596,7 +867,8 @@ export function useThreadComposerState() {
       return null;
     }
 
-    if (beforeDispatch !== undefined) {
+    // A command isn't an answer to the agent, so it leaves pending approvals alone.
+    if (beforeDispatch !== undefined && shellCommand === null) {
       const response = await beforeDispatch(
         text,
         attachments.length > 0 || draft.context !== undefined,
@@ -622,25 +894,11 @@ export function useThreadComposerState() {
       }
     }
 
-    // Resolve at send time because outbox delivery may be delayed.
-    // Steering uses "auto" so an ended turn queues a run instead of restoring the draft.
-    // An approval redirect must steer the waiting turn instead of queueing behind it.
-    const activeTurnDefault = beforeDispatch !== undefined ? "steer" : followUpBehavior;
-    const followUpAction = resolveComposerDispatchMode({
-      running: activeThreadBusy && canSteerActiveTurn,
-      alternateModifier: followUpOverride !== undefined && followUpOverride !== activeTurnDefault,
-      activeTurnDefault,
-    });
-    const setupRunning = [selectedThreadActivityRun?.status, selectedThreadRuntime?.status].some(
-      (status) => status === "preparing" || status === "starting",
+    // A redirect declined approvals to steer the waiting turn, not to queue behind it.
+    const followUpDispatchMode = resolveFollowUpDispatchMode(
+      beforeDispatch !== undefined && shellCommand === null ? "steer" : followUpBehavior,
+      followUpOverride,
     );
-    const followUpDispatchMode = setupRunning
-      ? "queue"
-      : followUpAction === "auto"
-        ? null
-        : followUpAction === "queue"
-          ? "queue"
-          : "auto";
 
     const metadata = makeQueuedMessageMetadata();
     const messageId = MessageId.make(metadata.messageId);
@@ -650,7 +908,9 @@ export function useThreadComposerState() {
       threadId: selectedThreadShell.id,
       messageId,
       commandId: CommandId.make(metadata.commandId),
-      text,
+      ...(shellCommand === null
+        ? { text }
+        : { text: shellCommandMessageText(shellCommand), shellCommand: true }),
       attachments,
       context: draft.context,
       modelSelection,
@@ -667,16 +927,42 @@ export function useThreadComposerState() {
       () => scheduleUnusedComposerAttachmentCleanup(attachments),
       (error: unknown) => {
         // Restore with uncapped append; capped merge could drop attachments added during the failed write.
-        void mergeComposerDraftContent(threadKey, {
-          text,
-          context: draft.context,
-          attachments: [],
+        const failedMessage =
+          error instanceof Error ? error.message : "Failed to save the queued message.";
+        const restored = () => {
+          appendComposerDraftAttachments(threadKey, attachments, { allowOverflow: true });
+          setThreadComposerError(threadKey, failedMessage);
+        };
+        // A merge that fails to persist has still published the text.
+        const restore = () =>
+          mergeComposerDraftContent(threadKey, {
+            ...(shellCommand === null
+              ? { text }
+              : { text: shellCommandMessageText(shellCommand), shellCommand: true }),
+            context: draft.context,
+            attachments: [],
+          }).then(restored, (restoreError: unknown) => {
+            if (restoreError instanceof ComposerDraftKindConflictError) throw restoreError;
+            restored();
+          });
+        void restore().catch((restoreError: ComposerDraftKindConflictError) => {
+          // Something of the other kind was typed meanwhile; joining them would change what runs.
+          Dialog.alert(`${failedMessage} Replace your draft with it?`, restoreError.message, [
+            {
+              text: "Keep mine",
+              style: "cancel",
+              onPress: () => scheduleUnusedComposerAttachmentCleanup(attachments),
+            },
+            {
+              text: "Replace",
+              style: "destructive",
+              onPress: () => {
+                clearComposerDraftContent(threadKey);
+                void restore();
+              },
+            },
+          ]);
         });
-        appendComposerDraftAttachments(threadKey, attachments, { allowOverflow: true });
-        setThreadComposerError(
-          threadKey,
-          error instanceof Error ? error.message : "Failed to save the queued message.",
-        );
       },
     );
     return messageId;
@@ -688,7 +974,9 @@ export function useThreadComposerState() {
     }
 
     const threadKey = activeComposerDraftKey(selectedThreadShell);
-    setComposerDraftText(threadKey, value);
+    setComposerDraftText(threadKey, value, {
+      canRunShellCommands: composerCanRunShellCommands(selectedThreadShell),
+    });
   };
 
   const { onPickDraftMedia, onPickDraftFiles, onNativePasteImages, onNativePasteText } =
@@ -754,6 +1042,12 @@ export function useThreadComposerState() {
     onNativePasteText,
     onRemoveDraftImage,
     onSendMessage,
+    runShellCommand,
+    editShellCommand,
+    liveShellCommands,
+    userShellCommandOwnsWorkingSlot,
+    returnStoppedShellCommand,
+    stopShellCommandsInsteadOfThread,
     onUpdateInteractionMode,
   };
 }

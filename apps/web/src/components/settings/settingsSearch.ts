@@ -573,6 +573,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["queue steer running turn send default behavior composer"],
   },
   {
+    id: "shell-commands",
+    title: "Shell commands (beta)",
+    to: "/settings/chat",
+    scope: "environment-defaults",
+    searchTerms: [
+      "! bang run command terminal bash zsh composer code block script beta experimental",
+    ],
+  },
+  {
     id: "provider-update-checks",
     title: "Provider update checks",
     to: "/settings/maintenance",
