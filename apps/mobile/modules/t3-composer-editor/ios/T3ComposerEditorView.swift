@@ -29,7 +29,19 @@ private struct ComposerControlledDocumentPayload: Decodable {
 private struct ComposerThemePayload: Decodable {
   let text: String
   let placeholder: String
+  /// The square behind a shell command's leading `!`, and the `!` itself.
+  let shellPrefixFill: String?
+  let shellPrefixText: String?
 }
+
+/// Marks the leading `!` this view styled, so a style left behind by an edit can be found and reset.
+private let shellPrefixAttribute = NSAttributedString.Key("T3ComposerShellPrefix")
+
+/// A shell command's `!` sits in a square this many ems wide, with this gap before the command;
+/// every line of the command starts after both. Matches the web composer.
+private let shellPrefixSizeEm: CGFloat = 1.35
+private let shellPrefixGapEm: CGFloat = 0.65
+private let shellPrefixRadiusEm: CGFloat = 0.3
 
 private enum ComposerEnterBehavior: String {
   case send
@@ -427,8 +439,21 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
   private var requestedSelection: ComposerSelectionPayload?
   private var theme = ComposerThemePayload(
     text: "#262626",
-    placeholder: "#8e8e93"
+    placeholder: "#8e8e93",
+    shellPrefixFill: nil,
+    shellPrefixText: nil
   )
+  private var autoCorrect = true
+  private var spellCheck = true
+  private var shellMode = false
+  /// The text starts with a styled `!`, so every line is indented past its square.
+  private var shellPrefixActive = false
+  private var placeholderIndented = false
+  /// Some text may still carry the `!` style, so leaving shell mode has something to reset.
+  private var shellPrefixStyleApplied = false
+  /// Drawn behind the text and scrolled with it; the `!` itself stays a character. Created on first
+  /// use, so an editor that never enters shell mode keeps its original view tree.
+  private var shellPrefixView: UIView?
   private var fontFamily = "DMSans-Regular"
   private var fontSize: CGFloat = 14
   private var lineHeight: CGFloat = 20
@@ -497,7 +522,9 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
         "selection": ["start": selection.start, "end": selection.end],
       ])
     }
+    // Cut edits the storage directly, so no textViewDidChange restyles a `!` it exposed or moved.
     textView.onAttributedMutation = { [weak self] in
+      self?.applyShellPrefixStyle()
       self?.emitTextChange()
     }
     textView.onSubmit = { [weak self] alternate in
@@ -594,6 +621,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     super.layoutSubviews()
     let previousSize = textView.bounds.size
     textView.frame = bounds
+    layoutShellPrefixView()
     if chipsNeedMeasuredWidth, bounds.width > 0 {
       chipsNeedMeasuredWidth = false
       applyControlledDocument(force: true)
@@ -613,7 +641,8 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
         }
       }
     }
-    let placeholderX = textView.textContainerInset.left + textView.textContainer.lineFragmentPadding
+    let placeholderX = textView.textContainerInset.left + textView.textContainer.lineFragmentPadding +
+      (placeholderIndented ? shellPrefixIndent : 0)
     let placeholderY = textView.textContainerInset.top
     let placeholderWidth = max(
       0,
@@ -738,11 +767,186 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
   }
 
   func setAutoCorrect(_ autoCorrect: Bool) {
+    self.autoCorrect = autoCorrect
+    // Shell mode holds corrections off; leaving it applies this value.
+    guard !shellMode else { return }
     textView.autocorrectionType = autoCorrect ? .yes : .no
   }
 
   func setSpellCheck(_ spellCheck: Bool) {
+    self.spellCheck = spellCheck
+    guard !shellMode else { return }
     textView.spellCheckingType = spellCheck ? .yes : .no
+  }
+
+  /// A shell command is typed as written: no corrections, capitals, or smart punctuation.
+  func setShellMode(_ shellMode: Bool) {
+    guard self.shellMode != shellMode else { return }
+    self.shellMode = shellMode
+    applyTextInputTraits()
+    applyShellPrefixStyle()
+    // The document this mode belongs to may have been applied first, with its caret at 0.
+    snapControlledCaretAfterShellPrefix()
+    updatePlaceholderVisibility()
+  }
+
+  /// A caret JS put before the `!`, moved after it like any other; JS learns of it with the next
+  /// caret move or edit, as on Android.
+  private func snapControlledCaretAfterShellPrefix() {
+    let caret = rangeAfterShellPrefix(textView.selectedRange)
+    guard !NSEqualRanges(caret, textView.selectedRange) else { return }
+    let wasApplying = isApplyingControlledValue
+    isApplyingControlledValue = true
+    textView.selectedRange = caret
+    isApplyingControlledValue = wasApplying
+  }
+
+  private func applyTextInputTraits() {
+    let assisted = !shellMode
+    let autocorrection: UITextAutocorrectionType = assisted && autoCorrect ? .yes : .no
+    let spellChecking: UITextSpellCheckingType = assisted && spellCheck ? .yes : .no
+    let capitalization: UITextAutocapitalizationType = assisted ? .sentences : .none
+    let smartQuotes: UITextSmartQuotesType = assisted ? .default : .no
+    let smartDashes: UITextSmartDashesType = assisted ? .default : .no
+    let smartInsertDelete: UITextSmartInsertDeleteType = assisted ? .default : .no
+    guard textView.autocorrectionType != autocorrection ||
+      textView.spellCheckingType != spellChecking ||
+      textView.autocapitalizationType != capitalization ||
+      textView.smartQuotesType != smartQuotes ||
+      textView.smartDashesType != smartDashes ||
+      textView.smartInsertDeleteType != smartInsertDelete else {
+      return
+    }
+    textView.autocorrectionType = autocorrection
+    textView.spellCheckingType = spellChecking
+    textView.autocapitalizationType = capitalization
+    textView.smartQuotesType = smartQuotes
+    textView.smartDashesType = smartDashes
+    textView.smartInsertDeleteType = smartInsertDelete
+    // The keyboard reads these traits when it attaches; a focused editor has to reattach it.
+    if textView.isFirstResponder {
+      textView.reloadInputViews()
+    }
+  }
+
+  private var shellPrefixIndent: CGFloat {
+    fontSize * (shellPrefixSizeEm + shellPrefixGapEm)
+  }
+
+  private func shellPrefixFont() -> UIFont {
+    let font = UIFont(name: fontFamily, size: fontSize) ?? UIFont.systemFont(ofSize: fontSize)
+    guard let bold = font.fontDescriptor.withSymbolicTraits(.traitBold) else { return font }
+    return UIFont(descriptor: bold, size: fontSize)
+  }
+
+  /// Styles a leading `!` in shell mode: bold, centered in the square drawn behind it, and kerned
+  /// so the command starts after the gap. Later lines hang at the same indent. Resets any style an
+  /// edit moved off the first character, and the indent once the `!` is gone.
+  private func applyShellPrefixStyle() {
+    // Outside shell mode there is no style to reset, so ordinary edits skip the attribute scan.
+    guard shellMode || shellPrefixActive || shellPrefixStyleApplied else {
+      return
+    }
+    guard textView.markedTextRange == nil else {
+      return
+    }
+    let storage = textView.textStorage
+    let wantsPrefix = shellMode && storage.length > 0 &&
+      (storage.string as NSString).character(at: 0) == 0x21
+    let indentChanged = wantsPrefix != shellPrefixActive
+    shellPrefixActive = wantsPrefix
+    var prefixStyled = false
+    var stale: [NSRange] = []
+    storage.enumerateAttribute(
+      shellPrefixAttribute,
+      in: NSRange(location: 0, length: storage.length)
+    ) { value, range, _ in
+      guard value != nil else { return }
+      if wantsPrefix && range.location == 0 && range.length == 1 {
+        prefixStyled = true
+      } else {
+        stale.append(range)
+      }
+    }
+    guard indentChanged || !stale.isEmpty || prefixStyled != wantsPrefix else {
+      shellPrefixStyleApplied = prefixStyled
+      layoutShellPrefixView()
+      return
+    }
+    let base = baseAttributes()
+    storage.beginEditing()
+    if indentChanged && storage.length > 0 {
+      storage.addAttribute(
+        .paragraphStyle,
+        value: base[.paragraphStyle] as Any,
+        range: NSRange(location: 0, length: storage.length)
+      )
+    }
+    for range in stale {
+      storage.removeAttribute(shellPrefixAttribute, range: range)
+      storage.removeAttribute(.kern, range: range)
+      storage.addAttributes(base, range: range)
+    }
+    if wantsPrefix && (!prefixStyled || indentChanged) {
+      let font = shellPrefixFont()
+      let glyphWidth = ("!" as NSString).size(withAttributes: [.font: font]).width
+      let squareInset = max(0, (fontSize * shellPrefixSizeEm - glyphWidth) / 2)
+      let paragraph = NSMutableParagraphStyle()
+      paragraph.minimumLineHeight = lineHeight
+      paragraph.maximumLineHeight = lineHeight
+      // The first paragraph's style comes from its first character: the `!` starts inside the
+      // square, its kern carries the command past the gap, and wrapped lines hang under it.
+      paragraph.firstLineHeadIndent = squareInset
+      paragraph.headIndent = shellPrefixIndent
+      storage.addAttributes(
+        [
+          shellPrefixAttribute: true,
+          .font: font,
+          .foregroundColor: UIColor(composerHex: theme.shellPrefixText)
+            ?? UIColor(composerHex: theme.text) ?? .label,
+          .kern: shellPrefixIndent - squareInset - glyphWidth,
+          .paragraphStyle: paragraph,
+        ],
+        range: NSRange(location: 0, length: 1)
+      )
+    }
+    shellPrefixStyleApplied = wantsPrefix
+    storage.endEditing()
+    restoreBaseTypingAttributes()
+    layoutShellPrefixView()
+  }
+
+  /// Places the square behind the leading `!`, centered on the glyph's cap height.
+  private func layoutShellPrefixView() {
+    guard shellPrefixActive, textView.textStorage.length > 0 else {
+      shellPrefixView?.isHidden = true
+      return
+    }
+    let shellPrefixView: UIView
+    if let existing = self.shellPrefixView {
+      shellPrefixView = existing
+    } else {
+      shellPrefixView = UIView()
+      shellPrefixView.isUserInteractionEnabled = false
+      textView.insertSubview(shellPrefixView, at: 0)
+      self.shellPrefixView = shellPrefixView
+    }
+    let layout = textView.layoutManager
+    let glyph = layout.glyphIndexForCharacter(at: 0)
+    let line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+    let baseline = line.minY + layout.location(forGlyphAt: glyph).y
+    let size = fontSize * shellPrefixSizeEm
+    let center = baseline - shellPrefixFont().capHeight / 2
+    shellPrefixView.frame = CGRect(
+      x: textView.textContainerInset.left + textView.textContainer.lineFragmentPadding,
+      y: textView.textContainerInset.top + center - size / 2,
+      width: size,
+      height: size
+    )
+    shellPrefixView.layer.cornerRadius = fontSize * shellPrefixRadiusEm
+    shellPrefixView.backgroundColor = UIColor(composerHex: theme.shellPrefixFill)
+      ?? UIColor.systemPurple.withAlphaComponent(0.24)
+    shellPrefixView.isHidden = false
   }
 
   func setEnterBehavior(_ behavior: String) {
@@ -781,6 +985,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
   }
 
   public func textViewDidChange(_ textView: UITextView) {
+    applyShellPrefixStyle()
     emitTextChange()
   }
 
@@ -793,6 +998,12 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     // would pair the post-edit text with a pre-edit revision counter, so let
     // the change event that follows carry both; only pure caret moves emit.
     guard self.textView.serializedText() == value else {
+      return
+    }
+    // The assignment re-enters this delegate, which emits the corrected caret.
+    let caret = rangeAfterShellPrefix(textView.selectedRange)
+    if !NSEqualRanges(caret, textView.selectedRange) {
+      textView.selectedRange = caret
       return
     }
     emitSelection()
@@ -880,9 +1091,10 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     }
     isApplyingControlledValue = true
     textView.attributedText = makeAttributedDocument()
+    applyShellPrefixStyle()
     let targetSelection = requestedSelection ?? previousSelection
     requestedSelection = nil
-    textView.selectedRange = displayRange(for: targetSelection)
+    textView.selectedRange = rangeAfterShellPrefix(displayRange(for: targetSelection))
     restoreBaseTypingAttributes()
     isApplyingControlledValue = false
     if currentSource != value || previousSelection.start != targetSelection.start || previousSelection.end != targetSelection.end {
@@ -1066,6 +1278,10 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     let paragraph = NSMutableParagraphStyle()
     paragraph.minimumLineHeight = lineHeight
     paragraph.maximumLineHeight = lineHeight
+    if shellPrefixActive {
+      paragraph.firstLineHeadIndent = shellPrefixIndent
+      paragraph.headIndent = shellPrefixIndent
+    }
     return [
       .font: font,
       .foregroundColor: UIColor(composerHex: theme.text) ?? .label,
@@ -1133,6 +1349,18 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     )
   }
 
+  /// The `!` sits in its square, so a caret before it would look like one after it and typing
+  /// there would silently end shell mode. A caret there moves after it, as on Android, whether the
+  /// person or JS put it there.
+  private func rangeAfterShellPrefix(_ range: NSRange) -> NSRange {
+    guard shellPrefixActive,
+          textView.markedTextRange == nil,
+          NSEqualRanges(range, NSRange(location: 0, length: 0)) else {
+      return range
+    }
+    return NSRange(location: 1, length: 0)
+  }
+
   private func displayRange(for selection: ComposerSelectionPayload) -> NSRange {
     let start = displayOffset(forSourceOffset: selection.start)
     let end = displayOffset(forSourceOffset: selection.end)
@@ -1155,7 +1383,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     guard let requestedSelection else {
       return
     }
-    let nextRange = displayRange(for: requestedSelection)
+    let nextRange = rangeAfterShellPrefix(displayRange(for: requestedSelection))
     guard nextRange.location <= textView.attributedText.length,
           NSMaxRange(nextRange) <= textView.attributedText.length else {
       return
@@ -1182,7 +1410,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     guard textView.isFirstResponder, textView.markedTextRange == nil, value == snapshot.value else {
       return
     }
-    let range = displayRange(for: snapshot.selection)
+    let range = rangeAfterShellPrefix(displayRange(for: snapshot.selection))
     guard !NSEqualRanges(range, textView.selectedRange) else {
       return
     }
@@ -1207,7 +1435,13 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
   }
 
   private func updatePlaceholderVisibility() {
-    placeholderLabel.isHidden = !value.isEmpty
+    // A shell command's own `!` is not content yet; the placeholder follows its square.
+    let shellPlaceholder = shellMode && value == "!"
+    placeholderLabel.isHidden = !(value.isEmpty || shellPlaceholder)
+    if placeholderIndented != shellPlaceholder {
+      placeholderIndented = shellPlaceholder
+      setNeedsLayout()
+    }
   }
 
   private func emitContentSizeIfNeeded() {
