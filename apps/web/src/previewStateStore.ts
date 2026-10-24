@@ -218,6 +218,7 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
               code: event.code,
               description: event.description,
               ...(event.download === undefined ? {} : { download: event.download }),
+              ...(event.crashed ? { crashed: true as const } : {}),
             },
             updatedAt: event.createdAt,
           };
