@@ -1090,6 +1090,7 @@ describe("PreviewManager", () => {
     };
     return {
       wc: wc as unknown as Electron.WebContents,
+      listeners,
       attach,
       detach,
       sendCommand,
@@ -1117,6 +1118,42 @@ describe("PreviewManager", () => {
         expect(guest.attach).toHaveBeenCalledTimes(2);
       }),
     ),
+  );
+
+  effectIt.effect(
+    "reconnects a page that crashed while its DevTools were open once it revives",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const guest = makeAttachingGuest(49);
+          const on = guest.wc.on as unknown as ReturnType<typeof vi.fn>;
+          const emit = (event: string, ...args: unknown[]) => {
+            for (const [name, listener] of on.mock.calls) if (name === event) listener(...args);
+          };
+          let crashed = false;
+          guest.sendCommand.mockImplementation(async () => {
+            if (crashed) throw new Error("Target crashed");
+          });
+          Object.assign(guest.wc, { openDevTools: vi.fn() });
+          fromId.mockReturnValue(guest.wc);
+          yield* manager.createTab("tab_devtools", {
+            serverTab: { threadId: "thread-1", tabId: "server-1" },
+          });
+          yield* manager.registerWebview("tab_devtools", 49);
+          yield* manager.openDevTools("tab_devtools");
+
+          crashed = true;
+          emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+          guest.listeners.get("devtools-closed")?.();
+
+          // A reload revives the page, which then answers its debugger again.
+          const reattached = Promise.withResolvers<void>();
+          guest.attach.mockImplementation(() => reattached.resolve());
+          crashed = false;
+          emit("did-start-loading");
+          yield* Effect.promise(() => reattached.promise);
+        }),
+      ),
   );
 
   effectIt.effect("skips a guest destroyed while another guest's session opens", () =>
@@ -1220,6 +1257,66 @@ describe("PreviewManager", () => {
         yield* Effect.yieldNow;
 
         expect(states.at(-1)?.audible).toBe(true);
+      }),
+    ),
+  );
+
+  effectIt.effect("tells the server when its tab's page crashes and when a reload revives it", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.DesktopBrowserHost;
+      const lines = yield* Queue.unbounded<unknown>();
+      yield* host.events.pipe(
+        Stream.map((line) => JSON.parse(new TextDecoder().decode(line))),
+        Stream.filter((event) => event.type === "crash"),
+        Stream.runForEach((event) => Queue.offer(lines, event)),
+        Effect.forkScoped,
+      );
+      // Lets the subscription start, so it sees the attach's own events.
+      yield* Effect.yieldNow;
+      const preview = makeFaviconWebContents({ url: "https://example.com/" });
+      fromId.mockReturnValue(
+        Object.assign(preview.webContents, { getUserAgent: () => "Electron" }),
+      );
+      const manager = yield* PreviewManager.PreviewManager;
+      yield* manager.createTab("tab_1", { serverTab: { threadId: "thread-1", tabId: "server-1" } });
+      yield* manager.registerWebview("tab_1", 42);
+      // Attaching clears whatever crash the server still holds for the tab.
+      expect(yield* Queue.take(lines)).toMatchObject({ message: null });
+
+      preview.listeners.get("render-process-gone")!(
+        {} as never,
+        { reason: "oom", exitCode: 9 } as never,
+      );
+      expect(yield* Queue.take(lines)).toMatchObject({
+        tabId: "server-1",
+        message: expect.stringContaining("ran out of memory"),
+      });
+
+      // A person reloading the crashed page in the app.
+      preview.setLoading(true);
+      preview.listeners.get("did-start-loading")!();
+      expect(yield* Queue.take(lines)).toMatchObject({ tabId: "server-1", message: null });
+    }).pipe(Effect.provide(managerLayer()), Effect.scoped),
+  );
+
+  effectIt.effect("keeps a tab tied to its server tab when a URL is typed", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const preview = makeFaviconWebContents({ url: "https://example.com/" });
+        fromId.mockReturnValue(preview.webContents);
+        const states: PreviewManager.PreviewTabState[] = [];
+        yield* manager.subscribeStateChanges((_tabId, state) =>
+          Effect.sync(() => {
+            states.push(state);
+          }),
+        );
+        const serverTab = { threadId: "thread-1", tabId: "server-1" };
+        yield* manager.createTab("tab_typed", { serverTab });
+        yield* manager.registerWebview("tab_typed", 42);
+
+        yield* manager.navigate("tab_typed", "https://example.org/");
+        // Without it, the server never hears that the page crashed or revived.
+        expect(states.at(-1)?.serverTab).toEqual(serverTab);
       }),
     ),
   );
@@ -1687,7 +1784,10 @@ describe("PreviewManager", () => {
       const serverTab = { threadId: "thread-1", tabId: "server-tab-1" };
       const lines = yield* Queue.unbounded<string>();
       yield* host.events.pipe(
-        Stream.runForEach((line) => Queue.offer(lines, new TextDecoder().decode(line))),
+        Stream.map((line) => new TextDecoder().decode(line)),
+        // Attaching also reports the tab's crash state.
+        Stream.filter((line) => /"type":"(attached|detached)"/.test(line)),
+        Stream.runForEach((line) => Queue.offer(lines, line)),
         Effect.forkScoped,
       );
       const nextType = Queue.take(lines).pipe(
