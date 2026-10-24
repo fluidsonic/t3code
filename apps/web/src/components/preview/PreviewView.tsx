@@ -86,7 +86,7 @@ import { BROWSER_DEVICE_TOOLBAR_HEIGHT } from "~/browser/browserViewportLayout";
 import { useBrowserLayoutZoomFactor } from "~/browser/useBrowserLayoutZoomFactor";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
 import { isBrowserSettingsReadError } from "~/browser/openFileInPreview";
-import { PreviewFileNotShown, PreviewUnreachable } from "./PreviewUnreachable";
+import { PreviewCrashed, PreviewFileNotShown, PreviewUnreachable } from "./PreviewUnreachable";
 import type { MessageResolver } from "~/i18n/messages";
 import { revealInFileExplorerLabel } from "./fileExplorerLabel";
 import { Badge } from "~/components/ui/badge";
@@ -431,6 +431,10 @@ export function PreviewView({
     if (serverOwnsRendering) stepServerZoom(0);
     else if (previewBridge && runtimeTabId) void previewBridge.resetZoom(runtimeTabId);
   };
+
+  // Reviving a crashed page takes the desktop that renders it, here or behind the server.
+  // A desktop-only tab seen from another client has no way to reload.
+  const canReloadCrashed = desktopOverlay !== null || serverOwnsRendering;
 
   const handleToggleDeviceToolbar = () => {
     if (!runtimeTabId || !tabId) return;
@@ -1193,7 +1197,14 @@ export function PreviewView({
           <ZoomIndicator zoomFactor={desktopOverlay.zoomFactor} />
         ) : null}
         {desktopSlotShown ? null : pageOverlays}
-        {navStatus._tag === "LoadFailed" && navStatus.download ? (
+        {navStatus._tag === "LoadFailed" && navStatus.crashed ? (
+          <div className="absolute inset-0 z-10 bg-background">
+            <PreviewCrashed
+              message={navStatus.description}
+              onReload={canReloadCrashed ? handleRefresh : undefined}
+            />
+          </div>
+        ) : navStatus._tag === "LoadFailed" && navStatus.download ? (
           <div className="absolute inset-0 z-10 bg-background">
             <ServerTabFileNotShown
               threadRef={threadRef}
