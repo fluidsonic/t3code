@@ -74,6 +74,27 @@ export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 const decodePrepareThread = Schema.decodeUnknownSync(GitPreparePullRequestThreadInput);
 const decodeStackedAction = Schema.decodeUnknownSync(GitRunStackedActionInput);
 
+// Sending or editing a `! cmd` shell command runs it on the environment, outside any provider
+// sandbox, so it needs the same grant as typing into a terminal.
+function isShellCommandDispatch(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const command = input as { readonly type?: unknown; readonly shellCommand?: unknown };
+  return (
+    (command.type === "message.dispatch" || command.type === "queued-run.edit") &&
+    command.shellCommand === true
+  );
+}
+
+function isShellCommandLaunch(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const initialMessage = (input as { readonly initialMessage?: unknown }).initialMessage;
+  return (
+    typeof initialMessage === "object" &&
+    initialMessage !== null &&
+    (initialMessage as { readonly shellCommand?: unknown }).shellCommand === true
+  );
+}
+
 export function clientRpcRequiredScopes(
   method: string,
   input: unknown,
@@ -82,6 +103,12 @@ export function clientRpcRequiredScopes(
     const payload = decodePrepareThread(input);
     if (payload.mode === "worktree" && payload.threadId !== undefined)
       return [AuthSourceControlWriteScope, AuthOrchestrationOperateScope];
+  }
+  if (
+    (method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand && isShellCommandDispatch(input)) ||
+    (method === ORCHESTRATION_V2_WS_METHODS.launchThread && isShellCommandLaunch(input))
+  ) {
+    return [AuthOrchestrationOperateScope, AuthTerminalOperateScope];
   }
   if (method === WS_METHODS.gitRunStackedAction && input !== undefined) {
     const payload = decodeStackedAction(input);

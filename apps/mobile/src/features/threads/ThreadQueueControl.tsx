@@ -7,6 +7,7 @@ import {
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
 import type { ChatAttachment, EnvironmentId, RunId, ThreadId } from "@t3tools/contracts";
+import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
 import { Atom } from "effect/reactivity";
 import { Image } from "expo-image";
 import * as Haptics from "expo-haptics";
@@ -34,6 +35,8 @@ import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { assetImageSource } from "../../lib/assetImageSource";
 import { beginQueuedRunEdit, useQueuedRunEdit } from "../../state/queued-run-edit";
+import { useCanRunShellCommands } from "../../state/shell-commands";
+import { ShellCommandText } from "./thread-shell-command";
 import { environmentThreadDetails, threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
@@ -135,6 +138,8 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
   const promote = useAtomCommand(threadEnvironment.promoteQueuedRun, "promote queued message");
   const cancel = useAtomCommand(threadEnvironment.cancelQueuedRun, "remove queued message");
   const resume = useAtomCommand(threadEnvironment.resumeThreadQueue, "resume queue");
+  // Editing a queued command needs what sending one does.
+  const canRunShellCommands = useCanRunShellCommands(target.environmentId);
   const [resuming, setResuming] = useState(false);
   const [busyRunId, setBusyRunId] = useState<RunId | null>(null);
   const busyRef = useRef(false);
@@ -166,6 +171,7 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           originalText: entry.text,
           existingAttachments: entry.attachments,
           ...(entry.context ? { context: entry.context } : {}),
+          ...(entry.shellCommand ? { shellCommand: true } : {}),
         },
         makeQueuedRunsAtom({
           threadId: target.threadId,
@@ -235,126 +241,147 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           No messages waiting in this queue.
         </Text>
       ) : null}
-      {queuedRuns.map(({ run, text, attachments, context, message }, index) => {
-        const controls = resolveThreadQueueRowControls({
-          busy: busyRunId !== null,
-          canPromoteToSteer: workflow?.canPromoteToSteer ?? false,
-          canSendNow: workflow?.canSendNow ?? false,
-          editBlocked: editBlockedReason !== null,
-          isEditing: editing?.runId === run.id,
-          isGuestMessage: context?.guest !== undefined,
-          text,
-        });
-        const title =
-          controls.displayText || (attachments.length > 0 ? "Attachments" : "Queued message");
-        return (
-          <View key={run.id} className="flex-row items-center border-b border-border bg-sheet">
-            <QueueRowSwipeable
-              enabled={busyRunId === null && controls.canDismiss}
-              background={theme["--color-sheet"]}
-              onRemove={() => void act(run.id, "remove")}
-            >
-              <View className="flex-row items-center">
-                <Menu
-                  accessibilityLabel={`Actions for queued message ${index + 1}`}
-                  shouldOpenOnLongPress
-                  style={{ flex: 1 }}
-                  actions={[
-                    ...(workflow?.canPromoteToSteer || workflow?.canSendNow
-                      ? [
-                          {
-                            id: "steer",
-                            title: "Send now",
-                            attributes: { disabled: !controls.canSend },
-                            image: Platform.OS === "ios" ? "arrow.up" : "arrow_upward",
-                          },
-                        ]
-                      : []),
-                    {
-                      id: "edit",
-                      title: "Edit",
-                      attributes: { disabled: !controls.canEdit },
-                      image: Platform.OS === "ios" ? "pencil" : "edit",
-                    },
-                    {
-                      id: "remove",
-                      title: "Remove",
-                      attributes: { disabled: !controls.canDismiss, destructive: true },
-                    },
-                  ]}
-                  onPressAction={({ nativeEvent }) =>
-                    void act(run.id, nativeEvent.event as QueueAction)
-                  }
-                >
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel={title}
-                    accessibilityHint={
-                      controls.canEdit
-                        ? "Opens this message in the composer for editing"
-                        : (editBlockedReason ?? undefined)
+      {queuedRuns.map(
+        ({ run, text, attachments, context, message, shellCommand, shellCommandRan }, index) => {
+          const controls = resolveThreadQueueRowControls({
+            busy: busyRunId !== null,
+            canPromoteToSteer: workflow?.canPromoteToSteer ?? false,
+            canSendNow: workflow?.canSendNow ?? false,
+            editBlocked: editBlockedReason !== null,
+            isEditing: editing?.runId === run.id,
+            isGuestMessage: context?.guest !== undefined,
+            text,
+          });
+          const canEdit =
+            controls.canEdit &&
+            (shellCommand !== true || (canRunShellCommands && shellCommandRan !== true));
+          const command = shellCommand ? shellCommandFromMessageText(text) : null;
+          const title =
+            command !== null
+              ? `Command: ${command}`
+              : controls.displayText || (attachments.length > 0 ? "Attachments" : "Queued message");
+          return (
+            <View key={run.id} className="flex-row items-center border-b border-border bg-sheet">
+              <QueueRowSwipeable
+                enabled={busyRunId === null && controls.canDismiss}
+                background={theme["--color-sheet"]}
+                onRemove={() => void act(run.id, "remove")}
+              >
+                <View className="flex-row items-center">
+                  <Menu
+                    accessibilityLabel={`Actions for queued message ${index + 1}`}
+                    shouldOpenOnLongPress
+                    style={{ flex: 1 }}
+                    actions={[
+                      ...(workflow?.canPromoteToSteer || workflow?.canSendNow
+                        ? [
+                            {
+                              id: "steer",
+                              title: "Send now",
+                              attributes: { disabled: !controls.canSend },
+                              image: Platform.OS === "ios" ? "arrow.up" : "arrow_upward",
+                            },
+                          ]
+                        : []),
+                      {
+                        id: "edit",
+                        title: "Edit",
+                        attributes: { disabled: !canEdit },
+                        image: Platform.OS === "ios" ? "pencil" : "edit",
+                      },
+                      {
+                        id: "remove",
+                        title: "Remove",
+                        attributes: { disabled: !controls.canDismiss, destructive: true },
+                      },
+                    ]}
+                    onPressAction={({ nativeEvent }) =>
+                      void act(run.id, nativeEvent.event as QueueAction)
                     }
-                    disabled={!controls.canEdit}
-                    onPress={() => void act(run.id, "edit")}
-                    className="min-h-14 flex-row items-center gap-2.5 py-2.5 active:opacity-70"
                   >
-                    <QueueAttachmentThumbnails
-                      environmentId={target.environmentId}
-                      attachments={attachments}
-                    />
-                    <View className="min-w-0 flex-1 gap-0.5">
-                      {message ? (
-                        <QueuedRunSender environmentId={target.environmentId} message={message} />
-                      ) : null}
-                      <Text
-                        className={
-                          controls.isEditing
-                            ? "text-sm text-foreground-muted"
-                            : "text-sm text-foreground"
-                        }
-                        numberOfLines={1}
-                      >
-                        {context?.guest === undefined ? null : (
-                          <Text className="font-t3-medium text-adaptive-fuchsia-600-300">
-                            {`${context.guest.name}  `}
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={title}
+                      accessibilityHint={
+                        !canEdit
+                          ? (editBlockedReason ?? undefined)
+                          : shellCommand
+                            ? "Opens this command in the composer for editing"
+                            : "Opens this message in the composer for editing"
+                      }
+                      disabled={!canEdit}
+                      onPress={() => void act(run.id, "edit")}
+                      className="min-h-14 flex-row items-center gap-2.5 py-2.5 active:opacity-70"
+                    >
+                      <QueueAttachmentThumbnails
+                        environmentId={target.environmentId}
+                        attachments={attachments}
+                      />
+                      <View className="min-w-0 flex-1 gap-0.5">
+                        {message ? (
+                          <QueuedRunSender environmentId={target.environmentId} message={message} />
+                        ) : null}
+                        {command !== null ? (
+                          <ShellCommandText
+                            command={command}
+                            numberOfLines={1}
+                            className="min-w-0"
+                            textClassName={
+                              controls.isEditing ? "text-foreground-muted" : "text-foreground"
+                            }
+                          />
+                        ) : (
+                          <Text
+                            className={
+                              controls.isEditing
+                                ? "text-sm text-foreground-muted"
+                                : "text-sm text-foreground"
+                            }
+                            numberOfLines={1}
+                          >
+                            {context?.guest === undefined ? null : (
+                              <Text className="font-t3-medium text-adaptive-fuchsia-600-300">
+                                {`${context.guest.name}  `}
+                              </Text>
+                            )}
+                            {title}
                           </Text>
                         )}
-                        {title}
-                      </Text>
-                    </View>
-                    {controls.isEditing ? (
-                      <Text className="shrink-0 text-2xs uppercase tracking-wide text-primary">
-                        Editing
-                      </Text>
-                    ) : null}
-                  </Pressable>
-                </Menu>
-                {workflow?.canPromoteToSteer || workflow?.canSendNow ? (
-                  // Outside the edit row and full row height, so a near miss never opens the editor.
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel={`Send now, queued message ${index + 1}`}
-                    disabled={!controls.canSend}
-                    onPress={() => void act(run.id, "steer")}
-                    className="shrink-0 justify-center self-stretch pl-4 active:opacity-70 disabled:opacity-40"
-                  >
-                    <View className="min-h-9 flex-row items-center gap-1.5 rounded-full bg-primary px-4">
-                      <SymbolView
-                        name="arrow.up"
-                        size={13}
-                        tintColorClassName="accent-primary-foreground"
-                      />
-                      <Text className="font-t3-medium text-sm text-primary-foreground">
-                        Send now
-                      </Text>
-                    </View>
-                  </Pressable>
-                ) : null}
-              </View>
-            </QueueRowSwipeable>
-          </View>
-        );
-      })}
+                      </View>
+                      {controls.isEditing ? (
+                        <Text className="shrink-0 text-2xs uppercase tracking-wide text-primary">
+                          Editing
+                        </Text>
+                      ) : null}
+                    </Pressable>
+                  </Menu>
+                  {workflow?.canPromoteToSteer || workflow?.canSendNow ? (
+                    // Outside the edit row and full row height, so a near miss never opens the editor.
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Send now, queued message ${index + 1}`}
+                      disabled={!controls.canSend}
+                      onPress={() => void act(run.id, "steer")}
+                      className="shrink-0 justify-center self-stretch pl-4 active:opacity-70 disabled:opacity-40"
+                    >
+                      <View className="min-h-9 flex-row items-center gap-1.5 rounded-full bg-primary px-4">
+                        <SymbolView
+                          name="arrow.up"
+                          size={13}
+                          tintColorClassName="accent-primary-foreground"
+                        />
+                        <Text className="font-t3-medium text-sm text-primary-foreground">
+                          Send now
+                        </Text>
+                      </View>
+                    </Pressable>
+                  ) : null}
+                </View>
+              </QueueRowSwipeable>
+            </View>
+          );
+        },
+      )}
     </ScrollView>
   );
 

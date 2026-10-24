@@ -1,6 +1,7 @@
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
 import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
+import { userShellCommandOwnsWorkingSlot } from "@t3tools/client-runtime/user-shell-command";
 import * as DateTime from "effect/DateTime";
 import * as Equal from "effect/Equal";
 import {
@@ -1388,6 +1389,21 @@ function deriveTimelineTurnFolds(
   });
 }
 
+/** `userShellCommandOwnsWorkingSlot` with this thread's optimistic sends. */
+export function deriveUserShellCommandOwnsWorkingSlot(input: {
+  readonly projection: Parameters<typeof userShellCommandOwnsWorkingSlot>[0]["projection"];
+  readonly optimisticMessages: ReadonlyArray<
+    Pick<ChatMessage, "id" | "shellCommand" | "inputIntent">
+  >;
+}): boolean {
+  return userShellCommandOwnsWorkingSlot({
+    projection: input.projection,
+    sendingShellMessageIds: input.optimisticMessages.flatMap((message) =>
+      message.shellCommand === true && message.inputIntent !== "queued_turn" ? [message.id] : [],
+    ),
+  });
+}
+
 export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   pendingApprovalRequestIds?: ReadonlySet<RuntimeRequestId>;
@@ -1405,6 +1421,8 @@ export function deriveMessagesTimelineRows(input: {
   threadStartCheckpointReady?: boolean;
   availableRevertTurnCounts?: ReadonlySet<number> | undefined;
   worktreeSetup?: WorktreeSetupSnapshot | null;
+  /** See `deriveUserShellCommandOwnsWorkingSlot`. */
+  userShellCommandOwnsWorkingSlot?: boolean;
 }): MessagesTimelineRow[] {
   const timelineEntries = timelineRowEntries(input.timelineEntries);
   const isPendingApproval = (entry: WorkLogEntry) => {
@@ -1648,7 +1666,24 @@ export function deriveMessagesTimelineRows(input: {
   const activeCompactionRunId = compactsOnReturn
     ? runningCompactionRunId
     : (resumeCompactionEntry?.entry.runId ?? null);
+  const setupHandedOff =
+    input.worktreeSetup !== null &&
+    input.worktreeSetup !== undefined &&
+    worktreeSetupAgentStarted(input.worktreeSetup) &&
+    input.latestRun?.startedAt != null;
+  const setupOwnsWorkingSlot =
+    !setupHandedOff &&
+    (input.worktreeSetup?.phase === "running" || input.worktreeSetup?.phase === "done");
+  // Visible non-agent work owns the working slot while the agent waits on it, so the agent gets no
+  // "Thinking" row. Worktree setup shows its card under its own working row; a `! cmd` shows in
+  // the composer's shell commands control, so the agent gets no working row either.
+  const workingSlotOwner = setupOwnsWorkingSlot
+    ? "worktree-setup"
+    : input.userShellCommandOwnsWorkingSlot === true
+      ? "user-shell-command"
+      : null;
   const appendWorkingRow = () => {
+    if (workingSlotOwner === "user-shell-command") return;
     if (compactionOnlyRunFinished) return;
     if (runningCompactionRunId !== null && activeCompactionRunId === null) return;
     nextRows.push({
@@ -2052,14 +2087,6 @@ export function deriveMessagesTimelineRows(input: {
     });
   }
 
-  const setupHandedOff =
-    input.worktreeSetup !== null &&
-    input.worktreeSetup !== undefined &&
-    worktreeSetupAgentStarted(input.worktreeSetup) &&
-    input.latestRun?.startedAt != null;
-  const setupOwnsWorkingSlot =
-    !setupHandedOff &&
-    (input.worktreeSetup?.phase === "running" || input.worktreeSetup?.phase === "done");
   if (input.worktreeSetup && (!setupHandedOff || input.worktreeSetup.phase !== "running")) {
     const setupRow = {
       kind: "worktree-setup",
@@ -2102,7 +2129,7 @@ export function deriveMessagesTimelineRows(input: {
   if (
     input.isWorking &&
     input.latestRun?.turnEnded !== true &&
-    !setupOwnsWorkingSlot &&
+    workingSlotOwner === null &&
     !hasActiveCompaction &&
     !compactionOnlyRunFinished &&
     (latestToolFailed || (!hasActivityRow && !input.pendingApprovalRequestIds?.size))

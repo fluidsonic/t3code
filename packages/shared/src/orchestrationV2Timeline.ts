@@ -9,7 +9,43 @@ type TimelineRun = Pick<OrchestrationV2Run, "id" | "status">;
 type TimelineRunAttempt = Pick<OrchestrationV2RunAttempt, "runId" | "rootNodeId" | "status">;
 type TimelineTurnItem = Pick<OrchestrationV2TurnItem, "type" | "runId" | "nodeId"> & {
   readonly inputIntent?: OrchestrationV2UserMessageInputIntent;
+  readonly userShellMessageId?: string | undefined;
+  readonly userShellDelivered?: boolean | undefined;
 };
+
+/**
+ * A person's `! cmd` joins the conversation only once its result reaches the agent. Until then,
+ * waiting, running or stopped, its item is live state shown above the composer.
+ */
+export function isUndeliveredUserShellCommand(item: TimelineTurnItem): boolean {
+  return (
+    item.type === "command_execution" &&
+    item.userShellMessageId !== undefined &&
+    item.userShellDelivered !== true
+  );
+}
+
+/**
+ * An undelivered command a client still shows above the composer, so snapshots keep it outside
+ * their timeline window: waiting or running, finished in a run whose turn has yet to start, or
+ * finished while its run's turn waits for it (held at a steering window, or being released).
+ */
+export function isLiveUserShellCommand(
+  item: TimelineTurnItem & Pick<OrchestrationV2TurnItem, "status">,
+  runs: ReadonlyArray<TimelineRun>,
+): boolean {
+  if (!isUndeliveredUserShellCommand(item)) return false;
+  if (item.status === "pending" || item.status === "running" || item.status === "waiting") {
+    return true;
+  }
+  const run =
+    item.runId === null ? undefined : runs.find((candidate) => candidate.id === item.runId);
+  return (
+    run?.status === "starting" ||
+    run?.status === "queued" ||
+    (run?.status === "running" && (item.status === "completed" || item.status === "failed"))
+  );
+}
 
 export function isOrchestrationV2SupersededInterrupt(input: {
   readonly item: TimelineTurnItem;
@@ -45,6 +81,7 @@ export function isOrchestrationV2TurnItemVisible(input: {
   readonly items: ReadonlyArray<TimelineTurnItem>;
 }): boolean {
   const { item } = input;
+  if (isUndeliveredUserShellCommand(item)) return false;
   if (
     item.runId !== null &&
     input.runs.some((run) => run.id === item.runId && run.status === "rolled_back")
@@ -89,6 +126,7 @@ export function createOrchestrationV2TurnItemVisibility(input: {
     input.items.filter((item) => item.type === "run_interrupt_request").map((item) => item.runId),
   );
   return (item) => {
+    if (isUndeliveredUserShellCommand(item)) return false;
     const status = item.runId === null ? undefined : statuses.get(item.runId);
     if (status === "rolled_back") return false;
     if (
