@@ -74,6 +74,11 @@ import {
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
 import {
+  normalizeShellCommandMessageText,
+  shellCommandFromMessageText,
+  userShellCommandItemId,
+} from "@t3tools/shared/shellCommand";
+import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -167,6 +172,16 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import {
+  isShellCommandMessage,
+  USER_SHELL_COMMAND_TITLE,
+  userShellBypassedModes,
+  userShellDispatchRejection,
+} from "./UserShellCommands.ts";
+import {
+  isUserShellCommandItem,
+  type UserShellCommandItem,
+} from "@t3tools/provider-core/server/userShellCommand";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -459,6 +474,15 @@ function wakeWorkStartedAt(
   return previous === undefined ? {} : { workStartedAt: orchestrationV2RunWorkStartedAt(previous) };
 }
 
+/** Shell commands run in the terminal, so `! /goal` is never a goal control message. */
+function goalCommandOf(message: {
+  readonly text: string;
+  readonly attachments?: ReadonlyArray<unknown> | undefined;
+  readonly shellCommand?: boolean | undefined;
+}) {
+  return message.shellCommand === true ? null : parseGoalCommand(message);
+}
+
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
 /** Unfinished runs (including queued) or open requests block moving a thread to another project. */
@@ -536,6 +560,10 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.background-work.settle":
     case "thread.stop":
     case "provider.switch":
+    case "user-shell-command.stop":
+    case "user-shell-command.finish":
+    case "user-shell-command.hold":
+    case "user-shell-command.released":
       return command.threadId;
     case "delegated_task.request":
     case "delegated_task.remote.request":
@@ -742,7 +770,7 @@ function delegatedTaskTerminalStatus(
 }
 
 function nextQueuedRun(
-  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
 ): OrchestrationV2Run | undefined {
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
 }
@@ -1487,6 +1515,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
       const projection = yield* readCommandProjection(threadId);
+      // A steered `! cmd` can outlive the turn it held; nothing starts beside it. Its result
+      // then starts the queue again (see `dispatchWithReceiptEffect`).
+      if (
+        projection.thread.hasShellCommands === true &&
+        (yield* readActiveUserShellItems(threadId)).some((item) => item.status === "running")
+      ) {
+        return;
+      }
       if (
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
@@ -1513,8 +1549,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         modelSelection,
         providerInstanceId: modelSelection.instanceId,
       };
+      // A command that has not run yet starts without its provider: only the agent's reply after
+      // it waits on usage limits, a disabled instance, or an earlier provider failure.
+      const shellPhase =
+        isShellCommandMessage(queuedMessage) &&
+        queuedMessage !== undefined &&
+        (yield* readUserShellItem(threadId, userShellCommandItemId(queuedMessage.id))) === null;
       // A limited provider would fail and consume every waiting message.
-      if (usageLimitHoldsQueue(projection, queuedRun.providerInstanceId)) {
+      if (!shellPhase && usageLimitHoldsQueue(projection, queuedRun.providerInstanceId)) {
         return;
       }
       // Failed worktree creation would run queued work in the project checkout; wait for the user.
@@ -1527,27 +1569,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         failedRun?.id === options?.endedRunId &&
         failedRun?.workspacePreparation?.type === "worktree" &&
         projection.thread.worktreePath === null;
-      const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
-      const projectOverride =
-        settings.projectSettingsOverrides[projection.thread.projectId]?.providerInstances?.[
-          queuedRun.providerInstanceId
-        ]?.enabled;
-      const machineInstance = Object.hasOwn(
-        settings.providerInstances,
+      const instanceDisabledForProject = yield* providerInstanceDisabledForProject(
+        projection.thread.projectId,
         queuedRun.providerInstanceId,
-      )
-        ? settings.providerInstances[queuedRun.providerInstanceId]
-        : undefined;
-      const instanceDisabledForProject =
-        projectOverride !== undefined
-          ? !projectOverride
-          : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
+      );
       if (
         worktreeMissing ||
-        instanceDisabledForProject ||
-        (failureClass !== undefined &&
-          failureClass !== "validation_error" &&
-          failedRun?.providerInstanceId === queuedRun.providerInstanceId)
+        (!shellPhase &&
+          (instanceDisabledForProject ||
+            (failureClass !== undefined &&
+              failureClass !== "validation_error" &&
+              failedRun?.providerInstanceId === queuedRun.providerInstanceId)))
       ) {
         const now = yield* DateTime.now;
         yield* writeSystemEvents(
@@ -1928,6 +1960,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           title: null,
           type: "user_message",
           messageId: queuedMessage.id,
+          ...(queuedMessage.shellCommand === true ? { shellCommand: true } : {}),
           text: queuedMessage.text,
           attachments: queuedMessage.attachments,
           ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
@@ -1950,6 +1983,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         completedAt: now,
         updatedAt: now,
       };
+      // A command message joins the transcript with its result: once its batch is delivered,
+      // which a run whose commands already ran does as it starts.
+      const shellBatchDelivery =
+        isShellCommandMessage(queuedMessage) && !shellPhase
+          ? userShellBatchDeliveryEvents({
+              run: startingRun,
+              projection,
+              items: yield* readUserShellBatch(startingRun, []),
+              ordinal: Math.max(yield* nextTurnItemOrdinal(projection), userTurnItem.ordinal),
+              now,
+            })
+          : null;
+      const scheduledCommand = shellPhase
+        ? scheduleUserShellCommand({
+            commandId,
+            run: startingRun,
+            nodeId: rootNodeId,
+            message: queuedMessage,
+            ordinal: userTurnItem.ordinal + 1,
+            now,
+            active: yield* readActiveUserShellItems(threadId),
+            thread: projection.thread,
+          })
+        : null;
       const handoffTurnItem: OrchestrationV2TurnItem | null =
         activeHandoff === null
           ? null
@@ -2150,15 +2207,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: providerThread,
           },
-          {
-            type: "turn-item.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
-          },
+          ...(isShellCommandMessage(queuedMessage)
+            ? (shellBatchDelivery ?? [])
+            : [
+                {
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNodeId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
+                },
+              ]),
           {
             type: "run.updated",
             threadId,
@@ -2168,6 +2229,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: startingRun,
           },
+          ...(scheduledCommand?.events ?? []),
         ],
         [
           ...sessionsToDetach.map((session) => ({
@@ -2180,12 +2242,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               detail: "Provider or model selection changed.",
             },
           })),
-          {
-            id: `effect:${commandId}:provider-turn.start:${queuedRun.id}`,
-            commandId,
-            threadId,
-            request: { type: "provider-turn.start", runId: queuedRun.id },
-          },
+          ...(scheduledCommand === null
+            ? [
+                {
+                  id: `effect:${commandId}:provider-turn.start:${queuedRun.id}`,
+                  commandId,
+                  threadId,
+                  request: { type: "provider-turn.start" as const, runId: queuedRun.id },
+                },
+              ]
+            : scheduledCommand.effects),
         ],
       );
     },
@@ -3817,6 +3883,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             item.runId === run.id &&
             item.type === "command_execution" &&
             item.input === WORKSPACE_PREPARATION_INPUT &&
+            item.userShellMessageId === undefined &&
             item.status === "running",
         );
         if (preparationItem === undefined) continue;
@@ -3868,6 +3935,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: { ...node, status: "cancelled", completedAt: now },
         });
+      }
+      // Archive ends the thread's `! cmd` commands. Their late results no longer continue a run,
+      // so a run still running its commands ends here, without an agent turn.
+      const stoppedShellItems =
+        projection.thread.hasShellCommands === true
+          ? yield* interruptActiveUserShellItems({ command, events, effects, now })
+          : [];
+      if (stoppedShellItems.length > 0) {
+        const afterShellStop = yield* getProjectionWithPendingEvents(command.threadId, events);
+        for (const runId of new Set(stoppedShellItems.flatMap((item) => item.runId ?? []))) {
+          const run = afterShellStop.runs.find((candidate) => candidate.id === runId);
+          if (run?.status !== "starting") continue;
+          yield* settleUserShellRunInterrupted({
+            command,
+            events,
+            effects,
+            projection: afterShellStop,
+            run,
+            now,
+          });
+        }
       }
       yield* disposeAllDelegatedCompletionCohorts({
         command,
@@ -4369,6 +4457,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly idleCompaction?: OrchestrationV2ConversationMessage["idleCompaction"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
     readonly forceRestart: boolean;
+    /** Delivering a finished `! cmd`: its message and result join the transcript here. */
+    readonly shellCommand?: boolean;
   }) {
     const targetRun = input.projection.runs.find((candidate) => candidate.id === input.targetRunId);
     if (targetRun === undefined) {
@@ -4388,7 +4478,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
       });
     }
-    if (parseGoalCommand(input) !== null) {
+    if (goalCommandOf(input) !== null) {
       return yield* new OrchestratorDispatchError({
         commandId: input.command.commandId,
         commandType: input.command.type,
@@ -4517,6 +4607,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const message: OrchestrationV2ConversationMessage = {
           createdBy: input.createdBy,
           creationSource: input.creationSource,
+          ...(input.shellCommand === true ? { shellCommand: true } : {}),
           ...(input.delegatedCompletion === undefined
             ? {}
             : { delegatedCompletion: input.delegatedCompletion }),
@@ -4565,6 +4656,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             input.command.type === "queued-message.promote-to-steer"
               ? "promoted_queued_to_steer"
               : "steer",
+          ...(input.shellCommand === true ? { shellCommand: true } : {}),
           text: input.text,
           attachments: input.attachments,
           ...(input.context ? { context: input.context } : {}),
@@ -4587,6 +4679,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: notificationTurnItem(turnItem, message, input.projection.subagents),
         });
+        if (input.shellCommand === true) {
+          yield* emitDeliveredUserShellItem({
+            command: input.command,
+            events: input.events,
+            messageId: input.messageId,
+            run: { id: messageInput.runId, providerInstanceId: messageInput.providerInstanceId },
+            nodeId: messageInput.nodeId,
+            ordinal: turnItem.ordinal + 1,
+            now,
+          });
+        }
       },
     );
 
@@ -5058,8 +5161,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    /**
+     * `redelivery`: results and messages sent before, queued again because they never reached
+     * the agent (see `queueUserShellRedelivery`); never a fresh send, and always queued.
+     * `shellCommandGroup`: see `OrchestrationV2ConversationMessage.shellCommandGroup`.
+     */
+    options: {
+      readonly redelivery?: boolean;
+      readonly shellSteer?: boolean;
+      readonly shellCommandGroup?: MessageId | undefined;
+    } = {},
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    const shellCommand = command.shellCommand === true;
+    // A command that already ran is being redelivered: its result goes to an agent, and its
+    // message and result join the transcript where that happens.
+    const shellResultDelivery =
+      shellCommand &&
+      (yield* readUserShellItem(command.threadId, userShellCommandItemId(command.messageId))) !==
+        null;
+    const redelivery = shellResultDelivery || options.redelivery === true;
+    const shellFields = shellCommand
+      ? {
+          shellCommand: true as const,
+          ...(options.shellCommandGroup === undefined
+            ? {}
+            : { shellCommandGroup: options.shellCommandGroup }),
+        }
+      : {};
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -5208,7 +5337,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // Background wakes and delegated completions continue work the user already snoozed, so
     // only a message someone actually sent ends the snooze.
     const automaticWake =
-      command.notification !== undefined || command.delegatedCompletion !== undefined;
+      command.notification !== undefined || command.delegatedCompletion !== undefined || redelivery;
     if (projection.thread.snoozedUntil != null && !automaticWake) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {
@@ -5303,7 +5432,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchMode = { type: "queue_after_active" };
     }
     // Codex and Claude own /goal; elsewhere it is ordinary text that cannot steer.
-    const parsedGoalCommand = parseGoalCommand(command);
+    const parsedGoalCommand = goalCommandOf(command);
     const goalCommand =
       parsedGoalCommand === null ||
       (yield* goalDriverFor(command, modelSelection.instanceId)) === undefined
@@ -5486,6 +5615,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             payload: { ...sourcePlan, status: "completed" },
           });
 
+    // A steered command must not run beside the agent's own tools and edits, so it waits for the
+    // agent to pause or for its turn to end, and steers sent meanwhile wait with it.
+    const steeredRunId =
+      dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active"
+        ? dispatchMode.targetRunId
+        : undefined;
+    const steering = steeredRunId !== undefined;
+    if (
+      projection.thread.hasShellCommands === true &&
+      !redelivery &&
+      command.createdBy === "user" &&
+      delegatedCompletion === undefined &&
+      command.notification === undefined &&
+      !isNativeMaintenanceCommand(command) &&
+      goalCommandOf(command) === null
+    ) {
+      const windowRun = yield* readUserShellWindowRun(projection, events);
+      if (
+        windowRun === undefined
+          ? shellCommand && steering
+          : steering || command.deliveryIntent !== undefined
+      ) {
+        yield* dispatchUserShellSteer({
+          command,
+          events,
+          effects,
+          target: windowRun ?? projection.runs.find((run) => run.id === steeredRunId),
+          shellCommandGroup: options.shellCommandGroup,
+        });
+        return;
+      }
+    }
     if (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") {
       yield* dispatchSteerIntoRun({
         command,
@@ -5511,6 +5672,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         ...(command.idleCompaction === undefined ? {} : { idleCompaction: command.idleCompaction }),
         forceRestart: dispatchMode.type === "restart_active",
+        ...shellFields,
       });
       return;
     }
@@ -5531,12 +5693,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
-    const queueBehindRun = activeRun ?? worktreeMissingRun;
-    const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     const startsOrQueuesRun =
       dispatchMode.type === "defer_start" ||
       dispatchMode.type === "start_immediately" ||
       dispatchMode.type === "queue_after_active";
+    // A steered `! cmd` can outlive the turn it held. Nothing starts beside it: a send waits
+    // behind it like behind a turn, and so does a redelivery, which is always queued.
+    const shellBusyRun =
+      projection.thread.hasShellCommands !== true ||
+      activeRun !== undefined ||
+      worktreeMissingRun !== undefined ||
+      !startsOrQueuesRun
+        ? undefined
+        : options.redelivery === true
+          ? (latestRun ?? projection.runs.at(-1))
+          : yield* runOfOutlivingUserShellCommand(projection, events);
+    const queueBehindRun = activeRun ?? worktreeMissingRun ?? shellBusyRun;
+    const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     const shouldQueue = queueBehindRun !== undefined && startsOrQueuesRun;
     // Client messages resume held queues; server continuations and scheduled tasks do not.
     // Provider failure or usage limits re-hold the queue. Failed worktree setup keeps it held
@@ -5553,7 +5726,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (command.creationSource === "web" || command.creationSource === "mobile") &&
       command.scheduledTaskId === undefined;
     const heldRunsToRelease =
-      sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved
+      sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved && !redelivery
         ? projection.runs.filter((run) => run.status === "queued" && run.queueHeld === true)
         : [];
     const releasedAt = yield* DateTime.now;
@@ -5607,17 +5780,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : projection.providerSessions.find(
               (candidate) => candidate.id === targetProviderThread.providerSessionId,
             );
-      const queuedCapabilities =
-        selectedProviderSession?.capabilities ??
-        (yield* queuedAdapter.getCapabilities().pipe(mapDispatchError(command)));
-      yield* mapDispatchError(command)(
-        commandPolicy.ensureQueuedMessages({
-          commandId: command.commandId,
-          threadId: command.threadId,
-          providerInstanceId: modelSelection.instanceId,
-          capabilities: queuedCapabilities,
-        }),
-      );
+      // A queued command runs on the server, whatever the provider supports.
+      if (!shellCommand) {
+        const queuedCapabilities =
+          selectedProviderSession?.capabilities ??
+          (yield* queuedAdapter.getCapabilities().pipe(mapDispatchError(command)));
+        yield* mapDispatchError(command)(
+          commandPolicy.ensureQueuedMessages({
+            commandId: command.commandId,
+            threadId: command.threadId,
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: queuedCapabilities,
+          }),
+        );
+      }
       const queuedProviderThread: OrchestrationV2ProviderThread = targetProviderThread ?? {
         id: idAllocator.derive.providerThread({
           driver: queuedAdapter.driver,
@@ -5757,6 +5933,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId,
         nodeId: rootNodeId,
         role: "user",
+        ...shellFields,
+        ...(options.shellSteer === true ? { shellSteer: true } : {}),
         text: dispatchText,
         ...(command.context ? { context: command.context } : {}),
         attachments: command.attachments,
@@ -6104,6 +6282,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId,
         nodeId: rootNodeId,
         role: "user",
+        ...shellFields,
         text: dispatchText,
         ...(command.context ? { context: command.context } : {}),
         attachments: command.attachments,
@@ -6138,6 +6317,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         type: "user_message",
         messageId: command.messageId,
         inputIntent: "turn_start",
+        ...shellFields,
         text: dispatchText,
         ...(command.context ? { context: command.context } : {}),
         attachments: command.attachments,
@@ -6233,15 +6413,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: message,
       });
-      yield* emitEvent({
-        type: "turn-item.updated",
-        threadId: command.threadId,
-        runId,
-        nodeId: rootNodeId,
-        providerInstanceId: modelSelection.instanceId,
-        occurredAt: now,
-        payload: notificationTurnItem(turnItem, message, projection.subagents),
-      });
+      // A command that has yet to run joins the transcript once its result is delivered.
+      if (!shellCommand || shellResultDelivery) {
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          runId,
+          nodeId: rootNodeId,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: notificationTurnItem(turnItem, message, projection.subagents),
+        });
+      }
+      if (shellResultDelivery) {
+        yield* emitDeliveredUserShellItem({
+          command,
+          events,
+          messageId: command.messageId,
+          run,
+          nodeId: rootNodeId,
+          ordinal: turnItem.ordinal + 1,
+          now,
+        });
+      }
       if (preparationTurnItem !== null) {
         yield* emitEvent({
           type: "turn-item.updated",
@@ -6260,7 +6454,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         request: { type: "provider-turn.start", runId },
       } satisfies PendingOrchestrationEffectV2;
       if (dispatchMode.type !== "defer_start") {
-        yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+        if (shellCommand && !shellResultDelivery) {
+          yield* emitScheduledUserShellCommand({
+            command,
+            events,
+            effects,
+            run,
+            nodeId: rootNodeId,
+            message,
+            ordinal: turnItem.ordinal + 1,
+            now,
+          });
+        } else {
+          yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+        }
       }
       return;
     }
@@ -6793,6 +7000,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       runId,
       nodeId: rootNodeId,
       role: "user",
+      ...shellFields,
       text: dispatchText,
       ...(command.context ? { context: command.context } : {}),
       attachments: command.attachments,
@@ -6827,6 +7035,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       type: "user_message",
       messageId: command.messageId,
       inputIntent: "turn_start",
+      ...shellFields,
       text: dispatchText,
       ...(command.context ? { context: command.context } : {}),
       attachments: command.attachments,
@@ -7127,15 +7336,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: message,
     });
-    yield* emitEvent({
-      type: "turn-item.updated",
-      threadId: command.threadId,
-      runId,
-      nodeId: rootNodeId,
-      providerInstanceId: modelSelection.instanceId,
-      occurredAt: now,
-      payload: notificationTurnItem(turnItem, message, projection.subagents),
-    });
+    if (!shellCommand || shellResultDelivery) {
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        runId,
+        nodeId: rootNodeId,
+        providerInstanceId: modelSelection.instanceId,
+        occurredAt: now,
+        payload: notificationTurnItem(turnItem, message, projection.subagents),
+      });
+    }
+    if (shellResultDelivery) {
+      yield* emitDeliveredUserShellItem({
+        command,
+        events,
+        messageId: command.messageId,
+        run,
+        nodeId: rootNodeId,
+        ordinal: turnItem.ordinal + 1,
+        now,
+      });
+    }
     const forkResolution = nativeForkResolution ?? portableForkResolution;
     if (pendingForkTransfer !== undefined && forkResolution !== null) {
       yield* emitEvent({
@@ -7184,6 +7406,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         } satisfies PendingOrchestrationEffectV2,
       ]);
+    }
+    if (shellCommand && !shellResultDelivery) {
+      yield* emitScheduledUserShellCommand({
+        command,
+        events,
+        effects,
+        run,
+        nodeId: rootNodeId,
+        message,
+        ordinal: turnItem.ordinal + 1,
+        now,
+      });
+      return;
     }
     const pendingEffect = {
       id: `effect:${command.commandId}:provider-turn.start:${runId}`,
@@ -9026,10 +9261,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: "Automatic completion deliveries cannot be promoted to Steer.",
       });
     }
+    if (
+      queuedMessage.shellCommand === true &&
+      (yield* readUserShellItem(command.threadId, userShellCommandItemId(queuedMessage.id))) !==
+        null
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "This shell command already ran.",
+      });
+    }
+    // A steered command, or a steer while one holds the agent, waits for it in the queue.
+    const windowRun =
+      projection.thread.hasShellCommands === true
+        ? yield* readUserShellWindowRun(projection, events)
+        : undefined;
+    if (queuedMessage.shellCommand === true || windowRun !== undefined) {
+      yield* steerQueuedRunForUserShell({
+        command,
+        events,
+        effects,
+        messageId: queuedMessage.id,
+        target: windowRun ?? projection.runs.find((run) => run.id === command.targetRunId),
+      });
+      return;
+    }
 
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
-    const parsedGoalCommand = parseGoalCommand(queuedMessage);
+    const parsedGoalCommand = goalCommandOf(queuedMessage);
     const goalCommand =
       parsedGoalCommand === null ||
       (yield* goalDriverFor(command, queuedRun.providerInstanceId)) === undefined
@@ -9411,11 +9672,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: "A guest's message cannot be edited. Cancel it instead.",
       });
     }
-    yield* ensureGoalCommandSupported(
-      command,
-      { text: command.text, attachments: command.attachments ?? queuedMessage.attachments },
-      queuedRun.providerInstanceId,
-    );
+    // The flag decides which permission the edit needed, so it must match the message: agents
+    // never set it and cannot edit a command, and no edit turns a message into one.
+    if ((queuedMessage.shellCommand === true) !== (command.shellCommand === true)) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause:
+          queuedMessage.shellCommand === true
+            ? "This queued item is a shell command. Update T3 Code to edit it."
+            : "A queued message cannot be turned into a shell command.",
+      });
+    }
+    // A usage limit can send a run back to the queue after its commands ran; editing the command
+    // then would change what the agent is told ran.
+    if (
+      queuedMessage.shellCommand === true &&
+      (yield* readUserShellItem(command.threadId, userShellCommandItemId(queuedMessage.id))) !==
+        null
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "This command already ran; only the agent's reply is waiting.",
+      });
+    }
+    if (queuedMessage.shellCommand === true && (command.attachments?.length ?? 0) > 0) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "A shell command cannot have attachments.",
+      });
+    }
+    if (queuedMessage.shellCommand === true && shellCommandFromMessageText(command.text) === "") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Queued run ${command.runId} cannot be edited to an empty command.`,
+      });
+    }
+    // Stored as `! <command>` so clients without shell commands still read it as one.
+    const editedText =
+      queuedMessage.shellCommand === true
+        ? normalizeShellCommandMessageText(command.text)
+        : command.text;
+    if (queuedMessage.shellCommand !== true) {
+      yield* ensureGoalCommandSupported(
+        command,
+        { text: command.text, attachments: command.attachments ?? queuedMessage.attachments },
+        queuedRun.providerInstanceId,
+      );
+    }
     const queuedTurnItem = projection.turnItems.find(
       (candidate) => candidate.type === "user_message" && candidate.messageId === queuedMessage.id,
     );
@@ -9433,7 +9740,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: withoutGuestAttribution({
         ...queuedMessage,
-        text: command.text,
+        text: editedText,
         ...editedAttachments,
         ...(command.context ? { context: command.context } : {}),
         updatedAt: now,
@@ -9449,7 +9756,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: withoutGuestAttribution({
           ...queuedTurnItem,
-          text: command.text,
+          text: editedText,
           ...editedAttachments,
           ...(command.context ? { context: command.context } : {}),
           updatedAt: now,
@@ -9499,7 +9806,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }> =>
         candidate.runId === command.runId &&
         candidate.type === "command_execution" &&
-        candidate.input === WORKSPACE_PREPARATION_INPUT,
+        candidate.input === WORKSPACE_PREPARATION_INPUT &&
+        candidate.userShellMessageId === undefined,
     );
     if (
       run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
@@ -9629,6 +9937,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: { ...state.run, status: "starting" },
       });
+      // A new thread's first command runs once its workspace exists, in that workspace.
+      const message =
+        projection.thread.hasShellCommands === true
+          ? (yield* loadProjectionForCommand(command, ["messages"], {
+              messageIds: [state.run.userMessageId],
+            })).messages.find((candidate) => candidate.id === state.run.userMessageId)
+          : undefined;
+      if (
+        message !== undefined &&
+        isShellCommandMessage(message) &&
+        (yield* readUserShellItem(command.threadId, userShellCommandItemId(message.id))) === null
+      ) {
+        yield* emitScheduledUserShellCommand({
+          command,
+          events,
+          effects,
+          run: state.run,
+          nodeId: state.rootNode.id,
+          message,
+          ordinal: state.preparationItem.ordinal + 1,
+          now,
+        });
+        return;
+      }
       yield* Ref.update(effects, (existing) => [
         ...existing,
         {
@@ -10303,8 +10635,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly now: DateTime.Utc;
   }) {
     const emitEvent = emit(input.events, input.command);
-    const { runs, subagents } = input.projection;
+    const { subagents } = input.projection;
     let { thread } = input.projection;
+    // Earlier steps of this Stop may have settled a group's waiting commands; holding them again
+    // from an older read would bring them back.
+    const { runs } =
+      thread.hasShellCommands === true
+        ? yield* getProjectionWithPendingEvents(thread.id, input.events)
+        : input.projection;
     let recovery = thread.limitRecovery;
     const latest = latestExecutedRun(runs);
     if (latest?.status === "failed") {
@@ -10769,6 +11107,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     const now = yield* DateTime.now;
+    // Stop ends any `! cmd` still running, a steered one beside the agent included; none of
+    // their results reaches the agent.
+    if (projection.thread.hasShellCommands === true) {
+      yield* interruptActiveUserShellItems({ command, events, effects, now });
+    }
+    // The run reads as running until its provider stops it. A pause reported meanwhile must not
+    // open a window that runs the steered commands the Stop held.
+    if (run.userShellHold !== undefined) {
+      const { userShellHold: _hold, ...released } = run;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: released,
+      });
+    }
     const completionMessage = projection.messages.find(
       (candidate) => candidate.id === run.userMessageId,
     );
@@ -10881,6 +11240,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Run ${command.runId} has no active attempt to interrupt.`,
         });
       }
+      const shellItems =
+        projection.thread.hasShellCommands === true
+          ? (yield* loadProjectionForCommand(command, ["turnItems"], {
+              turnItemTypes: ["command_execution"],
+              turnItemRunIds: [run.id],
+            })).turnItems.filter(isUserShellCommandItem)
+          : [];
+      // A run of `! cmd` commands whose results reached no agent has nothing in the transcript,
+      // as when its command is stopped on its own, so it records no interrupt there either.
+      const reachedNoAgent =
+        run.status === "starting" &&
+        shellItems.length > 0 &&
+        shellItems.every((item) => item.userShellDelivered !== true);
       const interruptResultItem: OrchestrationV2TurnItem = {
         id: idAllocator.derive.runSignalTurnItem({
           runId: run.id,
@@ -10902,24 +11274,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         type: "run_interrupt_result",
         message: "Run interrupted before provider start",
       };
-      yield* emitEvent({
-        type: "turn-item.updated",
-        threadId: command.threadId,
-        runId: run.id,
-        nodeId: rootNode.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: now,
-        payload: interruptRequestItem,
-      });
-      yield* emitEvent({
-        type: "turn-item.updated",
-        threadId: command.threadId,
-        runId: run.id,
-        nodeId: rootNode.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: now,
-        payload: interruptResultItem,
-      });
+      for (const payload of reachedNoAgent ? [] : [interruptRequestItem, interruptResultItem]) {
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: rootNode.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload,
+        });
+      }
       const preparationItem = projection.turnItems.find(
         (
           candidate,
@@ -10927,6 +11292,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           candidate.runId === run.id &&
           candidate.type === "command_execution" &&
           candidate.input === WORKSPACE_PREPARATION_INPUT &&
+          candidate.userShellMessageId === undefined &&
           candidate.status === "running",
       );
       if (preparationItem !== undefined) {
@@ -10976,6 +11342,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       yield* stopRemainingWork();
       yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
+      // Its commands may have changed files, so the stopped run still gets a checkpoint.
+      const scopeId = rootNode.checkpointScopeId;
+      if (shellItems.length > 0 && scopeId !== null) {
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:checkpoint.capture:${run.id}`,
+            commandId: CommandId.make(`command:effect:checkpoint.capture:${run.id}`),
+            threadId: command.threadId,
+            request: { type: "checkpoint.capture", runId: run.id, scopeId },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
+      }
       return {
         effectTypes: ["provider-turn.start", "provider-turn.restart"],
         reason: `Run ${run.id} was interrupted before its provider turn started.`,
@@ -11217,7 +11596,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       >;
       readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
       readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
-      readonly projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">;
+      readonly projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">;
       readonly queuedRunId: RunId;
       readonly targetRunId: RunId | undefined;
       readonly reason: string;
@@ -11351,6 +11730,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     const now = yield* DateTime.now;
+    // A steered `! cmd` can outlive its turn, and it is not the agent's background work.
+    if (projection.thread.hasShellCommands === true) {
+      yield* interruptActiveUserShellItems({ command, events, effects, now });
+    }
     // Record that Stop reached the turn it could not interrupt and the thread's last executed
     // run, so a late tool call from their agent starts nothing.
     const executed = latestExecutedRun(projection.runs);
@@ -12438,6 +12821,1676 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return parentRun.id;
   });
 
+  // `! cmd` shell commands. A starting run executes its commands in order, then starts its turn with
+  // the results. A steered command waits at the queue front until the agent pauses at its steering
+  // window, or runs as the next batch if the turn was interrupted. Command and result join the
+  // transcript only once delivered (`userShellDelivered`); until then they are live state.
+
+  const providerInstanceDisabledForProject = Effect.fnUntraced(function* (
+    projectId: OrchestrationV2AppThread["projectId"],
+    instanceId: ProviderInstanceId,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+    const projectOverride =
+      settings.projectSettingsOverrides[projectId]?.providerInstances?.[instanceId]?.enabled;
+    const machineInstance = Object.hasOwn(settings.providerInstances, instanceId)
+      ? settings.providerInstances[instanceId]
+      : undefined;
+    return projectOverride !== undefined
+      ? !projectOverride
+      : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
+  });
+
+  /** Pending and running commands of a thread, including those this command already wrote. */
+  const readActiveUserShellItems = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    pending: ReadonlyArray<OrchestrationV2DomainEvent> = [],
+  ) {
+    const { turnItems } = yield* projectionStore
+      .getThreadRecords(threadId, ["turnItems"], {
+        turnItemTypes: ["command_execution"],
+        turnItemStatuses: ["pending", "running"],
+      })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    const items = new Map<TurnItemId, UserShellCommandItem>();
+    for (const item of turnItems) {
+      if (isUserShellCommandItem(item)) items.set(item.id, item);
+    }
+    for (const event of pending) {
+      if (
+        event.type === "turn-item.updated" &&
+        event.threadId === threadId &&
+        isUserShellCommandItem(event.payload)
+      ) {
+        items.set(event.payload.id, event.payload);
+      }
+    }
+    return [...items.values()].filter(
+      (item) => item.status === "pending" || item.status === "running",
+    );
+  });
+
+  /** The ended run whose steered command still runs, which nothing may start beside. */
+  const runOfOutlivingUserShellCommand = Effect.fnUntraced(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
+    pending: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    // A thread this command creates is not stored yet, and has run nothing.
+    if (projection.runs.length === 0) return undefined;
+    const active = yield* readActiveUserShellItems(projection.thread.id, yield* Ref.get(pending));
+    const running = active.find((item) => item.status === "running");
+    return running === undefined
+      ? undefined
+      : projection.runs.find((run) => run.id === running.runId);
+  });
+
+  const readUserShellItem = (threadId: ThreadId, itemId: TurnItemId) =>
+    projectionStore.getTurnItem({ threadId, itemId }).pipe(
+      Effect.map((item) => (item !== null && isUserShellCommandItem(item) ? item : null)),
+      Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+    );
+
+  /** The command's item as this command has left it so far. */
+  const readPendingUserShellItem = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    itemId: TurnItemId,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const pending = (yield* Ref.get(events)).findLast(
+      (event) =>
+        event.type === "turn-item.updated" &&
+        event.threadId === threadId &&
+        event.payload.id === itemId,
+    );
+    if (pending?.type === "turn-item.updated" && isUserShellCommandItem(pending.payload)) {
+      return pending.payload;
+    }
+    return yield* readUserShellItem(threadId, itemId);
+  });
+
+  /**
+   * A command's result reached the agent: from here on it is conversation, shown and replayed,
+   * placed where it was delivered rather than where it was sent.
+   */
+  const emitDeliveredUserShellItem = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly messageId: MessageId;
+    readonly run: Pick<OrchestrationV2Run, "id" | "providerInstanceId">;
+    readonly nodeId: NodeId;
+    readonly ordinal: number;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const item = yield* readPendingUserShellItem(
+      threadId,
+      userShellCommandItemId(input.messageId),
+      input.events,
+    );
+    if (item === null || (item.status !== "completed" && item.status !== "failed")) return;
+    yield* emit(
+      input.events,
+      input.command,
+    )({
+      type: "turn-item.updated",
+      threadId,
+      runId: input.run.id,
+      nodeId: input.nodeId,
+      providerInstanceId: input.run.providerInstanceId,
+      occurredAt: input.now,
+      payload: {
+        ...item,
+        runId: input.run.id,
+        nodeId: input.nodeId,
+        ordinal: input.ordinal,
+        userShellDelivered: true,
+        updatedAt: input.now,
+      },
+    });
+  });
+
+  /** The finished, undelivered commands of a run's batch, in the order they ran. */
+  const readUserShellBatch = Effect.fnUntraced(function* (
+    run: Pick<OrchestrationV2Run, "id" | "threadId" | "userMessageId">,
+    pending: ReadonlyArray<OrchestrationV2DomainEvent>,
+  ) {
+    const threadId = run.threadId;
+    const { turnItems } = yield* projectionStore
+      .getThreadRecords(threadId, ["turnItems"], {
+        turnItemTypes: ["command_execution"],
+        turnItemRunIds: [run.id],
+      })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    const latest = new Map<TurnItemId, UserShellCommandItem>();
+    for (const item of turnItems) {
+      if (isUserShellCommandItem(item)) latest.set(item.id, item);
+    }
+    for (const event of pending) {
+      if (
+        event.type === "turn-item.updated" &&
+        isUserShellCommandItem(event.payload) &&
+        (latest.has(event.payload.id) || event.payload.runId === run.id)
+      ) {
+        latest.set(event.payload.id, event.payload);
+      }
+    }
+    return [...latest.values()]
+      .filter(
+        (item) =>
+          item.runId === run.id &&
+          item.userShellDelivered !== true &&
+          (item.status === "completed" || item.status === "failed"),
+      )
+      .toSorted((left, right) => left.ordinal - right.ordinal);
+  });
+
+  /**
+   * A starting run's batch, delivered as its provider turn starts: each finished command's message
+   * and result, in the order they ran, then the message that followed them. A stopped command
+   * stays out, as it stays out of the prompt.
+   */
+  const userShellBatchDeliveryEvents = (input: {
+    readonly run: OrchestrationV2Run;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "messages" | "turnItems">;
+    readonly items: ReadonlyArray<UserShellCommandItem>;
+    readonly ordinal: number;
+    readonly now: DateTime.Utc;
+    /** Delivered into a running turn rather than as its start. */
+    readonly inputIntent?: "steer";
+    /** Only these of the run's waiting messages; by default, all of them. */
+    readonly messageIds?: ReadonlyArray<MessageId>;
+  }): Array<Omit<OrchestrationV2DomainEvent, "id">> => {
+    const { run, now } = input;
+    const rootNodeId = run.rootNodeId;
+    if (rootNodeId === null) return [];
+    let ordinal = input.ordinal;
+    const userItem = (
+      message: OrchestrationV2ConversationMessage,
+      startIntent: "turn_start" | "queued_turn",
+    ): OrchestrationV2TurnItem => ({
+      createdBy: message.createdBy,
+      creationSource: message.creationSource,
+      id: idAllocator.derive.userTurnItem({ messageId: message.id }),
+      threadId: run.threadId,
+      runId: run.id,
+      nodeId: rootNodeId,
+      providerThreadId: run.providerThreadId,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: ordinal++,
+      status: "completed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "user_message",
+      messageId: message.id,
+      inputIntent: input.inputIntent ?? startIntent,
+      ...(message.shellCommand === true ? { shellCommand: true } : {}),
+      text: message.text,
+      attachments: message.attachments,
+      ...(message.context ? { context: message.context } : {}),
+    });
+    const base = {
+      threadId: run.threadId,
+      runId: run.id,
+      nodeId: rootNodeId,
+      providerInstanceId: run.providerInstanceId,
+      occurredAt: now,
+    } as const;
+    const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = [];
+    for (const item of input.items) {
+      const message = input.projection.messages.find(
+        (candidate) => candidate.id === item.userShellMessageId,
+      );
+      if (message === undefined) continue;
+      events.push(
+        {
+          ...base,
+          type: "message.updated",
+          payload: { ...message, runId: run.id, nodeId: rootNodeId, updatedAt: now },
+        },
+        {
+          ...base,
+          type: "turn-item.updated",
+          payload: userItem(
+            message,
+            message.id === run.userMessageId ? "turn_start" : "queued_turn",
+          ),
+        },
+        {
+          ...base,
+          type: "turn-item.updated",
+          payload: {
+            ...item,
+            runId: run.id,
+            nodeId: rootNodeId,
+            ordinal: ordinal++,
+            userShellDelivered: true,
+            updatedAt: now,
+          },
+        },
+      );
+    }
+    for (const message of input.projection.messages) {
+      if (
+        message.runId === run.id &&
+        message.role === "user" &&
+        message.shellCommand !== true &&
+        (input.messageIds === undefined || input.messageIds.includes(message.id)) &&
+        !input.projection.turnItems.some(
+          (item) => item.type === "user_message" && item.messageId === message.id,
+        )
+      ) {
+        events.push({
+          ...base,
+          type: "turn-item.updated",
+          payload: userItem(message, "queued_turn"),
+        });
+      }
+    }
+    return events;
+  };
+
+  const emitUserShellBatchDelivery = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly run: OrchestrationV2Run;
+    readonly now: DateTime.Utc;
+  }) {
+    const projection = yield* getProjectionWithPendingEvents(input.run.threadId, input.events);
+    const deliveryEvents = userShellBatchDeliveryEvents({
+      run: input.run,
+      projection,
+      items: yield* readUserShellBatch(input.run, yield* Ref.get(input.events)),
+      ordinal: yield* nextTurnItemOrdinal(projection),
+      now: input.now,
+    });
+    for (const event of deliveryEvents) yield* emit(input.events, input.command)(event);
+  });
+
+  const userShellRunEffect = (
+    commandId: CommandId,
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+  ): PendingOrchestrationEffectV2 => ({
+    id: `effect:${commandId}:user-shell-command.run:${turnItemId}`,
+    commandId,
+    threadId,
+    request: { type: "user-shell-command.run", turnItemId },
+  });
+
+  /**
+   * The command's item, running with an effect that starts it, or pending while another command
+   * of the thread runs: a thread's commands never overlap, steered ones included.
+   */
+  const scheduleUserShellCommand = (input: {
+    readonly commandId: CommandId;
+    readonly run: Pick<OrchestrationV2Run, "id" | "threadId" | "providerInstanceId">;
+    readonly nodeId: NodeId;
+    readonly message: Pick<OrchestrationV2ConversationMessage, "id" | "text">;
+    readonly ordinal: number;
+    readonly now: DateTime.Utc;
+    readonly active: ReadonlyArray<UserShellCommandItem>;
+    readonly thread: Pick<OrchestrationV2AppThread, "runtimeMode" | "interactionMode">;
+  }) => {
+    const start = !input.active.some((item) => item.status === "running");
+    const bypassedModes = userShellBypassedModes(input.thread);
+    const item: UserShellCommandItem = {
+      id: userShellCommandItemId(input.message.id),
+      threadId: input.run.threadId,
+      runId: input.run.id,
+      nodeId: input.nodeId,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: input.ordinal,
+      status: start ? "running" : "pending",
+      // Clients that predate shell commands show the item as a tool row labeled by its title;
+      // current clients render it from `userShellMessageId` and ignore the title.
+      title: USER_SHELL_COMMAND_TITLE,
+      startedAt: start ? input.now : null,
+      completedAt: null,
+      updatedAt: input.now,
+      type: "command_execution",
+      input: shellCommandFromMessageText(input.message.text),
+      userShellMessageId: input.message.id,
+      ...(bypassedModes.length === 0 ? {} : { bypassedModes }),
+    };
+    return {
+      events: [
+        {
+          type: "turn-item.updated" as const,
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          nodeId: input.nodeId,
+          providerInstanceId: input.run.providerInstanceId,
+          occurredAt: input.now,
+          payload: item,
+        },
+      ],
+      effects: start ? [userShellRunEffect(input.commandId, input.run.threadId, item.id)] : [],
+    };
+  };
+
+  const emitScheduledUserShellCommand = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly run: Pick<OrchestrationV2Run, "id" | "threadId" | "providerInstanceId">;
+    readonly nodeId: NodeId;
+    readonly message: Pick<OrchestrationV2ConversationMessage, "id" | "text">;
+    readonly ordinal: number;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = input.run.threadId;
+    const scheduled = scheduleUserShellCommand({
+      ...input,
+      commandId: input.command.commandId,
+      active: yield* readActiveUserShellItems(threadId, yield* Ref.get(input.events)),
+      thread: yield* projectionStore
+        .getThread(threadId)
+        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+    });
+    for (const event of scheduled.events) yield* emit(input.events, input.command)(event);
+    yield* Ref.update(input.effects, (existing) => [...existing, ...scheduled.effects]);
+  });
+
+  /** Starts the oldest waiting command once none runs. */
+  const startNextPendingUserShellCommand = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const thread = yield* projectionStore
+      .getThread(threadId)
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    if (thread.archivedAt !== null) return;
+    const active = yield* readActiveUserShellItems(threadId, yield* Ref.get(input.events));
+    if (active.some((item) => item.status === "running")) return;
+    const next = active
+      .filter((item) => item.status === "pending")
+      .toSorted(
+        (left, right) =>
+          DateTime.Order(left.updatedAt, right.updatedAt) || left.ordinal - right.ordinal,
+      )[0];
+    if (next === undefined) return;
+    yield* emit(
+      input.events,
+      input.command,
+    )({
+      type: "turn-item.updated",
+      threadId,
+      ...(next.runId === null ? {} : { runId: next.runId }),
+      ...(next.nodeId === null ? {} : { nodeId: next.nodeId }),
+      occurredAt: input.now,
+      payload: { ...next, status: "running", startedAt: input.now, updatedAt: input.now },
+    });
+    yield* Ref.update(input.effects, (existing) => [
+      ...existing,
+      userShellRunEffect(input.command.commandId, threadId, next.id),
+    ]);
+  });
+
+  /** Stop, archive, and delete end every command of the thread; none reaches an agent. */
+  const interruptActiveUserShellItems = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const active = yield* readActiveUserShellItems(threadId, yield* Ref.get(input.events));
+    for (const item of active) {
+      yield* emit(
+        input.events,
+        input.command,
+      )({
+        type: "turn-item.updated",
+        threadId,
+        ...(item.runId === null ? {} : { runId: item.runId }),
+        ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+        occurredAt: input.now,
+        payload: { ...item, status: "interrupted", completedAt: input.now, updatedAt: input.now },
+      });
+      yield* endWaitingUserShellGroup({ ...input, item, failed: false });
+    }
+    const running = active.filter((item) => item.status === "running").map((item) => item.id);
+    if (running.length > 0) {
+      yield* Ref.update(input.effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${input.command.commandId}:user-shell-command.stop`,
+          commandId: input.command.commandId,
+          threadId,
+          request: { type: "user-shell-command.stop", turnItemIds: running },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    }
+    return active;
+  });
+
+  /**
+   * A queued message a finished command folds into its run instead of starting its own. Only one
+   * for the same model: the run's turn would otherwise answer it with a model it was not sent to.
+   */
+  const absorbableQueuedMessage = (
+    target: OrchestrationV2Run,
+    run: OrchestrationV2Run | undefined,
+    message: OrchestrationV2ConversationMessage | undefined,
+  ): message is OrchestrationV2ConversationMessage =>
+    run !== undefined &&
+    message !== undefined &&
+    run.providerInstanceId === target.providerInstanceId &&
+    modelSelectionsEqual(run.modelSelection, target.modelSelection) &&
+    run.queueHeld !== true &&
+    run.restartContinuationOfRunId === undefined &&
+    run.sourcePlanRef === undefined &&
+    message.createdBy === "user" &&
+    message.notification === undefined &&
+    message.delegatedCompletion === undefined &&
+    message.scheduledTaskId === undefined &&
+    !isNativeMaintenanceCommand(message) &&
+    goalCommandOf(message) === null;
+
+  /**
+   * Moves a queued message into `target`, the way promote-to-steer folds a queued run. It joins
+   * the transcript with the run's batch, once that is delivered.
+   */
+  const absorbQueuedRun = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly projection: OrchestrationV2ThreadProjection;
+    readonly target: OrchestrationV2Run;
+    readonly queued: OrchestrationV2Run;
+    readonly message: OrchestrationV2ConversationMessage;
+    readonly now: DateTime.Utc;
+  }) {
+    const { target, message, now } = input;
+    const rootNodeId = target.rootNodeId;
+    if (rootNodeId === null) return;
+    yield* emitQueuedRunCancellation({
+      command: input.command,
+      events: input.events,
+      projection: input.projection,
+      run: input.queued,
+      now,
+    });
+    yield* emit(
+      input.events,
+      input.command,
+    )({
+      type: "message.updated",
+      threadId: target.threadId,
+      runId: target.id,
+      nodeId: rootNodeId,
+      providerInstanceId: target.providerInstanceId,
+      occurredAt: now,
+      payload: { ...message, runId: target.id, nodeId: rootNodeId, updatedAt: now },
+    });
+  });
+
+  const holdQueuedRuns = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    for (const run of projection.runs) {
+      if (run.status !== "queued" || run.queueHeld === true) continue;
+      yield* emit(
+        input.events,
+        input.command,
+      )({
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: input.now,
+        payload: { ...run, queueHeld: true },
+      });
+    }
+  });
+
+  /** Ends a run whose commands reached no agent, keeping a checkpoint of what they changed. */
+  const settleUserShellRunInterrupted = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly projection: OrchestrationV2ThreadProjection;
+    readonly run: OrchestrationV2Run;
+    readonly now: DateTime.Utc;
+  }) {
+    const { run, now } = input;
+    const attempt = input.projection.attempts.find(
+      (candidate) => candidate.id === run.activeAttemptId,
+    );
+    const rootNode = input.projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
+    const emitEvent = emit(input.events, input.command);
+    const base = {
+      threadId: run.threadId,
+      runId: run.id,
+      ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+      providerInstanceId: run.providerInstanceId,
+      occurredAt: now,
+    } as const;
+    if (attempt !== undefined) {
+      yield* emitEvent({
+        ...base,
+        type: "run-attempt.updated",
+        payload: { ...attempt, status: "interrupted", completedAt: now },
+      });
+    }
+    if (rootNode !== undefined) {
+      yield* emitEvent({
+        ...base,
+        type: "node.updated",
+        payload: { ...rootNode, status: "interrupted", completedAt: now },
+      });
+    }
+    yield* emitEvent({
+      ...base,
+      type: "run.updated",
+      payload: { ...run, status: "interrupted", completedAt: now },
+    });
+    const scopeId = rootNode?.checkpointScopeId ?? null;
+    if (scopeId !== null) {
+      yield* Ref.update(input.effects, (effects) => [
+        ...effects,
+        {
+          id: `effect:checkpoint.capture:${run.id}`,
+          commandId: CommandId.make(`command:effect:checkpoint.capture:${run.id}`),
+          threadId: run.threadId,
+          request: { type: "checkpoint.capture", runId: run.id, scopeId },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    }
+  });
+
+  /**
+   * The commands are done, so the run's provider turn starts with their results. A provider that
+   * cannot take it now (usage limit, disabled instance) leaves the run at the front of the queue,
+   * where the agent's reply waits like any queued message.
+   */
+  const startTurnAfterUserShellCommands = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly projection: OrchestrationV2ThreadProjection;
+    readonly run: OrchestrationV2Run;
+    readonly now: DateTime.Utc;
+  }) {
+    const { run, now } = input;
+    const limited = usageLimitHoldsQueue(input.projection, run.providerInstanceId);
+    const disabled = yield* providerInstanceDisabledForProject(
+      input.projection.thread.projectId,
+      run.providerInstanceId,
+    );
+    if (!limited && !disabled) {
+      yield* emitUserShellBatchDelivery({ command: input.command, events: input.events, run, now });
+      yield* Ref.update(input.effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${input.command.commandId}:provider-turn.start:${run.id}`,
+          commandId: input.command.commandId,
+          threadId: run.threadId,
+          request: { type: "provider-turn.start", runId: run.id },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+      return;
+    }
+    const emitEvent = emit(input.events, input.command);
+    yield* emitEvent({
+      type: "run.updated",
+      threadId: run.threadId,
+      runId: run.id,
+      providerInstanceId: run.providerInstanceId,
+      occurredAt: now,
+      payload: {
+        ...run,
+        status: "queued",
+        queuePosition: 1,
+        ...(disabled ? { queueHeld: true } : {}),
+      },
+    });
+    const behind = queuedRunsInDeliveryOrder(input.projection).filter(
+      (candidate) => candidate.id !== run.id,
+    );
+    for (const [index, queued] of behind.entries()) {
+      if (queued.queuePosition === index + 2) continue;
+      yield* emitEvent({
+        type: "run.updated",
+        threadId: run.threadId,
+        runId: queued.id,
+        providerInstanceId: queued.providerInstanceId,
+        occurredAt: now,
+        payload: { ...queued, queuePosition: index + 2 },
+      });
+    }
+  });
+
+  /**
+   * After one command of a starting run ends: run the next queued command, or start the provider
+   * turn. Queued messages are folded in only here, one at a time, so a stop never consumes the
+   * message after it.
+   */
+  const continueUserShellRun = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly runId: RunId;
+    /** `killed`: the process was ended by Stop, archive, delete, or shutdown, not by the person. */
+    readonly outcome: "completed" | "failed" | "stopped" | "killed";
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const run = projection.runs.find((candidate) => candidate.id === input.runId);
+    // Archive settles the run of the commands it ends; nothing continues on an archived thread.
+    if (run?.status !== "starting" || projection.thread.archivedAt !== null) return;
+    if (isSteeredShellMessage(projection, run.userMessageId)) {
+      // A run of steered commands takes only the steers sent with them, as a held turn would:
+      // every command first, then every message.
+      const steered = yield* waitingUserShellSteers(projection);
+      const next = steered.find(({ message }) => message.shellCommand === true);
+      if (input.outcome === "completed" && next !== undefined && run.rootNodeId !== null) {
+        yield* absorbQueuedRun({ ...input, projection, target: run, ...next });
+        yield* emitScheduledUserShellCommand({
+          ...input,
+          run,
+          nodeId: run.rootNodeId,
+          message: next.message,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+        });
+        return;
+      }
+      if (input.outcome === "completed" || input.outcome === "failed") {
+        for (const entry of steered) {
+          if (entry.message.shellCommand === true) continue;
+          yield* absorbQueuedRun({ ...input, projection, target: run, ...entry });
+        }
+      }
+    } else {
+      const next = nextQueuedRun(projection);
+      const nextMessage = projection.messages.find(
+        (candidate) => candidate.id === next?.userMessageId,
+      );
+      const absorbable =
+        next !== undefined &&
+        absorbableQueuedMessage(run, next, nextMessage) &&
+        (nextMessage.shellCommand !== true ||
+          (yield* readUserShellItem(threadId, userShellCommandItemId(nextMessage.id))) === null);
+      if (
+        input.outcome === "completed" &&
+        absorbable &&
+        next !== undefined &&
+        nextMessage?.shellCommand === true &&
+        run.rootNodeId !== null
+      ) {
+        yield* absorbQueuedRun({
+          ...input,
+          projection,
+          target: run,
+          queued: next,
+          message: nextMessage,
+        });
+        yield* emitScheduledUserShellCommand({
+          ...input,
+          run,
+          nodeId: run.rootNodeId,
+          message: nextMessage,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+        });
+        return;
+      }
+      if (
+        (input.outcome === "completed" || input.outcome === "failed") &&
+        absorbable &&
+        next !== undefined &&
+        nextMessage !== undefined &&
+        nextMessage.shellCommand !== true
+      ) {
+        yield* absorbQueuedRun({
+          ...input,
+          projection,
+          target: run,
+          queued: next,
+          message: nextMessage,
+        });
+      }
+    }
+    const current = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const currentRun = current.runs.find((candidate) => candidate.id === run.id) ?? run;
+    const { turnItems } = yield* projectionStore
+      .getThreadRecords(threadId, ["turnItems"], {
+        turnItemTypes: ["command_execution"],
+        turnItemRunIds: [run.id],
+      })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    const pendingItems = (yield* Ref.get(input.events)).flatMap((event) =>
+      event.type === "turn-item.updated" ? [event.payload] : [],
+    );
+    const settled = new Map(
+      [...turnItems, ...pendingItems]
+        .filter((item) => item.runId === run.id && isUserShellCommandItem(item))
+        .map((item) => [item.id, item.status] as const),
+    );
+    const finished = [...settled.values()].some(
+      (status) => status === "completed" || status === "failed",
+    );
+    if (input.outcome === "killed" || (input.outcome === "stopped" && !finished)) {
+      yield* settleUserShellRunInterrupted({ ...input, projection: current, run: currentRun });
+    } else {
+      yield* startTurnAfterUserShellCommands({ ...input, projection: current, run: currentRun });
+    }
+    if (input.outcome !== "completed") yield* holdQueuedRuns(input);
+  });
+
+  const isSteeredShellMessage = (
+    projection: Pick<OrchestrationV2ThreadProjection, "messages">,
+    messageId: MessageId,
+  ) =>
+    projection.messages.some((message) => message.id === messageId && message.shellSteer === true);
+
+  /** The steers waiting in the queue for steered shell commands, in the order they were sent. */
+  const steeredQueuedRuns = (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
+  ) =>
+    queuedRunsInDeliveryOrder(projection).filter((run) =>
+      isSteeredShellMessage(projection, run.userMessageId),
+    );
+
+  /**
+   * The run steered shell commands hold: a running turn being paused, paused, or interrupted for
+   * them, or the run that runs them once that turn ended. A steer sent meanwhile waits for them.
+   */
+  const readUserShellWindowRun = Effect.fnUntraced(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const held = projection.runs.find(
+      (run) => run.status === "running" && run.userShellHold !== undefined,
+    );
+    if (held !== undefined) return held;
+    const starting = projection.runs.find(
+      (run) =>
+        run.status === "starting" &&
+        projection.messages.some(
+          (message) =>
+            message.id === run.userMessageId &&
+            message.shellSteer === true &&
+            message.shellCommand === true,
+        ),
+    );
+    if (starting === undefined) return undefined;
+    const active = yield* readActiveUserShellItems(projection.thread.id, yield* Ref.get(events));
+    return active.some((item) => item.runId === starting.id) ? starting : undefined;
+  });
+
+  /**
+   * Holds the running turn for steered commands. A provider that can pause its agent at the next
+   * steering window does; any other has its turn interrupted, and the queue runs the commands
+   * once it ended. A turn not yet running needs neither: the queue waits for it anyway.
+   */
+  const planUserShellHold = Effect.fnUntraced(function* (input: {
+    readonly commandId: CommandId;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "providerThreads" | "providerTurns">;
+    readonly target: OrchestrationV2Run;
+    readonly mode?: "interrupt";
+    readonly now: DateTime.Utc;
+  }) {
+    const { target } = input;
+    const providerThread = input.projection.providerThreads.find(
+      (candidate) => candidate.id === target.providerThreadId,
+    );
+    const providerTurn = input.projection.providerTurns.find(
+      (candidate) =>
+        candidate.runAttemptId === target.activeAttemptId && candidate.status === "running",
+    );
+    const providerSessionId = providerThread?.providerSessionId ?? null;
+    const attemptId = target.activeAttemptId;
+    if (
+      target.status !== "running" ||
+      providerThread === undefined ||
+      providerSessionId === null ||
+      providerTurn === undefined ||
+      attemptId === null ||
+      // Already held for this turn. A hold left from an earlier provider turn of the run (a
+      // restarted attempt) holds nothing, so it is replaced.
+      (input.mode === undefined && target.userShellHold?.providerTurnId === providerTurn.id)
+    ) {
+      return undefined;
+    }
+    const session = yield* providerSessions
+      .get(providerSessionId)
+      .pipe(Effect.orElseSucceed(() => Option.none()));
+    const mode =
+      input.mode === undefined && Option.isSome(session) && session.value.pauseTurn !== undefined
+        ? "pause"
+        : "interrupt";
+    return {
+      event: {
+        type: "run.updated",
+        threadId: target.threadId,
+        runId: target.id,
+        providerInstanceId: target.providerInstanceId,
+        occurredAt: input.now,
+        payload: {
+          ...target,
+          userShellHold: {
+            providerTurnId: providerTurn.id,
+            status: mode === "pause" ? "pausing" : "interrupting",
+          },
+        },
+      },
+      effect: {
+        id: `effect:${input.commandId}:provider-turn.hold:${mode}:${providerTurn.id}`,
+        commandId: input.commandId,
+        threadId: target.threadId,
+        request: {
+          type: "provider-turn.hold",
+          mode,
+          runId: target.id,
+          providerSessionId,
+          providerThreadId: providerThread.id,
+          providerTurnId: providerTurn.id,
+          attemptId,
+        },
+      },
+    } satisfies {
+      readonly event: Omit<OrchestrationV2DomainEvent, "id">;
+      readonly effect: PendingOrchestrationEffectV2;
+    };
+  });
+
+  const openUserShellHold = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "providerThreads" | "providerTurns">;
+    readonly target: OrchestrationV2Run;
+    readonly mode?: "interrupt";
+    readonly now: DateTime.Utc;
+  }) {
+    const plan = yield* planUserShellHold({ ...input, commandId: input.command.commandId });
+    if (plan === undefined) return;
+    yield* emit(input.events, input.command)(plan.event);
+    yield* Ref.update(input.effects, (existing) => [...existing, plan.effect]);
+  });
+
+  /**
+   * A steered command can arrive before the turn it steers runs (the run is still starting) or
+   * while a hold for an earlier provider turn of the run is left. Once a provider turn runs, the
+   * commands waiting for it hold it like any other.
+   */
+  const armUserShellHold = Effect.fn("Orchestrator.armUserShellHold")(function* (
+    threadId: ThreadId,
+  ) {
+    const { thread, runs } = yield* projectionStore.getThreadRecords(threadId, ["runs"]);
+    if (thread.hasShellCommands !== true) return;
+    const target = runs.find((run) => run.status === "running");
+    const queued = runs.filter((run) => run.status === "queued" && run.queueHeld !== true);
+    if (target === undefined || queued.length === 0 || target.userShellHold?.status === "paused") {
+      return;
+    }
+    const { messages } = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+      messageIds: queued.map((run) => run.userMessageId),
+    });
+    if (!messages.some((message) => message.shellSteer === true && message.shellCommand === true)) {
+      return;
+    }
+    const projection = yield* projectionStore.getThreadRecords(threadId, [
+      "providerThreads",
+      "providerTurns",
+    ]);
+    const plan = yield* planUserShellHold({
+      commandId: CommandId.make(`command:system:user-shell-hold:${target.id}`),
+      projection,
+      target,
+      now: yield* DateTime.now,
+    });
+    if (plan !== undefined) yield* writeSystemEvents([plan.event], [plan.effect]);
+  });
+
+  /**
+   * Makes a queued message a steer that waits for steered shell commands: it moves to the front
+   * of the queue, behind the steers sent before it. A steered command opens a hold on the
+   * running turn unless one is open; while the agent waits at its steering window, it runs right
+   * away.
+   */
+  const steerQueuedRunForUserShell = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly messageId: MessageId;
+    readonly target: OrchestrationV2Run | undefined;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const queued = projection.runs.find(
+      (run) => run.userMessageId === input.messageId && run.status === "queued",
+    );
+    const message = projection.messages.find((candidate) => candidate.id === input.messageId);
+    // With no turn to wait for it started right away instead.
+    if (queued === undefined || message === undefined) return;
+    const now = yield* DateTime.now;
+    const emitEvent = emit(input.events, input.command);
+    yield* emitEvent({
+      type: "message.updated",
+      threadId,
+      ...(message.runId === null ? {} : { runId: message.runId }),
+      ...(message.nodeId === null ? {} : { nodeId: message.nodeId }),
+      occurredAt: now,
+      payload: { ...message, shellSteer: true, updatedAt: now },
+    });
+    const others = queuedRunsInDeliveryOrder(projection).filter((run) => run.id !== queued.id);
+    const order = [
+      ...others.filter((run) => isSteeredShellMessage(projection, run.userMessageId)),
+      queued,
+      ...others.filter((run) => !isSteeredShellMessage(projection, run.userMessageId)),
+    ];
+    for (const [index, run] of order.entries()) {
+      if (run.queuePosition === index + 1) continue;
+      yield* emitEvent({
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: { ...run, queuePosition: index + 1 },
+      });
+    }
+    const target = projection.runs.find((run) => run.id === input.target?.id);
+    if (target === undefined || message.shellCommand !== true) return;
+    if (target.userShellHold?.status === "paused") {
+      yield* advanceUserShellWindow({ ...input, runId: target.id, outcome: "completed", now });
+    } else {
+      // A run not running yet is held once its provider turn runs (`armUserShellHold`).
+      yield* openUserShellHold({ ...input, projection, target, now });
+    }
+  });
+
+  /**
+   * A steer that waits for steered shell commands: a steered command, or any steer sent while
+   * one holds the agent. It queues instead of reaching the running turn now, so that turn's tools
+   * and edits never run at the same time as the commands.
+   */
+  const dispatchUserShellSteer = Effect.fn("Orchestrator.dispatchUserShellSteer")(
+    function* (input: {
+      readonly command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
+      readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+      readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+      readonly target: OrchestrationV2Run | undefined;
+      readonly shellCommandGroup: MessageId | undefined;
+    }): Effect.fn.Return<void, OrchestratorV2Error> {
+      const { deliveryIntent: _deliveryIntent, ...command } = input.command;
+      yield* dispatchMessage(
+        { ...command, dispatchMode: { type: "queue_after_active" } },
+        input.events,
+        input.effects,
+        { shellCommandGroup: input.shellCommandGroup },
+      );
+      yield* steerQueuedRunForUserShell({ ...input, messageId: command.messageId });
+    },
+  );
+
+  /**
+   * The steers waiting for steered commands that may still join a window or batch: not held by a
+   * Stop or a failure, and not a command whose result only waits to be delivered again.
+   */
+  const waitingUserShellSteers = Effect.fnUntraced(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
+  ) {
+    const entries: Array<{
+      readonly queued: OrchestrationV2Run;
+      readonly message: OrchestrationV2ConversationMessage;
+    }> = [];
+    for (const queued of steeredQueuedRuns(projection)) {
+      if (queued.queueHeld === true) continue;
+      const message = projection.messages.find(
+        (candidate) => candidate.id === queued.userMessageId,
+      );
+      if (message === undefined) continue;
+      if (
+        message.shellCommand === true &&
+        (yield* readUserShellItem(projection.thread.id, userShellCommandItemId(message.id))) !==
+          null
+      ) {
+        continue;
+      }
+      entries.push({ queued, message });
+    }
+    return entries;
+  });
+
+  /**
+   * What a run still owes its agent: its finished, undelivered commands in the order they ran,
+   * then the messages folded into it after them that have not joined the transcript.
+   */
+  const undeliveredUserShellMessageIds = Effect.fnUntraced(function* (input: {
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "messages" | "turnItems">;
+    readonly run: OrchestrationV2Run;
+    readonly withMessages: boolean;
+  }) {
+    const commands = (yield* readUserShellBatch(input.run, yield* Ref.get(input.events))).map(
+      (item) => item.userShellMessageId,
+    );
+    const messages = input.withMessages
+      ? input.projection.messages
+          .filter(
+            (message) =>
+              message.runId === input.run.id &&
+              message.shellSteer === true &&
+              message.shellCommand !== true &&
+              !input.projection.turnItems.some(
+                (item) => item.type === "user_message" && item.messageId === message.id,
+              ),
+          )
+          .map((message) => message.id)
+      : [];
+    return [...commands, ...messages];
+  });
+
+  /**
+   * Results (and messages sent with them) that missed their turn: a refused release, or a held turn
+   * that ended while its commands ran. Queued as one front run that delivers them once the thread
+   * is free. Not a fresh send: it neither releases a held queue nor ends a snooze.
+   */
+  const queueUserShellRedelivery = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly messageIds: ReadonlyArray<MessageId>;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const messages = input.messageIds.flatMap((id) => {
+      const message = projection.messages.find((candidate) => candidate.id === id);
+      return message === undefined ? [] : [message];
+    });
+    const lead = messages.find((message) => message.shellCommand === true) ?? messages[0];
+    if (lead === undefined) return;
+    yield* dispatchMessage(
+      {
+        type: "message.dispatch",
+        commandId: input.command.commandId,
+        threadId,
+        messageId: lead.id,
+        text: lead.text,
+        ...(lead.shellCommand === true ? { shellCommand: true } : {}),
+        ...(lead.context ? { context: lead.context } : {}),
+        attachments: lead.attachments,
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: lead.createdBy,
+        creationSource: lead.creationSource,
+      },
+      input.events,
+      input.effects,
+      { redelivery: true, shellSteer: lead.shellSteer === true },
+    );
+    const queued = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const run = queued.runs.findLast(
+      (candidate) => candidate.userMessageId === lead.id && candidate.status === "queued",
+    );
+    if (run === undefined || run.rootNodeId === null) return;
+    const emitEvent = emit(input.events, input.command);
+    const base = {
+      threadId,
+      runId: run.id,
+      nodeId: run.rootNodeId,
+      providerInstanceId: run.providerInstanceId,
+      occurredAt: input.now,
+    } as const;
+    for (const message of messages) {
+      if (message.id !== lead.id) {
+        yield* emitEvent({
+          ...base,
+          type: "message.updated",
+          payload: { ...message, runId: run.id, nodeId: run.rootNodeId, updatedAt: input.now },
+        });
+      }
+      if (message.shellCommand !== true) continue;
+      const item = yield* readPendingUserShellItem(
+        threadId,
+        userShellCommandItemId(message.id),
+        input.events,
+      );
+      if (item === null || item.userShellDelivered === true) continue;
+      // Still undelivered, so it keeps its live position; it takes one in this run when delivered.
+      yield* emitEvent({
+        ...base,
+        type: "turn-item.updated",
+        payload: { ...item, runId: run.id, nodeId: run.rootNodeId, updatedAt: input.now },
+      });
+    }
+    // At the front of the queue: it was meant for the turn before anything waiting behind it.
+    const order = [
+      run,
+      ...queuedRunsInDeliveryOrder(queued).filter((candidate) => candidate.id !== run.id),
+    ];
+    for (const [index, candidate] of order.entries()) {
+      if (candidate.queuePosition === index + 1) continue;
+      yield* emitEvent({
+        type: "run.updated",
+        threadId,
+        runId: candidate.id,
+        providerInstanceId: candidate.providerInstanceId,
+        occurredAt: input.now,
+        payload: { ...candidate, queuePosition: index + 1 },
+      });
+    }
+  });
+
+  /**
+   * At the agent's steering window: runs the next steered command or, when none is left (or one
+   * failed or stopped), releases the agent with the results and steered messages as one steer.
+   * A failure still sends the waiting messages and a stop does not; both hold the queued steers.
+   */
+  const advanceUserShellWindow = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly runId: RunId;
+    readonly outcome: "completed" | "failed" | "stopped";
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const run = projection.runs.find((candidate) => candidate.id === input.runId);
+    const hold = run?.userShellHold;
+    if (run?.status !== "running" || hold?.status !== "paused" || run.rootNodeId === null) return;
+    const active = yield* readActiveUserShellItems(threadId, yield* Ref.get(input.events));
+    if (active.some((item) => item.runId === run.id)) return;
+    const steered = yield* waitingUserShellSteers(projection);
+    const next = steered.find(({ message }) => message.shellCommand === true);
+    if (input.outcome === "completed" && next !== undefined) {
+      yield* absorbQueuedRun({ ...input, projection, target: run, ...next });
+      yield* emitScheduledUserShellCommand({
+        ...input,
+        run,
+        nodeId: run.rootNodeId,
+        message: next.message,
+        ordinal: yield* nextTurnItemOrdinal(projection),
+      });
+      return;
+    }
+    if (input.outcome !== "stopped") {
+      for (const entry of steered) {
+        if (entry.message.shellCommand === true) continue;
+        yield* absorbQueuedRun({ ...input, projection, target: run, ...entry });
+      }
+    }
+    const current = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const messageIds = yield* undeliveredUserShellMessageIds({
+      events: input.events,
+      projection: current,
+      run,
+      withMessages: true,
+    });
+    const currentRun = current.runs.find((candidate) => candidate.id === run.id) ?? run;
+    const { userShellHold: _hold, ...released } = currentRun;
+    yield* emit(
+      input.events,
+      input.command,
+    )({
+      type: "run.updated",
+      threadId,
+      runId: run.id,
+      providerInstanceId: run.providerInstanceId,
+      occurredAt: input.now,
+      payload: released,
+    });
+    const providerThread = current.providerThreads.find(
+      (candidate) => candidate.id === run.providerThreadId,
+    );
+    const providerSessionId = providerThread?.providerSessionId ?? null;
+    if (providerThread !== undefined && providerSessionId !== null) {
+      yield* Ref.update(input.effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${input.command.commandId}:provider-turn.release:${hold.providerTurnId}`,
+          commandId: input.command.commandId,
+          threadId,
+          request: {
+            type: "provider-turn.release",
+            runId: run.id,
+            providerSessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId: hold.providerTurnId,
+            messageIds,
+          },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    } else {
+      yield* queueUserShellRedelivery({ ...input, messageIds });
+    }
+    if (input.outcome !== "completed") yield* holdQueuedRuns(input);
+  });
+
+  const dispatchUserShellCommandReleased = Effect.fn(
+    "Orchestrator.dispatchUserShellCommandReleased",
+  )(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "user-shell-command.released" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    const now = yield* DateTime.now;
+    if (!command.delivered) {
+      yield* queueUserShellRedelivery({
+        command,
+        events,
+        effects,
+        messageIds: command.messageIds,
+        now,
+      });
+      return;
+    }
+    const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    const run = projection.runs.find((candidate) => candidate.id === command.runId);
+    if (run === undefined) return;
+    const items = (yield* readUserShellBatch(run, yield* Ref.get(events))).filter((item) =>
+      command.messageIds.includes(item.userShellMessageId),
+    );
+    const delivery = userShellBatchDeliveryEvents({
+      run,
+      projection,
+      items,
+      ordinal: yield* nextTurnItemOrdinal(projection),
+      now,
+      inputIntent: "steer",
+      messageIds: command.messageIds,
+    });
+    for (const event of delivery) yield* emit(events, command)(event);
+  });
+
+  const dispatchUserShellCommandHold = Effect.fn("Orchestrator.dispatchUserShellCommandHold")(
+    function* (
+      command: Extract<OrchestrationV2ServerCommand, { readonly type: "user-shell-command.hold" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const hold = run?.userShellHold;
+      // A Stop or the turn's end got there first; the caller lets a waiting agent continue.
+      if (
+        run === undefined ||
+        run.status !== "running" ||
+        hold?.status !== "pausing" ||
+        hold.providerTurnId !== command.providerTurnId ||
+        (yield* stopReachedRun(command, command.threadId, run.id))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${command.runId} no longer waits for a pause.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      if (command.outcome === "unavailable") {
+        yield* openUserShellHold({
+          command,
+          events,
+          effects,
+          projection,
+          target: run,
+          mode: "interrupt",
+          now,
+        });
+        return;
+      }
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: { ...run, userShellHold: { ...hold, status: "paused" } },
+      });
+      yield* advanceUserShellWindow({
+        command,
+        events,
+        effects,
+        runId: run.id,
+        outcome: "completed",
+        now,
+      });
+    },
+  );
+
+  /**
+   * The rest of a group sent in one command: each waits behind the one before it, as a steer when
+   * the first was steered and in the queue otherwise. None can start before all are recorded.
+   */
+  const dispatchFollowingShellCommands = Effect.fnUntraced(function* (input: {
+    readonly command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
+    readonly group: MessageId;
+    readonly following: ReadonlyArray<{ readonly messageId: MessageId; readonly text: string }>;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+  }) {
+    const { deliveryIntent: _deliveryIntent, titleSeed: _titleSeed, ...base } = input.command;
+    const { messages } = yield* getProjectionWithPendingEvents(base.threadId, input.events);
+    const steered = messages.find((message) => message.id === input.group)?.shellSteer === true;
+    const ids = new Set(messages.map((message) => message.id));
+    for (const next of input.following) {
+      const rejection = ids.has(next.messageId)
+        ? "Each command of a group needs a new message id."
+        : userShellDispatchRejection({ ...base, text: next.text });
+      if (rejection !== null) {
+        return yield* new OrchestratorDispatchError({
+          commandId: base.commandId,
+          commandType: base.type,
+          cause: rejection,
+        });
+      }
+      ids.add(next.messageId);
+      yield* dispatchMessage(
+        {
+          ...base,
+          messageId: next.messageId,
+          text: normalizeShellCommandMessageText(next.text),
+          dispatchMode: { type: "queue_after_active" },
+          ...(steered ? { deliveryIntent: "steer" as const } : {}),
+        },
+        input.events,
+        input.effects,
+        { shellCommandGroup: input.group },
+      );
+    }
+  });
+
+  /**
+   * One of a group's commands failed or was stopped: as with `&&`, the commands of its group
+   * still waiting never run. After a failure they join its run as skipped, so they show in the
+   * thread and the agent hears they did not run; a stop takes them out without a word, as it
+   * sends nothing itself.
+   */
+  const endWaitingUserShellGroup = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly item: UserShellCommandItem;
+    readonly failed: boolean;
+    readonly now: DateTime.Utc;
+  }) {
+    const threadId = commandThreadId(input.command);
+    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
+    const group = projection.messages.find(
+      (message) => message.id === input.item.userShellMessageId,
+    )?.shellCommandGroup;
+    if (group === undefined) return;
+    const target = input.failed
+      ? projection.runs.find((run) => run.id === input.item.runId)
+      : undefined;
+    for (const queued of queuedRunsInDeliveryOrder(projection)) {
+      const message = projection.messages.find(
+        (candidate) => candidate.id === queued.userMessageId,
+      );
+      // A command of the group that already ran waits only to have its result delivered again.
+      if (
+        message?.shellCommandGroup !== group ||
+        (yield* readUserShellItem(threadId, userShellCommandItemId(message.id))) !== null
+      ) {
+        continue;
+      }
+      if (target === undefined || target.rootNodeId === null) {
+        yield* emitQueuedRunCancellation({ ...input, projection, run: queued });
+        continue;
+      }
+      const current = yield* getProjectionWithPendingEvents(threadId, input.events);
+      yield* absorbQueuedRun({ ...input, projection: current, target, queued, message });
+      const skipped: UserShellCommandItem = {
+        id: userShellCommandItemId(message.id),
+        threadId,
+        runId: target.id,
+        nodeId: target.rootNodeId,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: yield* nextTurnItemOrdinal(current),
+        status: "failed",
+        title: USER_SHELL_COMMAND_TITLE,
+        startedAt: null,
+        completedAt: input.now,
+        updatedAt: input.now,
+        type: "command_execution",
+        input: shellCommandFromMessageText(message.text),
+        userShellMessageId: message.id,
+        userShellSkipped: true,
+      };
+      yield* emit(
+        input.events,
+        input.command,
+      )({
+        type: "turn-item.updated",
+        threadId,
+        runId: target.id,
+        nodeId: target.rootNodeId,
+        providerInstanceId: target.providerInstanceId,
+        occurredAt: input.now,
+        payload: skipped,
+      });
+    }
+  });
+
+  /**
+   * After one of a run's commands ended: the run's paused window or its batch continues. A run
+   * that is neither (its held turn ended while the command ran) still owes the agent the
+   * results, which go as the next turn; a stop sends only those that finished before it.
+   */
+  const continueAfterUserShellCommand = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly runId: RunId;
+    readonly outcome: "completed" | "failed" | "stopped" | "killed";
+    readonly now: DateTime.Utc;
+  }) {
+    const projection = yield* getProjectionWithPendingEvents(
+      commandThreadId(input.command),
+      input.events,
+    );
+    const run = projection.runs.find((candidate) => candidate.id === input.runId);
+    if (run === undefined || projection.thread.archivedAt !== null) return;
+    if (run.status === "running" && run.userShellHold?.status === "paused") {
+      yield* advanceUserShellWindow({
+        ...input,
+        outcome: input.outcome === "killed" ? "stopped" : input.outcome,
+      });
+      return;
+    }
+    if (run.status === "starting") {
+      yield* continueUserShellRun(input);
+      return;
+    }
+    if (input.outcome === "killed") return;
+    const active = yield* readActiveUserShellItems(run.threadId, yield* Ref.get(input.events));
+    if (active.some((item) => item.runId === run.id)) return;
+    yield* queueUserShellRedelivery({
+      ...input,
+      messageIds: yield* undeliveredUserShellMessageIds({
+        events: input.events,
+        projection,
+        run,
+        withMessages: input.outcome !== "stopped",
+      }),
+    });
+  });
+
+  const dispatchUserShellCommandStop = Effect.fn("Orchestrator.dispatchUserShellCommandStop")(
+    function* (
+      command: Extract<OrchestrationV2Command, { readonly type: "user-shell-command.stop" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const item = yield* readUserShellItem(command.threadId, command.turnItemId);
+      if (item === null || (item.status !== "pending" && item.status !== "running")) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Shell command ${command.turnItemId} is not running.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        ...(item.runId === null ? {} : { runId: item.runId }),
+        ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+        occurredAt: now,
+        payload: { ...item, status: "interrupted", completedAt: now, updatedAt: now },
+      });
+      yield* endWaitingUserShellGroup({ command, events, item, failed: false, now });
+      if (item.status === "running") {
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:user-shell-command.stop`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: { type: "user-shell-command.stop", turnItemIds: [item.id] },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
+      }
+      if (item.runId !== null) {
+        yield* continueAfterUserShellCommand({
+          command,
+          events,
+          effects,
+          runId: item.runId,
+          outcome: "stopped",
+          now,
+        });
+      }
+      yield* startNextPendingUserShellCommand({ command, events, effects, now });
+    },
+  );
+
+  const dispatchUserShellCommandFinish = Effect.fn("Orchestrator.dispatchUserShellCommandFinish")(
+    function* (
+      command: Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "user-shell-command.finish" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const item = yield* readUserShellItem(command.threadId, command.turnItemId);
+      if (item === null) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Shell command ${command.turnItemId} does not exist.`,
+        });
+      }
+      const active = item.status === "pending" || item.status === "running";
+      // A stop already settled the item; its output is still recorded for the person to read.
+      const status = !active
+        ? item.status
+        : command.stopped
+          ? "interrupted"
+          : command.exitCode === 0
+            ? "completed"
+            : "failed";
+      const now = command.completedAt;
+      const emitEvent = emit(events, command);
+      const { exitCode: _exitCode, ...withoutExitCode } = item;
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        ...(item.runId === null ? {} : { runId: item.runId }),
+        ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+        occurredAt: now,
+        payload: {
+          ...withoutExitCode,
+          status,
+          output: command.output,
+          ...(command.exitCode === undefined ? {} : { exitCode: command.exitCode }),
+          startedAt: command.startedAt,
+          completedAt: active ? command.completedAt : (item.completedAt ?? command.completedAt),
+          updatedAt: now,
+        },
+      });
+      const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      const fullOutput = command.fullOutput;
+      if (fullOutput !== undefined) {
+        // Deleting the thread removes its message attachments, so the saved output goes with it.
+        const message = projection.messages.find(
+          (candidate) => candidate.id === item.userShellMessageId,
+        );
+        const messageItem = projection.turnItems.find(
+          (candidate) =>
+            candidate.type === "user_message" && candidate.messageId === item.userShellMessageId,
+        );
+        if (message !== undefined) {
+          yield* emitEvent({
+            type: "message.updated",
+            threadId: command.threadId,
+            ...(message.runId === null ? {} : { runId: message.runId }),
+            ...(message.nodeId === null ? {} : { nodeId: message.nodeId }),
+            occurredAt: now,
+            payload: {
+              ...message,
+              attachments: [...message.attachments, fullOutput],
+              updatedAt: now,
+            },
+          });
+        }
+        if (messageItem?.type === "user_message") {
+          yield* emitEvent({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            ...(messageItem.runId === null ? {} : { runId: messageItem.runId }),
+            ...(messageItem.nodeId === null ? {} : { nodeId: messageItem.nodeId }),
+            occurredAt: now,
+            payload: {
+              ...messageItem,
+              attachments: [...messageItem.attachments, fullOutput],
+              updatedAt: now,
+            },
+          });
+        }
+      }
+      if (active && status !== "completed") {
+        yield* endWaitingUserShellGroup({
+          command,
+          events,
+          item,
+          failed: status === "failed",
+          now,
+        });
+      }
+      if (active && item.runId !== null) {
+        yield* continueAfterUserShellCommand({
+          command,
+          events,
+          effects,
+          runId: item.runId,
+          outcome: command.stopped ? "killed" : status === "completed" ? "completed" : "failed",
+          now,
+        });
+      }
+      yield* startNextPendingUserShellCommand({ command, events, effects, now });
+    },
+  );
+
   const dispatchUnsupported = (command: OrchestrationV2ServerCommand) =>
     Effect.fail(
       new OrchestratorDispatchError({
@@ -12596,6 +14649,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId: command.threadId,
           });
         }
+        if (
+          command.guestMessageId !== undefined &&
+          (command.shellCommand === true || command.followingShellCommands !== undefined)
+        ) {
+          // An approved guest message carries the guest's words; they never run on this machine.
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "A guest's message cannot run as a shell command.",
+          });
+        }
+        if (command.shellCommand === true || command.followingShellCommands !== undefined) {
+          // Redelivering a finished command's result carries its saved output as an attachment.
+          const ran =
+            (yield* readUserShellItem(
+              command.threadId,
+              userShellCommandItemId(command.messageId),
+            )) !== null;
+          const rejection = userShellDispatchRejection(
+            ran ? { ...command, attachments: [] } : command,
+          );
+          if (rejection !== null) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: rejection,
+            });
+          }
+          if (thread.hasShellCommands !== true) {
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "thread.metadata-updated",
+              threadId: command.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...thread, hasShellCommands: true },
+            });
+          }
+        }
         const guestSend =
           command.guestMessageId === undefined
             ? undefined
@@ -12608,8 +14701,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 text: guestSend.text,
                 context: { version: 1 as const, records: [], guest: guestSend.guest },
               };
-        cancelUnsettledEffects = yield* dispatchMessage(dispatched, events, effects);
-        yield* recordSubagentFollowup(dispatched, events).pipe(mapDispatchError(command));
+        const { followingShellCommands = [], ...single } = dispatched;
+        const group = followingShellCommands.length > 0 ? command.messageId : undefined;
+        cancelUnsettledEffects = yield* dispatchMessage(
+          single.shellCommand === true
+            ? { ...single, text: normalizeShellCommandMessageText(single.text) }
+            : single,
+          events,
+          effects,
+          { shellCommandGroup: group },
+        );
+        if (group !== undefined) {
+          yield* dispatchFollowingShellCommands({
+            command: single,
+            group,
+            following: followingShellCommands,
+            events,
+            effects,
+          });
+        }
+        yield* recordSubagentFollowup(single, events).pipe(mapDispatchError(command));
         break;
       }
       case "notification.delivery.accept":
@@ -12762,6 +14873,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "queued-run.edit":
         yield* dispatchQueuedRunEdit(command, events);
+        break;
+      case "user-shell-command.stop":
+        yield* dispatchUserShellCommandStop(command, events, effects);
+        break;
+      case "user-shell-command.finish":
+        yield* dispatchUserShellCommandFinish(command, events, effects);
+        break;
+      case "user-shell-command.hold":
+        yield* dispatchUserShellCommandHold(command, events, effects);
+        break;
+      case "user-shell-command.released":
+        yield* dispatchUserShellCommandReleased(command, events, effects);
         break;
       case "checkpoint.rollback":
         yield* dispatchCheckpointRollback(command, events, effects);
@@ -13027,6 +15150,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
     }
+    // A command that outlived its run held the queue, and a result can be queued for delivery
+    // with no run ending to start it.
+    if (
+      command.type === "user-shell-command.finish" ||
+      command.type === "user-shell-command.stop" ||
+      command.type === "user-shell-command.released"
+    ) {
+      yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
+    }
     if (command.type === "notification.delivery.accept") {
       yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
     }
@@ -13134,6 +15266,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             stored.event.payload.status === "rolled_back"),
       ),
       Stream.runForEach(handleRunUpdate),
+      Effect.forkDetach,
+    );
+
+  // A provider turn that starts running takes the hold steered `! cmd` commands wait for. Only
+  // while the environment has shell commands on: a steer queued before they were turned off
+  // still runs, once the turn ends, like any queued message.
+  yield* eventSink
+    .stream({ afterSequence: terminalEventsAfterSequence, eventType: "provider-turn.updated" })
+    .pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "provider-turn.updated" &&
+          stored.event.payload.status === "running",
+      ),
+      Stream.filterEffect(() =>
+        serverSettings.getSettings.pipe(
+          Effect.map((settings) => settings.enableShellCommands),
+          Effect.orElseSucceed(() => false),
+        ),
+      ),
+      Stream.runForEach((stored) =>
+        threadDispatch
+          .withLock(stored.event.threadId, armUserShellHold(stored.event.threadId))
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to hold a turn for steered shell commands", {
+                threadId: stored.event.threadId,
+                sequence: stored.sequence,
+                cause,
+              }),
+            ),
+          ),
+      ),
       Effect.forkDetach,
     );
 

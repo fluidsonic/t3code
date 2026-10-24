@@ -51,13 +51,23 @@ export interface ComposerEditorProps {
   readonly scrollEnabled?: boolean;
   readonly autoCorrect?: boolean;
   readonly spellCheck?: boolean;
+  /**
+   * A `! cmd` shell command: typed as written, with no corrections, capitals, smart punctuation
+   * or chips; its leading `!` is drawn in a square with the command indented past it.
+   */
+  readonly shellMode?: boolean;
   readonly multiline?: boolean;
   readonly contentInsetVertical?: number;
   /** Android: center a single line vertically (collapsed pill); no-op on iOS. */
   readonly singleLineCentered?: boolean;
   readonly style?: StyleProp<ViewStyle>;
   readonly textStyle?: StyleProp<TextStyle>;
-  readonly onChangeText: (value: string) => void;
+  /**
+   * Return the text the draft kept when it differs from `value`, such as a lone `!` restored after
+   * Backspace leaves shell mode. That text can equal an older state of the editor, which would
+   * otherwise read as a stale render and never reach the editor.
+   */
+  readonly onChangeText: (value: string) => string | void;
   readonly onSelectionChange?: (selection: ComposerEditorSelection) => void;
   readonly onPasteImages?: (uris: ReadonlyArray<string>) => void;
   readonly onContextPress?: (reference: {

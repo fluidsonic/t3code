@@ -1,4 +1,8 @@
 import {
+  CommandId,
+  MessageId,
+  ORCHESTRATION_V2_WS_METHODS,
+  RunId,
   AuthEnvironmentMaintainScope,
   AuthDiagnosticsReadScope,
   AuthFilesystemReadScope,
@@ -379,3 +383,75 @@ it.effect("denies manual cleanup before the handler without settings permission"
     expect(handled).toBe(false);
   }).pipe(Effect.scoped),
 );
+
+describe("shell command authorization", () => {
+  const group = WsRpcGroup.omit(
+    ...[...WsRpcGroup.requests.keys()].filter(
+      (
+        tag,
+      ): tag is Exclude<
+        keyof typeof RPC_REQUIRED_SCOPES,
+        typeof ORCHESTRATION_V2_WS_METHODS.dispatchCommand
+      > => tag !== ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+    ),
+  );
+  const send = {
+    type: "message.dispatch",
+    commandId: CommandId.make("send"),
+    threadId: ThreadId.make("thread"),
+    messageId: MessageId.make("message"),
+    text: "ls",
+    attachments: [],
+    dispatchMode: { type: "start_immediately" },
+    createdBy: "user",
+    creationSource: "web",
+  } as const;
+  const edit = {
+    type: "queued-run.edit",
+    commandId: CommandId.make("edit"),
+    threadId: ThreadId.make("thread"),
+    runId: RunId.make("run"),
+    text: "ls -la",
+  } as const;
+
+  it.effect("needs terminal permission to send or edit a `! cmd` command", () =>
+    Effect.gen(function* () {
+      const handled: Array<string> = [];
+      const handler = group.toLayerHandler(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, (command) =>
+        Effect.sync(() => handled.push(command.commandId)).pipe(Effect.as({ sequence: 0 })),
+      );
+      const operator = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.merge(handler, RpcAuthorization.layer([AuthOrchestrationOperateScope])),
+        ),
+      );
+      const dispatch = operator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand];
+      yield* dispatch(send);
+      yield* dispatch(edit);
+      for (const command of [
+        { ...send, commandId: CommandId.make("shell-send"), shellCommand: true },
+        { ...edit, commandId: CommandId.make("shell-edit"), shellCommand: true },
+      ]) {
+        expect(yield* dispatch(command).pipe(Effect.flip)).toMatchObject({
+          requiredPermission: AuthTerminalOperateScope,
+        });
+      }
+      expect(handled).toEqual(["send", "edit"]);
+
+      const terminalOperator = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.merge(
+            handler,
+            RpcAuthorization.layer([AuthOrchestrationOperateScope, AuthTerminalOperateScope]),
+          ),
+        ),
+      );
+      yield* terminalOperator[ORCHESTRATION_V2_WS_METHODS.dispatchCommand]({
+        ...send,
+        commandId: CommandId.make("allowed"),
+        shellCommand: true,
+      });
+      expect(handled.at(-1)).toBe("allowed");
+    }).pipe(Effect.scoped),
+  );
+});
