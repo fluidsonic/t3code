@@ -2,6 +2,7 @@ import * as NodeZlib from "node:zlib";
 import {
   DesktopPreviewRecordingInputSchema,
   DESKTOP_PREVIEW_RECORDING_CAPTURE_TRIGGER,
+  describePreviewCrash,
 } from "@t3tools/contracts";
 import type {
   DesktopPreviewAnnotationTheme,
@@ -56,7 +57,11 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopRendererHistory from "../telemetry/DesktopRendererHistory.ts";
-import { MENU_ACTION_CHANNEL, PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL } from "../ipc/channels.ts";
+import {
+  MENU_ACTION_CHANNEL,
+  PREVIEW_PICTURE_IN_PICTURE_CRASHED_CHANNEL,
+  PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL,
+} from "../ipc/channels.ts";
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
 import * as PreviewPasskeys from "./Passkeys.ts";
 import * as BrowserSession from "./BrowserSession.ts";
@@ -88,6 +93,7 @@ export type PreviewNavStatus =
       title: string;
       code: number;
       description: string;
+      crashed?: true;
     };
 
 export interface PreviewTabState {
@@ -163,14 +169,23 @@ const buildPreviewPictureInPictureDataUrl = (): string => {
       html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #111; }
       body { display: grid; place-items: center; }
       img { width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+      p { margin: 16px; color: #aaa; font: 13px system-ui, sans-serif; text-align: center; }
     </style>
   </head>
   <body>
     <img id="preview-frame" alt="Live browser preview">
+    <p id="preview-crashed" hidden>This page crashed. Reload it in T3 Code.</p>
     <script>
       const frame = document.getElementById("preview-frame");
+      const crashed = document.getElementById("preview-crashed");
       window.previewPictureInPicture.onFrame((next) => {
         frame.src = "data:image/jpeg;base64," + next.data;
+        frame.hidden = false;
+        crashed.hidden = true;
+      });
+      window.previewPictureInPicture.onCrashed(() => {
+        frame.hidden = true;
+        crashed.hidden = false;
       });
     </script>
   </body>
@@ -420,6 +435,14 @@ type PointerEventListener = (event: DesktopPreviewPointerEvent) => Effect.Effect
 
 type OpenLinkListener = (event: DesktopPreviewOpenLinkEvent) => Effect.Effect<void>;
 
+const CRASH_CAUSES: Readonly<Record<string, string>> = {
+  oom: "it ran out of memory",
+  killed: "its process was stopped",
+  "launch-failed": "its process could not start",
+};
+
+const describeCrash = (reason: string) => describePreviewCrash(CRASH_CAUSES[reason]);
+
 // about:blank inherits relaxed guest preferences; external editor schemes must reach the OS handler.
 const POPUP_PROTOCOLS = new Set(["http:", "https:"]);
 
@@ -526,6 +549,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   let forwardedShortcuts: ReadonlyArray<PreviewForwardedShortcut> = [];
   const annotationThemeRef = yield* Ref.make(DEFAULT_ANNOTATION_THEME);
   const annotationSendEnabled = new Map<string, boolean>();
+  // Crashed guests, so the load a reload or navigation starts can report the revive.
+  const crashedTabIds = new Set<string>();
   const mainWindowRef = yield* Ref.make<Option.Option<BrowserWindow>>(Option.none());
   const tabsRef = yield* SynchronizedRef.make<ReadonlyMap<string, PreviewTabState>>(new Map());
   const attachedRef = yield* Ref.make<ReadonlyMap<number, ManagedListeners>>(new Map());
@@ -546,6 +571,22 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     ReadonlyMap<string, PictureInPictureSession>
   >(new Map());
   const pictureInPictureAspectRatiosRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
+  // A crashed page paints nothing, so its separate window says so instead of freezing on the
+  // last frame, and takes the revived page's first frame even if it looks the same.
+  const showPictureInPictureCrash = Effect.fn("PreviewManager.showPictureInPictureCrash")(
+    function* (tabId: string) {
+      const window = (yield* SynchronizedRef.get(pictureInPictureSessionsRef)).get(tabId)?.window;
+      if (window && !window.isDestroyed())
+        window.webContents.send(PREVIEW_PICTURE_IN_PICTURE_CRASHED_CHANNEL);
+      yield* SynchronizedRef.update(frameCaptureSessionsRef, (sessions) => {
+        const current = sessions.get(tabId);
+        if (!current) return sessions;
+        return replaceMap(sessions, (copy) => {
+          copy.set(tabId, { ...current, lastPictureInPictureFingerprint: null });
+        });
+      });
+    },
+  );
   const pictureInPictureMutationSemaphore = yield* Semaphore.make(1);
   const closingTabIdsRef = yield* Ref.make<ReadonlySet<string>>(new Set());
   // Legacy tab capture is unsupported (electron/electron#44618); recording uses setDisplayMediaRequestHandler.
@@ -1226,6 +1267,19 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         ] as const;
       });
       if (Option.isSome(next)) yield* emitIfCurrent(tabId, next.value);
+      // The main frame loading again means a reload or navigation revived a crashed guest.
+      if (
+        computedNavStatus.kind === "Loading" &&
+        Option.isSome(next) &&
+        crashedTabIds.delete(tabId) &&
+        next.value.serverTab
+      ) {
+        browserHost.crashChanged(next.value.serverTab, null);
+        // DevTools closing on the dead page could not reconnect it to the server.
+        const sessions = yield* SynchronizedRef.get(controlSessionsRef);
+        if (!sessions.has(wc.id) && !wc.isDevToolsOpened())
+          runFork(restoreControlSession(tabId, wc));
+      }
     });
     const sync = () => runFork(syncState(true));
     const syncNavigation = () => runFork(syncState(false, true));
@@ -1249,6 +1303,32 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       event: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
     ) => {
       if (event.isMainFrame && !event.isSameDocument) cancelFaviconCapture();
+    };
+    const rendererGone = (
+      _event: Electron.Event,
+      details: Electron.RenderProcessGoneDetails,
+    ): void => {
+      if (details.reason === "clean-exit") return;
+      const description = describeCrash(details.reason);
+      crashedTabIds.add(tabId);
+      runFork(
+        Effect.gen(function* () {
+          // The server first: it must not reconnect to the dead page in between.
+          const serverTab = (yield* SynchronizedRef.get(tabsRef)).get(tabId)?.serverTab;
+          if (serverTab) browserHost.crashChanged(serverTab, description);
+          yield* update(tabId, {
+            navStatus: {
+              kind: "LoadFailed",
+              url: wc.getURL(),
+              title: wc.getTitle(),
+              code: -1,
+              description,
+              crashed: true,
+            },
+          });
+          yield* showPictureInPictureCrash(tabId);
+        }),
+      );
     };
     const audioStateChanged = (
       event: Electron.Event<Electron.WebContentsAudioStateChangedEventParams>,
@@ -1503,6 +1583,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         wc.off("dom-ready", restoreRecordingCursor);
         wc.off("did-fail-load", failed as never);
         wc.off("audio-state-changed", audioStateChanged);
+        wc.off("render-process-gone", rendererGone);
         wc.off("did-create-window", windowCreated);
         wc.off("before-input-event", beforeInput);
         wc.ipc.off(HUMAN_INPUT_CHANNEL, humanInput);
@@ -1524,6 +1605,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         wc.on("dom-ready", restoreRecordingCursor);
         wc.on("did-fail-load", failed as never);
         wc.on("audio-state-changed", audioStateChanged);
+        wc.on("render-process-gone", rendererGone);
         wc.ipc.on(HUMAN_INPUT_CHANNEL, humanInput);
         wc.ipc.on(RECORDING_INPUT_CHANNEL, recordingInput);
         wc.ipc.on(MOUSE_NAVIGATE_CHANNEL, mouseNavigate);
@@ -1650,6 +1732,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   });
 
   const closeTabUnlocked = Effect.fn("PreviewManager.closeTabUnlocked")(function* (tabId: string) {
+    crashedTabIds.delete(tabId);
     if (!(yield* SynchronizedRef.get(tabsRef)).has(tabId)) return;
     clearPendingRecording(tabId);
     annotationSendEnabled.delete(tabId);
@@ -2021,7 +2104,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     yield* detachControlSession(wc.id);
     yield* attempt({ operation: "openDevTools", tabId, webContentsId: wc.id }, () => {
       wc.once("devtools-closed", () => {
-        if (!wc.isDestroyed()) runFork(restoreControlSession(tabId, wc));
+        // A crashed page answers no debugger; its revive reconnects it.
+        if (!wc.isDestroyed() && !crashedTabIds.has(tabId))
+          runFork(restoreControlSession(tabId, wc));
       });
       wc.openDevTools({ mode: "detach" });
     });
@@ -2277,6 +2362,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       if (afterAttach.serverTab) {
         yield* listenToBrowserHost;
         browserHost.attach(afterAttach.serverTab, { webContents: wc, debugger: control.debugger });
+        // The page may have crashed while it attached, or before this same guest attaches again
+        // (e.g. when its DevTools close), and the server must know either way.
+        browserHost.crashChanged(
+          afterAttach.serverTab,
+          afterAttach.navStatus.kind === "LoadFailed" && afterAttach.navStatus.crashed
+            ? afterAttach.navStatus.description
+            : null,
+        );
       }
       if (afterAttach.colorScheme !== "system") {
         yield* attemptPromise({ operation: "applyColorScheme", tabId, webContentsId: wc.id }, () =>
@@ -2425,6 +2518,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const captureSession = (yield* SynchronizedRef.get(frameCaptureSessionsRef)).get(tabId);
     if (!captureSession?.consumers.has("picture-in-picture") || captureSession.scope === null)
       return;
+    if (crashedTabIds.has(tabId)) return;
     const wc = yield* requireWebContents(tabId);
     const captureContext = { operation: "frameCapture.capturePage", tabId, webContentsId: wc.id };
     const image = yield* attemptPromise(captureContext, () => wc.capturePage()).pipe(
@@ -2783,6 +2877,10 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           );
         };
         const onDidFinishLoad = () => {
+          if (crashedTabIds.has(tabId)) {
+            runFork(showPictureInPictureCrash(tabId));
+            return;
+          }
           runFork(
             SynchronizedRef.update(frameCaptureSessionsRef, (sessions) => {
               const current = sessions.get(tabId);
@@ -3218,6 +3316,19 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       }
     },
   );
+  // The server waits for a revive after asking for a reload, so a tab whose page needs none, or
+  // that is gone, answers at once.
+  const reloadDetachedTab = Effect.fn("PreviewManager.reloadDetachedTab")(function* (
+    key: DesktopBrowserHost.DesktopBrowserTabKey,
+  ) {
+    const tab = [...(yield* SynchronizedRef.get(tabsRef)).values()].find(
+      (candidate) =>
+        candidate.serverTab?.threadId === key.threadId && candidate.serverTab.tabId === key.tabId,
+    );
+    const wc = tab?.webContentsId == null ? undefined : webContents.fromId(tab.webContentsId);
+    if (wc && !wc.isDestroyed() && wc.isCrashed()) wc.reload();
+    else browserHost.crashChanged(key, null);
+  });
   let browserHostStarted = false;
   // Subscribes before the attach that follows, so no event falls between the two.
   const listenToBrowserHost = Effect.suspend(() => {
@@ -3228,6 +3339,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       [
         browserHost.pointers.pipe(Stream.runForEach(emitAgentPointer), listen),
         browserHost.painting.pipe(Stream.runForEach(updateServerTabCapturing), listen),
+        browserHost.detachedReloads.pipe(Stream.runForEach(reloadDetachedTab), listen),
       ],
       { discard: true },
     );
