@@ -53,6 +53,31 @@ describe.each([
     ).toBe(true);
   });
 
+  it("shows a person's command only once its result reached the agent", () => {
+    const command = {
+      type: "command_execution" as const,
+      runId,
+      nodeId,
+      userShellMessageId: "message:shell",
+    };
+    const visible = (
+      item: Omit<typeof command, "userShellMessageId"> & {
+        readonly userShellMessageId?: string;
+        readonly userShellDelivered?: boolean;
+      },
+    ) =>
+      isVisible({
+        item,
+        runs: [{ id: runId, status: "running" }],
+        attempts: [],
+        items: [item],
+      });
+    expect(visible(command)).toBe(false);
+    expect(visible({ ...command, userShellDelivered: true })).toBe(true);
+    const { userShellMessageId: _messageId, ...agentCommand } = command;
+    expect(visible(agentCommand)).toBe(true);
+  });
+
   it("hides queued user messages once their run is cancelled", () => {
     expect(
       isVisible({
