@@ -12871,5 +12871,8 @@
   "f6a91589456cca50": "Aprobado",
   "c92657bb7f2293ff": "Necesita aprobación",
   "f1e5c1be1ac92361": "Aprobar",
-  "fcb5f3c4d4753326": "Esta conexión no puede aprobar comandos. Usa un cliente que pueda usar el terminal."
+  "fcb5f3c4d4753326": "Esta conexión no puede aprobar comandos. Usa un cliente que pueda usar el terminal.",
+  "e7fb4bcd4c70fd94": "Esta página se ha bloqueado.",
+  "4fc063fef1780a63": "Esta página se ha bloqueado",
+  "67fc00623dd5fcb9": "Recárgala en la aplicación de escritorio."
 }
