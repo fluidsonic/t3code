@@ -157,6 +157,7 @@ type PendingBackgroundWorkTurnItem = {
   readonly monitor?: boolean | undefined;
   readonly prompt?: string | undefined;
   readonly childThreadId?: ThreadId | null;
+  readonly userShellMessageId?: string | undefined;
 };
 
 function isLatestRunSettledForBackgroundWait(
@@ -227,7 +228,10 @@ function nativeTaskIdFromTurnItem(item: PendingBackgroundWorkTurnItem): string {
   return String(item.id);
 }
 
-/** Items Stop ends, without the pending list's settled-run gate. */
+/**
+ * Items Stop ends, without the pending list's settled-run gate, so the list and Stop agree.
+ * A person's `! cmd` is not the agent's work; Stop ends it on its own path.
+ */
 export function pendingBackgroundTurnItems<Item extends PendingBackgroundWorkTurnItem>(input: {
   readonly turnItems: ReadonlyArray<Item>;
   readonly runs?: ReadonlyArray<PendingBackgroundWorkRun>;
@@ -239,6 +243,7 @@ export function pendingBackgroundTurnItems<Item extends PendingBackgroundWorkTur
     (item) =>
       BACKGROUND_TURN_ITEM_TYPES.has(item.type) &&
       isOrchestrationV2WorkActive(item.status) &&
+      item.userShellMessageId === undefined &&
       !(item.type === "dynamic_tool" && isPersistentDynamicToolInput(item.input)) &&
       (item.runId === undefined ||
         item.runId === null ||

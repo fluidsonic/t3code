@@ -20,6 +20,7 @@ import {
   managedRuntimeModeDenial,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
+  type OrchestrationMessageContext,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
@@ -73,6 +74,9 @@ import {
 import { environmentThreadShells, threadEnvironment, threadFamilies } from "./threads";
 import {
   appendComposerDraftAttachments,
+  ComposerDraftKindConflictError,
+  isComposerDraftKindConflictError,
+  composerDraftMergeMixesKinds,
   composerDraftsAtom,
   flushComposerDrafts,
   type ComposerDraft,
@@ -339,6 +343,16 @@ export async function removeAcknowledgedExistingThreadMessage(
   }
 }
 
+/** The text a queued message is delivered with. A `! cmd` goes exactly as typed, without context. */
+export function queuedMessageServerContent(input: {
+  readonly text: string;
+  readonly shellCommand?: boolean | undefined;
+  readonly context: OrchestrationMessageContext | undefined;
+}): { text: string; shellCommand?: true; context?: OrchestrationMessageContext } {
+  if (input.shellCommand === true) return { text: input.text, shellCommand: true };
+  return serializeComposerMessageForServer(input.text, input.context);
+}
+
 export async function recoverEditedCreationAfterDelivery(
   queuedMessage: QueuedThreadMessage,
 ): Promise<boolean> {
@@ -357,9 +371,11 @@ export async function recoverEditedCreationAfterDelivery(
     // Merge before removal to retain file ownership; allow overflow and let send guards require trimming.
     await mergeComposerDraftContent(draftKey, {
       text: kept.text,
+      ...(kept.shellCommand === true ? { shellCommand: true } : {}),
       context: kept.context,
       attachments: [],
     });
+    clearThreadComposerError(draftKey, kept.messageId);
     if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[kept.messageId]) {
       return true;
     }
@@ -382,6 +398,9 @@ export async function recoverEditedCreationAfterDelivery(
     // Flush before removal: append only schedules persistence, leaving the queue as the sole durable copy.
     await flushComposerDrafts();
   } catch (error) {
+    if (isComposerDraftKindConflictError(error)) {
+      setThreadComposerError(draftKey, error.message, kept.messageId);
+    }
     console.warn("[thread-outbox] could not hand an edited pending task to the composer", error);
     return false;
   }
@@ -406,6 +425,18 @@ export async function restoreRejectedQueuedMessage(
 ): Promise<"restored" | "deferred" | "blocked" | "retry"> {
   const draftKey = recoveryDraftKey(queuedMessage);
   const threadKey = scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId);
+  // A code block's Run all can send its commands again; the composer holds one command, so they
+  // aren't put back there.
+  if (queuedMessage.followingShellCommands !== undefined) {
+    const removed = await removeThreadOutboxMessage(
+      queuedMessage,
+      threadOutboxRevision(queuedMessage.messageId),
+    ).catch(() => null);
+    if (removed === null) return "retry";
+    if (!removed) return "deferred";
+    setThreadComposerError(threadKey, message, queuedMessage.messageId);
+    return "restored";
+  }
   let rollback: { readonly snapshot: ComposerDraft; readonly merged: ComposerDraft } | null = null;
   try {
     if (
@@ -436,6 +467,18 @@ export async function restoreRejectedQueuedMessage(
       );
       return "blocked";
     }
+    if (composerDraftMergeMixesKinds(originalDraft, queuedMessage)) {
+      // Joined to the draft, prose would run as part of a command or a command would reach the
+      // agent as prose. It stays queued until the draft can take it.
+      setThreadComposerError(
+        threadKey,
+        new ComposerDraftKindConflictError({
+          incomingShellCommand: queuedMessage.shellCommand === true,
+        }).message,
+        queuedMessage.messageId,
+      );
+      return "blocked";
+    }
 
     const withdrawError = () => clearThreadComposerError(threadKey, queuedMessage.messageId);
     if (!queuedMessage.creation) {
@@ -446,6 +489,7 @@ export async function restoreRejectedQueuedMessage(
       stampRecoveryDraftProject(queuedMessage, draftKey);
       await mergeComposerDraftContent(draftKey, {
         text: queuedMessage.text,
+        ...(queuedMessage.shellCommand === true ? { shellCommand: true } : {}),
         context: queuedMessage.context,
         attachments: queuedMessage.attachments,
       });
@@ -767,10 +811,12 @@ export function createThreadOutboxDelivery(): {
     const blockedAttachments = currentDrafts[draftKey]?.attachments;
     const editorAttachments =
       editorDraftKey === null ? undefined : currentDrafts[editorDraftKey]?.attachments;
+    const blockedByKind = composerDraftMergeMixesKinds(currentDrafts[draftKey], queuedMessage);
     const unsubscribe = appAtomRegistry.subscribe(composerDraftsAtom, (drafts) => {
       if (
         drafts[draftKey]?.attachments === blockedAttachments &&
-        (editorDraftKey === null || drafts[editorDraftKey]?.attachments === editorAttachments)
+        (editorDraftKey === null || drafts[editorDraftKey]?.attachments === editorAttachments) &&
+        (!blockedByKind || composerDraftMergeMixesKinds(drafts[draftKey], queuedMessage))
       ) {
         return;
       }
@@ -938,14 +984,18 @@ export function createThreadOutboxDelivery(): {
         message: {
           messageId: queuedMessage.messageId,
           role: "user",
-          ...serializeComposerMessageForServer(
-            queuedMessage.text,
-            uploadedComposerContext(
+          ...(queuedMessage.followingShellCommands
+            ? { followingShellCommands: queuedMessage.followingShellCommands }
+            : {}),
+          ...queuedMessageServerContent({
+            text: queuedMessage.text,
+            shellCommand: queuedMessage.shellCommand,
+            context: uploadedComposerContext(
               queuedMessage.context,
               queuedMessage.attachments,
               prepared.attachments,
             ),
-          ),
+          }),
           attachments: prepared.attachments,
         },
         modelSelection: sendSettings.modelSelection,
@@ -1114,14 +1164,15 @@ export function createThreadOutboxDelivery(): {
         messageId: queuedMessage.messageId,
         createdAt: queuedMessage.createdAt,
         titleText: queuedMessage.text,
-        ...serializeComposerMessageForServer(
-          queuedMessage.text.trim(),
-          uploadedComposerContext(
+        ...queuedMessageServerContent({
+          text: queuedMessage.text.trim(),
+          shellCommand: queuedMessage.shellCommand,
+          context: uploadedComposerContext(
             queuedMessage.context,
             queuedMessage.attachments,
             prepared.attachments,
           ),
-        ),
+        }),
         uploadedAttachments: prepared.attachments,
         modelSelection: sendSettings.modelSelection,
         runtimeMode: sendSettings.runtimeMode,

@@ -4,6 +4,10 @@ import type {
 } from "@t3tools/client-runtime/state/thread-requests";
 import { linkRequestTargetName } from "@t3tools/client-runtime/link-request";
 import { turnItemIsWorkspacePreparation } from "@t3tools/client-runtime/state/turn-item-presentation";
+import {
+  isUserShellCommandItem,
+  type UserShellCommandItem,
+} from "@t3tools/client-runtime/user-shell-command";
 import type { ThreadCheckpointSummary } from "@t3tools/client-runtime/state/thread-checkpoints";
 import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import {
@@ -136,6 +140,10 @@ export interface ThreadFeedMessage {
   readonly id: MessageId;
   readonly role: "user" | "assistant";
   readonly text: string;
+  /** A person's shell command; `text` is its stored `! cmd` form. */
+  readonly shellCommand?: true;
+  /** That command's result item, which renders inside the message rather than as work. */
+  readonly shellCommandResult?: UserShellCommandItem;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly runId: RunId | null;
   readonly streaming: boolean;
@@ -158,6 +166,7 @@ export interface LocalThreadMessage {
   readonly id: MessageId;
   readonly role: string;
   readonly text: string;
+  readonly shellCommand?: boolean | undefined;
   readonly context?: OrchestrationMessageContext | undefined;
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
   readonly streaming: boolean;
@@ -1619,6 +1628,8 @@ export function deriveThreadFeedPresentation(
   runlessWorkActive = false,
   cache?: ThreadFeedCache,
   display: ThreadFeedDisplay = DEFAULT_THREAD_FEED_DISPLAY,
+  /** See `userShellCommandOwnsWorkingSlot`; the command, not the agent, is the live work. */
+  userShellCommandOwnsWorkingSlot = false,
 ): ThreadFeedEntry[] {
   const previous = cache?.presentation ?? null;
   const restart = presentationRestart(
@@ -1811,6 +1822,7 @@ export function deriveThreadFeedPresentation(
     activeWorkStartedAt !== null &&
     latestRun?.turnEnded !== true &&
     (activeRunId === null || !compactionCommandRunIds.has(activeRunId)) &&
+    !userShellCommandOwnsWorkingSlot &&
     !result.some(
       (row) =>
         row.id === LIVE_ACTIVITY_ROW_ID ||
@@ -2248,6 +2260,8 @@ interface ThreadFeedBuild {
   readonly checkpointSummaries: ReadonlyArray<ThreadCheckpointSummary> | undefined;
   readonly foldedAnswerRunIdByMessageId: ReadonlyMap<string, RunId | null>;
   readonly delegatedChildrenByRun: ReadonlyMap<RunId, ReadonlySet<string>>;
+  readonly shellResults: ReadonlyMap<string, UserShellCommandItem>;
+  readonly shellMessageIds: ReadonlySet<string>;
   readonly feed: ReadonlyArray<ThreadFeedEntry>;
   /** Grouping is empty before `row`: the rows before it produced `feed.slice(0, feedLength)`. */
   readonly restarts: ReadonlyArray<{ readonly row: number; readonly feedLength: number }>;
@@ -2360,8 +2374,15 @@ export function buildThreadFeed(
   // An answer that started a later run stays a normal message at that run's position.
   const foldedAnswerRunIdByMessageId = new Map<string, RunId | null>();
   const delegatedChildrenByRun = new Map<RunId, Set<string>>();
+  // A command's result belongs to its message, which can sit in a reused prefix.
+  const shellResults = new Map<string, UserShellCommandItem>();
+  const shellMessageIds = new Set<string>();
   for (const { item } of visibleTurnItems) {
-    if (item.type === "user_input_request" && item.questionAnswer) {
+    if (isUserShellCommandItem(item)) {
+      shellResults.set(item.userShellMessageId, item);
+    } else if (item.type === "user_message" && item.shellCommand === true) {
+      shellMessageIds.add(item.messageId);
+    } else if (item.type === "user_input_request" && item.questionAnswer) {
       foldedAnswerRunIdByMessageId.set(`async-answer:${item.questionAnswer.requestId}`, item.runId);
     } else if (item.type === "subagent" && item.origin === "app_owned" && item.runId !== null) {
       const children = delegatedChildrenByRun.get(item.runId) ?? new Set<string>();
@@ -2380,7 +2401,9 @@ export function buildThreadFeed(
     previous.nodes === options?.nodes &&
     checkpointSummariesEqual(previous.checkpointSummaries, options?.checkpointSummaries) &&
     mapsEqual(previous.foldedAnswerRunIdByMessageId, foldedAnswerRunIdByMessageId) &&
-    setMapsEqual(previous.delegatedChildrenByRun, delegatedChildrenByRun)
+    setMapsEqual(previous.delegatedChildrenByRun, delegatedChildrenByRun) &&
+    mapsEqual(previous.shellResults, shellResults) &&
+    setsEqual(previous.shellMessageIds, shellMessageIds)
   ) {
     const firstChanged = firstChangedIndex(previous.rows, visibleTurnItems);
     restartIndex = previous.restarts.length - 1;
@@ -2431,9 +2454,20 @@ export function buildThreadFeed(
     ) {
       continue;
     }
+    if (isUserShellCommandItem(item) && shellMessageIds.has(item.userShellMessageId)) continue;
     const attemptId = resolveAttemptId(item);
+    const shellResult = isUserShellCommandItem(item)
+      ? item
+      : item.type === "user_message" && item.shellCommand === true
+        ? shellResults.get(item.messageId)
+        : undefined;
     const cached = projectedEntriesCache.get(row);
-    if (cached?.attemptId === attemptId) {
+    if (
+      cached?.attemptId === attemptId &&
+      cached.entries.every(
+        (entry) => entry.type !== "message" || entry.message.shellCommandResult === shellResult,
+      )
+    ) {
       for (const entry of cached.entries) {
         entries.push(entry);
         entryRows.push(index);
@@ -2486,6 +2520,10 @@ export function buildThreadFeed(
           role: item.type === "user_message" ? "user" : "assistant",
           text: item.text,
           ...(item.type === "user_message" && item.context ? { context: item.context } : {}),
+          ...(item.type === "user_message" && item.shellCommand === true
+            ? { shellCommand: true as const }
+            : {}),
+          ...(shellResult ? { shellCommandResult: shellResult } : {}),
           attachments: item.attachments ?? [],
           runId: item.runId,
           streaming: item.type === "assistant_message" && item.streaming,
@@ -2551,6 +2589,7 @@ export function buildThreadFeed(
         id: message.id,
         role: message.role === "assistant" ? "assistant" : "user",
         text: message.text,
+        ...(message.shellCommand ? { shellCommand: true as const } : {}),
         ...(message.context ? { context: message.context } : {}),
         attachments: message.attachments ?? [],
         runId: null,
@@ -2608,6 +2647,8 @@ export function buildThreadFeed(
             checkpointSummaries: options?.checkpointSummaries,
             foldedAnswerRunIdByMessageId,
             delegatedChildrenByRun,
+            shellResults,
+            shellMessageIds,
             feed,
             restarts,
           };

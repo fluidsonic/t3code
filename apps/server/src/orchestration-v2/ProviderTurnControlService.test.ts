@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   type ModelSelection,
@@ -28,6 +29,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as ServerConfig from "../config.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -308,6 +310,9 @@ it.effect(
             layerProjection,
             layerSessionManager,
             Layer.mock(EventSink.EventSinkV2)({}),
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-turn-control-" }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
           ),
         ),
       );
