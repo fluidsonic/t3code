@@ -16,9 +16,12 @@ import {
   createAtomCommandScheduler,
   createEnvironmentCommand,
   createEnvironmentRpcCommand,
+  withRpcPermissionGuard,
 } from "./runtime.ts";
 import {
   type InterruptThreadTurnInput,
+  type EditQueuedRunInput,
+  type StartThreadTurnInput,
   type UpdateThreadMetadataInput,
   archiveThread,
   closeGuestShare,
@@ -42,6 +45,7 @@ import {
   revertThreadCheckpoint,
   setThreadInteractionMode,
   setThreadRuntimeMode,
+  stopUserShellCommand,
   pinThread,
   reorderPinnedThread,
   reorderActiveThread,
@@ -267,13 +271,20 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: startThreadTurn,
+      execute: (input: StartThreadTurnInput, registry) =>
+        startThreadTurn(input).pipe(withRpcPermissionGuard(runtime, registry)),
       scheduler,
       concurrency,
     }),
     interruptTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:interrupt-turn",
       execute: interruptTurn,
+      scheduler,
+      concurrency,
+    }),
+    stopUserShellCommand: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:stop-user-shell-command",
+      execute: stopUserShellCommand,
       scheduler,
       concurrency,
     }),
@@ -361,7 +372,8 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     editQueuedRun: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:edit-queued-run",
-      execute: editQueuedRun,
+      execute: (input: EditQueuedRunInput, registry) =>
+        editQueuedRun(input).pipe(withRpcPermissionGuard(runtime, registry)),
       scheduler,
       concurrency,
     }),
