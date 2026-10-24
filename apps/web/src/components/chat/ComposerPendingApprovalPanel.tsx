@@ -45,7 +45,10 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
   return (
     <span
       aria-label={fallbackLabel}
-      className={cn("flex min-w-0 flex-1 flex-col items-start gap-1", className)}
+      className={cn(
+        "flex max-h-[min(24rem,45dvh)] min-w-0 flex-1 flex-col items-start gap-1 overflow-y-auto",
+        className,
+      )}
       role="group"
     >
       <span className="flex w-full min-w-0 items-center gap-2 text-2xs text-muted-foreground">
@@ -71,13 +74,18 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           <span className="ml-auto shrink-0 tabular-nums">1/{pendingCount}</span>
         ) : null}
       </span>
+      {approval.description ? (
+        <span className="w-full min-w-0 text-2xs text-muted-foreground/70 wrap-break-word">
+          {approval.description}
+        </span>
+      ) : null}
       <Detail
         aria-label={detailAriaLabel}
         className={cn(
-          "block w-full min-w-0 overflow-auto text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5",
+          "block w-full min-w-0 shrink-0 overflow-auto whitespace-pre-wrap text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5",
           approval.requestKind === "mcp-elicitation"
-            ? "max-h-20 whitespace-pre-wrap font-sans wrap-break-word"
-            : "max-h-40 whitespace-pre-wrap font-mono wrap-anywhere",
+            ? "font-sans wrap-break-word"
+            : "font-mono wrap-anywhere",
         )}
         data-approval-detail="complete"
         tabIndex={0}
@@ -87,7 +95,7 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           : approval.detail || fallbackLabel}
       </Detail>
       {approval.reason ? (
-        <span className="w-full min-w-0 text-2xs text-muted-foreground wrap-break-word">
+        <span className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word">
           {approval.reason}
         </span>
       ) : null}

@@ -1340,6 +1340,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           completedAt: null,
           updatedAt: createdAt,
         };
+        const message = recordString(event, "message");
         const turnItem: OrchestrationV2TurnItem =
           method === "confirm"
             ? {
@@ -1347,7 +1348,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 type: "approval_request",
                 requestId,
                 requestKind: piApprovalRequestKind(title),
-                prompt: recordString(event, "message") ?? title,
+                ...(message === undefined
+                  ? { prompt: title }
+                  : { prompt: message, description: title }),
               }
             : {
                 ...itemBase,

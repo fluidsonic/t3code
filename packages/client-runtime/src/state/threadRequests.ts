@@ -47,6 +47,7 @@ export interface ThreadPendingApproval {
   readonly requestKind: ProviderRequestKind;
   readonly createdAt: string;
   readonly detail?: string;
+  readonly description?: string;
   readonly reason?: string;
   readonly fullAccessOverride?: ProviderApprovalFullAccessOverride;
   readonly appName?: string;
@@ -146,6 +147,9 @@ export function derivePendingThreadRequests(
       requestKind: request.kind,
       createdAt: DateTime.formatIso(request.createdAt),
       ...(item?.type === "approval_request" && item.prompt ? { detail: item.prompt } : {}),
+      ...(item?.type === "approval_request" && item.description
+        ? { description: item.description }
+        : {}),
       ...(item?.type === "approval_request" && item.reason ? { reason: item.reason } : {}),
       ...(item?.type === "approval_request" && item.fullAccessOverride
         ? { fullAccessOverride: item.fullAccessOverride }

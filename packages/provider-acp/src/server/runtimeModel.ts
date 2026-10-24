@@ -235,6 +235,7 @@ export type AcpPlanUpdate =
 export interface AcpPermissionRequest {
   readonly kind: string | "unknown";
   readonly detail?: string;
+  readonly description?: string;
   readonly toolCall?: AcpToolCallState;
 }
 
@@ -1229,9 +1230,16 @@ export function parsePermissionRequest(
     toolCall?.title ??
     toolCall?.detail ??
     (typeof params.sessionId === "string" ? `Session ${params.sessionId}` : undefined);
+  // Agents often title a command call with the command itself, sometimes in backticks.
+  const title = params.toolCall.title?.trim();
+  const description =
+    toolCall?.command && title && title.replace(/^`|`$/g, "") !== toolCall.command
+      ? title
+      : undefined;
   return {
     kind,
     ...(detail ? { detail } : {}),
+    ...(description ? { description } : {}),
     ...(toolCall ? { toolCall } : {}),
   };
 }

@@ -2867,11 +2867,13 @@ const CLAUDE_NO_STANDING_GRANT_OPTIONS = [
 export function claudeApprovalPresentation(input: {
   readonly permissionMode: PermissionMode;
   readonly prompt: string;
+  readonly description?: string | undefined;
   readonly callbackOptions: Pick<
     Parameters<CanUseTool>[2],
     "decisionReason" | "matchedAskRule" | "suppressAlwaysAllowRule"
   >;
 }): {
+  readonly description?: string;
   readonly reason?: string;
   readonly fullAccessOverride?: ProviderApprovalFullAccessOverride;
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
@@ -2890,6 +2892,9 @@ export function claudeApprovalPresentation(input: {
         ? "provider_check"
         : "ask_rule";
   return {
+    ...(input.description === undefined || input.description === input.prompt
+      ? {}
+      : { description: input.description }),
     ...(reason === "" || reason === input.prompt ? {} : { reason }),
     ...(fullAccessOverride === undefined ? {} : { fullAccessOverride }),
     ...(input.callbackOptions.suppressAlwaysAllowRule === true
@@ -8989,11 +8994,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
 
           const requestKind = providerRequestKindFromClaudeTool(toolName);
+          // Bash's title only summarizes the command; the command is what runs.
+          const { command } = toolInput;
           const prompt =
-            callbackOptions.title ??
-            callbackOptions.description ??
-            callbackOptions.decisionReason ??
-            summarizeClaudeToolRequest(toolName, nativeToolInput);
+            typeof command === "string"
+              ? command
+              : (callbackOptions.title ??
+                callbackOptions.description ??
+                callbackOptions.decisionReason ??
+                summarizeClaudeToolRequest(toolName, nativeToolInput));
+          const description =
+            typeof toolInput.description === "string"
+              ? toolInput.description
+              : callbackOptions.description;
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
@@ -9003,6 +9016,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             presentation: claudeApprovalPresentation({
               permissionMode: context.queryPolicy.permissionMode,
               prompt,
+              description,
               callbackOptions,
             }),
           });

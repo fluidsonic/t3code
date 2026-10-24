@@ -39,6 +39,12 @@ export function assertToolCallReadOnlyOnRequestOutput(
     [[request?.id, request?.kind]],
     "the approval card must show the resolved request",
   );
+  if (transcript.provider === "codex" || transcript.provider === "claudeAgent") {
+    assert.include(approvals[0]?.prompt, PROBE_CONTENT, "the approval must show the command");
+  }
+  if (transcript.provider === "claudeAgent") {
+    assert.equal(approvals[0]?.description, `Write exact text to ${PROBE_FILE}`);
+  }
 
   const writes = projection.turnItems.filter((item) =>
     request?.kind === "command"
