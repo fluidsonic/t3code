@@ -56,6 +56,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as UserShellCommandService from "./UserShellCommandService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
@@ -330,9 +331,21 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
     ),
   ),
 );
+const layerUserShellCommandsProvided = UserShellCommandService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerOrchestratorProvided,
+      ProjectionStore.layer,
+      ProjectStore.layer,
+      layerCommandOutputHubProvided,
+      layerCheckpointServiceProvided,
+    ),
+  ),
+);
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerUserShellCommandsProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
       layerProviderSessionManagerProvided,
