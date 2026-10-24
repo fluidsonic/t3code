@@ -1,5 +1,7 @@
 import { ActiveNewTaskContext } from "../../state/active-new-task";
 import * as Dialog from "../../components/ui/Dialog";
+import { readCanRunShellCommands } from "../../state/shell-commands";
+import { resolveComposerShellSend } from "../../lib/composerShellCommand";
 import React, { useEffect, useRef, useState } from "react";
 
 import type {
@@ -18,6 +20,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { threadContextsOutsideEnvironment } from "@t3tools/shared/composerContextReferences";
+import { shellCommandMessageText } from "@t3tools/shared/shellCommand";
 import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
 
@@ -572,7 +575,10 @@ export function NewTaskFlowProvider(
     if (!selectedProjectDraftKey) {
       return;
     }
-    setComposerDraftText(selectedProjectDraftKey, value);
+    setComposerDraftText(selectedProjectDraftKey, value, {
+      canRunShellCommands:
+        selectedProject !== null && readCanRunShellCommands(selectedProject.environmentId),
+    });
   };
   const replaceAttachments = (nextAttachments: ReadonlyArray<DraftComposerAttachment>) => {
     if (!selectedProjectDraftKey) {
@@ -773,6 +779,11 @@ export function NewTaskFlowProvider(
     if ((text.length === 0 && draft.attachments.length === 0) || !draftModelSelection) {
       return null;
     }
+    const shellSend = resolveComposerShellSend({
+      draft,
+      canRunShellCommands: readCanRunShellCommands(selectedProject.environmentId),
+    });
+    if (shellSend.kind === "empty" || shellSend.kind === "blocked") return null;
     if (
       threadContextsOutsideEnvironment({
         text: draft.text,
@@ -789,7 +800,9 @@ export function NewTaskFlowProvider(
       threadId: ThreadId.make(metadata.threadId),
       messageId: MessageId.make(metadata.messageId),
       commandId: CommandId.make(metadata.commandId),
-      text,
+      ...(shellSend.kind === "command"
+        ? { text: shellCommandMessageText(shellSend.command), shellCommand: true }
+        : { text }),
       attachments: draft.attachments,
       context: draft.context,
       modelSelection: draftModelSelection,

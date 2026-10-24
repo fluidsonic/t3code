@@ -26,13 +26,17 @@ export async function applyLinkedPromptToThreadDraft(
   }
   const action = linkedThreadDraftAction(getComposerDraftSnapshot(draftKey).text, prompt.text);
   if (action !== "ask") {
-    if (action === "fill") setComposerDraftText(draftKey, prompt.text);
+    // A link fills prose; only the person typing `!` makes a command.
+    if (action === "fill") setComposerDraftText(draftKey, prompt.text, { shellMode: false });
     showPromptLinkNotice(notice);
     return;
   }
   Dialog.alert("Linked prompt ready. Replace draft?", notice, [
     { text: "Keep mine", style: "cancel" },
-    { text: "Replace", onPress: () => setComposerDraftText(draftKey, prompt.text) },
+    {
+      text: "Replace",
+      onPress: () => setComposerDraftText(draftKey, prompt.text, { shellMode: false }),
+    },
   ]);
 }
 

@@ -30,6 +30,7 @@ import { useScaledTextRole } from "../features/settings/appearance/useScaledText
 import {
   acknowledgeComposerNativeEvent,
   assumeComposerControlledState,
+  forgetComposerSnapshotsRewrittenTo,
   isComposerNativeEcho,
   pruneAcknowledgedComposerNativeEvents,
   resolveComposerControlledEventCount,
@@ -89,6 +90,7 @@ interface NativeComposerEditorProps extends ViewProps {
   readonly autoFocus: boolean;
   readonly autoCorrect: boolean;
   readonly spellCheck: boolean;
+  readonly shellMode: boolean;
   readonly onComposerChange: (event: NativeEditorEvent) => void;
   readonly onComposerSelectionChange?: (event: NativeSelectionEvent) => void;
   readonly onComposerPasteImages?: (event: NativePasteImagesEvent) => void;
@@ -176,7 +178,10 @@ export function ComposerEditor({
 
   const skillLabels = useMemo(() => composerSkillLabels(skills), [skills]);
   const chipTextColor = createNativeComposerTheme(theme).text;
+  const shellMode = props.shellMode ?? false;
   const tokensJson = useMemo(() => {
+    // A command is plain text: no chips.
+    if (shellMode) return "[]";
     return JSON.stringify(
       composerContextEditorTokens(props.value, tokens, skillLabels).map((token) => {
         const record =
@@ -209,7 +214,7 @@ export function ComposerEditor({
         };
       }),
     );
-  }, [props.value, tokens, props.context, skillLabels, theme, chipTextColor]);
+  }, [props.value, tokens, props.context, skillLabels, theme, chipTextColor, shellMode]);
   // Every render resolves against the snapshot history, so a render whose
   // (value, selection) lags the acknowledged native state is stamped behind
   // the native revision and rejected by the editor instead of re-applying a
@@ -261,6 +266,16 @@ export function ComposerEditor({
     controlledDocumentJson,
     nativeEventSnapshotsRef,
   ]);
+  const deliverText = (eventCount: number, value: string) => {
+    const stored = onChangeText(value);
+    if (typeof stored === "string" && stored !== value) {
+      nativeEventSnapshotsRef.current = forgetComposerSnapshotsRewrittenTo(
+        nativeEventSnapshotsRef.current,
+        eventCount,
+        stored,
+      );
+    }
+  };
   const acceptNativeEvent = useCallback(
     (eventCount: number, value: string, nextSelection: ComposerEditorSelection) => {
       const acknowledgedEventCount = acknowledgeComposerNativeEvent(
@@ -312,6 +327,7 @@ export function ComposerEditor({
       autoFocus={props.autoFocus ?? false}
       autoCorrect={props.autoCorrect ?? true}
       spellCheck={props.spellCheck ?? true}
+      shellMode={shellMode}
       textPasteThresholdBytes={onPasteText ? PASTED_TEXT_ATTACHMENT_THRESHOLD_BYTES : 0}
       maxInputChars={PROVIDER_SEND_TURN_MAX_INPUT_CHARS}
       style={style as StyleProp<ViewStyle>}
@@ -322,7 +338,7 @@ export function ComposerEditor({
           event.nativeEvent.selection,
         );
         if (acknowledgedEventCount === false) return;
-        onChangeText(event.nativeEvent.value);
+        deliverText(acknowledgedEventCount, event.nativeEvent.value);
         onSelectionChange?.(event.nativeEvent.selection);
         setMostRecentEventCount(acknowledgedEventCount);
         forceNativeEventRender((sequence) => sequence + 1);
@@ -336,7 +352,7 @@ export function ComposerEditor({
         if (acknowledgedEventCount === false) return;
         // Selection events may carry post-edit text; publish it with its revision or stale drafts can overwrite native text.
         if (event.nativeEvent.value !== props.value) {
-          onChangeText(event.nativeEvent.value);
+          deliverText(acknowledgedEventCount, event.nativeEvent.value);
         }
         onSelectionChange?.(event.nativeEvent.selection);
         setMostRecentEventCount(acknowledgedEventCount);
@@ -352,7 +368,7 @@ export function ComposerEditor({
           paste.selection,
         );
         if (acknowledgedEventCount === false) return;
-        onChangeText(paste.value);
+        deliverText(acknowledgedEventCount, paste.value);
         onSelectionChange?.(paste.selection);
         props.onPasteContext?.(paste);
         setMostRecentEventCount(acknowledgedEventCount);
@@ -367,7 +383,7 @@ export function ComposerEditor({
         );
         if (acknowledgedEventCount === false) return;
         // Sync before capturing async paste targets; props may lag the last native keystroke.
-        onChangeText(paste.value);
+        deliverText(acknowledgedEventCount, paste.value);
         onSelectionChange?.(paste.selection);
         onPasteText?.(paste);
         setMostRecentEventCount(acknowledgedEventCount);
