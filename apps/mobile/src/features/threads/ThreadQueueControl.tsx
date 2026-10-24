@@ -5,6 +5,7 @@ import {
   queuedRunEditBlockedReason,
 } from "@t3tools/client-runtime/queued-run-edit";
 import type { ChatAttachment, EnvironmentId, RunId, ThreadId } from "@t3tools/contracts";
+import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
 import { Atom } from "effect/reactivity";
 import { Image } from "expo-image";
 import * as Haptics from "expo-haptics";
@@ -29,6 +30,8 @@ import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../n
 import { useAssetUrl } from "../../state/assets";
 import { assetImageSource } from "../../lib/assetImageSource";
 import { beginQueuedRunEdit, useQueuedRunEdit } from "../../state/queued-run-edit";
+import { useCanRunShellCommands } from "../../state/shell-commands";
+import { ShellCommandText } from "./thread-shell-command";
 import { environmentThreadDetails, threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
@@ -74,6 +77,8 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
   const promote = useAtomCommand(threadEnvironment.promoteQueuedRun, "promote queued message");
   const cancel = useAtomCommand(threadEnvironment.cancelQueuedRun, "remove queued message");
   const resume = useAtomCommand(threadEnvironment.resumeThreadQueue, "resume queue");
+  // Editing a queued command needs what sending one does.
+  const canRunShellCommands = useCanRunShellCommands(target.environmentId);
   const [resuming, setResuming] = useState(false);
   const [busyRunId, setBusyRunId] = useState<RunId | null>(null);
   const busyRef = useRef(false);
@@ -104,6 +109,7 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           originalText: entry.text,
           existingAttachments: entry.attachments,
           ...(entry.context ? { context: entry.context } : {}),
+          ...(entry.shellCommand ? { shellCommand: true } : {}),
         },
         makeQueuedRunsAtom({
           threadId: target.threadId,
@@ -173,7 +179,7 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           No messages waiting in this queue.
         </Text>
       ) : null}
-      {queuedRuns.map(({ run, text, attachments, context }, index) => {
+      {queuedRuns.map(({ run, text, attachments, context, shellCommand, shellCommandRan }, index) => {
         const controls = resolveThreadQueueRowControls({
           busy: busyRunId !== null,
           canPromoteToSteer: workflow?.canPromoteToSteer ?? false,
@@ -183,8 +189,14 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
           isGuestMessage: context?.guest !== undefined,
           text,
         });
+        const canEdit =
+          controls.canEdit &&
+          (shellCommand !== true || (canRunShellCommands && shellCommandRan !== true));
+        const command = shellCommand ? shellCommandFromMessageText(text) : null;
         const title =
-          controls.displayText || (attachments.length > 0 ? "Attachments" : "Queued message");
+          command !== null
+            ? `Command: ${command}`
+            : controls.displayText || (attachments.length > 0 ? "Attachments" : "Queued message");
         return (
           <View key={run.id} className="flex-row items-center border-b border-border bg-sheet">
             <QueueRowSwipeable
@@ -211,7 +223,7 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
                     {
                       id: "edit",
                       title: "Edit",
-                      attributes: { disabled: !controls.canEdit },
+                      attributes: { disabled: !canEdit },
                       image: Platform.OS === "ios" ? "pencil" : "edit",
                     },
                     {
@@ -228,11 +240,13 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
                     accessibilityRole="button"
                     accessibilityLabel={title}
                     accessibilityHint={
-                      controls.canEdit
-                        ? "Opens this message in the composer for editing"
-                        : (editBlockedReason ?? undefined)
+                      !canEdit
+                        ? (editBlockedReason ?? undefined)
+                        : shellCommand
+                          ? "Opens this command in the composer for editing"
+                          : "Opens this message in the composer for editing"
                     }
-                    disabled={!controls.canEdit}
+                    disabled={!canEdit}
                     onPress={() => void act(run.id, "edit")}
                     className="min-h-14 flex-row items-center gap-2.5 py-2.5 active:opacity-70"
                   >
@@ -240,21 +254,32 @@ export function ThreadQueueSheet({ route }: StaticScreenProps<QueueTarget>) {
                       environmentId={target.environmentId}
                       attachments={attachments}
                     />
-                    <Text
-                      className={
-                        controls.isEditing
-                          ? "min-w-0 flex-1 text-sm text-foreground-muted"
-                          : "min-w-0 flex-1 text-sm text-foreground"
-                      }
-                      numberOfLines={1}
-                    >
-                      {context?.guest === undefined ? null : (
-                        <Text className="font-t3-medium text-adaptive-fuchsia-600-300">
-                          {`${context.guest.name}  `}
-                        </Text>
-                      )}
-                      {title}
-                    </Text>
+                    {command !== null ? (
+                      <ShellCommandText
+                        command={command}
+                        numberOfLines={1}
+                        className="min-w-0 flex-1"
+                        textClassName={
+                          controls.isEditing ? "text-foreground-muted" : "text-foreground"
+                        }
+                      />
+                    ) : (
+                      <Text
+                        className={
+                          controls.isEditing
+                            ? "min-w-0 flex-1 text-sm text-foreground-muted"
+                            : "min-w-0 flex-1 text-sm text-foreground"
+                        }
+                        numberOfLines={1}
+                      >
+                        {context?.guest === undefined ? null : (
+                          <Text className="font-t3-medium text-adaptive-fuchsia-600-300">
+                            {`${context.guest.name}  `}
+                          </Text>
+                        )}
+                        {title}
+                      </Text>
+                    )}
                     {controls.isEditing ? (
                       <Text className="shrink-0 text-2xs uppercase tracking-wide text-primary">
                         Editing

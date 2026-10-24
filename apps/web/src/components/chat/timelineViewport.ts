@@ -54,6 +54,8 @@ export interface TimelineViewport {
    * upward scroll it causes is not read as the user's. Returns the release.
    */
   readonly holdProgrammaticScroll: () => () => void;
+  /** Takes the current position as the start of the next scroll, as layout put it there. */
+  readonly rebaseline: () => void;
   /** Follow announces letting go, so the list can remember it is reading history. */
   readonly followReleased: () => void;
   readonly onFollowReleased: (listener: () => void) => () => void;
@@ -152,6 +154,13 @@ export function attachTimelineViewport(scrollNode: HTMLElement): TimelineViewpor
         released = true;
         programmaticHolds -= 1;
       };
+    },
+    rebaseline: () => {
+      scrolledUp({
+        top: scrollNode.scrollTop,
+        height: scrollNode.scrollHeight,
+        programmatic: true,
+      });
     },
     followReleased: () => {
       for (const listener of followReleasedListeners) listener();

@@ -16,7 +16,7 @@ import {
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
-import { projectScriptTerminalInput } from "@t3tools/shared/projectScripts";
+import { canEditInTerminal, projectScriptTerminalInput } from "@t3tools/shared/projectScripts";
 import { type SetStateAction } from "react";
 import {
   isAtomCommandInterrupted,
@@ -65,6 +65,7 @@ interface ChatTerminalActionsInput {
   readonly activeThreadRef: ScopedThreadRef | null;
   readonly activeProject: EnvironmentProject | null;
   readonly activeRightPanelSurface: RightPanelSurface | null;
+  readonly rightPanelOpen: boolean;
   readonly runningTerminalIds: ReadonlyArray<string>;
   readonly activeServerOrderedTerminalIds: ReadonlyArray<string>;
   readonly activeTerminalLabelsById: ReadonlyMap<string, string>;
@@ -89,6 +90,7 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
     activeThreadRef,
     activeProject,
     activeRightPanelSurface,
+    rightPanelOpen,
     runningTerminalIds,
     activeServerOrderedTerminalIds,
     activeTerminalLabelsById,
@@ -203,6 +205,8 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
       preferNewTerminal?: boolean;
       rememberAsLastInvoked?: boolean;
       shellHistory?: "preserve" | "suppress";
+      /** False leaves the command on the prompt to edit instead of running it. */
+      submit?: boolean;
     },
   ) => {
     if (!hasTerminalWriteAccess() || !activeThreadId || !activeProject || !activeThread) return;
@@ -269,9 +273,11 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
 
     const writeResult = await terminalActions.writeToTerminal(
       targetTerminalId,
-      options?.shellHistory === "preserve"
-        ? `${script.command}\r`
-        : projectScriptTerminalInput(script.command),
+      options?.submit === false
+        ? script.command
+        : options?.shellHistory === "preserve"
+          ? `${script.command}\r`
+          : projectScriptTerminalInput(script.command),
     );
     if (!writeResult) return;
     if (writeResult._tag === "Failure") {
@@ -317,6 +323,40 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
     );
   };
   const runShellCommandStable = useStableCallback(runShellCommand);
+  const editShellCommandInTerminal = (command: string) => {
+    if (!canEditInTerminal(command)) return;
+    void runProjectScript(
+      {
+        id: "chat-code-block",
+        name: "Chat code block",
+        command,
+        icon: "play",
+        runOnWorktreeCreate: false,
+      },
+      // The same terminal Run in terminal would use.
+      { rememberAsLastInvoked: false, shellHistory: "preserve", submit: false },
+    );
+  };
+  const editShellCommandInTerminalStable = useStableCallback(editShellCommandInTerminal);
+  // The terminal on screen: the open drawer's, else an open right panel's.
+  const visibleTerminalId = terminalUiState.terminalOpen
+    ? terminalUiState.activeTerminalId
+    : rightPanelOpen && activeRightPanelSurface?.kind === "terminal"
+      ? activeRightPanelSurface.activeTerminalId
+      : null;
+  const canCopyToVisibleTerminal = () => visibleTerminalId !== null && hasTerminalWriteAccess();
+  // Stable, and read when a menu opens, so a terminal opening or closing doesn't re-render the
+  // timeline that holds the code blocks offering it.
+  const canCopyToVisibleTerminalStable = useStableCallback(canCopyToVisibleTerminal);
+  /** Types a command at the visible terminal's cursor, as a paste would, without running it. */
+  const copyToVisibleTerminal = (command: string) => {
+    if (visibleTerminalId === null || !hasTerminalWriteAccess() || !canEditInTerminal(command)) {
+      return;
+    }
+    void terminalActions.writeToTerminal(visibleTerminalId, command);
+    if (terminalUiState.terminalOpen) setTerminalFocusRequestId((value) => value + 1);
+  };
+  const copyToVisibleTerminalStable = useStableCallback(copyToVisibleTerminal);
   const addTerminalSurface = () => {
     if (!activeThreadRef) return;
     const launched = terminalActions.launchTerminal({
@@ -450,6 +490,9 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
     requestCloseTerminalStable,
     runProjectScriptStable,
     runShellCommandStable,
+    editShellCommandInTerminalStable,
+    copyToVisibleTerminalStable,
+    canCopyToVisibleTerminalStable,
     setTerminalOpenStable,
     splitPanelTerminalStable,
     splitPanelTerminalVerticalStable,
