@@ -51,6 +51,15 @@ export class DesktopBrowserChannel extends Context.Service<
     ) => Effect.Effect<void>;
     /** Never fails. A failed write means a broken channel; the next backend starts with no turns. */
     readonly turn: (threadId: string, active: boolean) => Effect.Effect<void>;
+    /** Reloads the page, which revives one whose renderer crashed. */
+    readonly reload: (key: DesktopTabKey) => Effect.Effect<void>;
+    /** The desktop sees a crash first; `null` means a reload brought the page back. */
+    readonly crashes: Stream.Stream<{
+      readonly key: DesktopTabKey;
+      readonly message: string | null;
+    }>;
+    /** The message of the tab's latest crash that no reload revived yet. */
+    readonly crashOf: (key: DesktopTabKey) => string | undefined;
   }
 >()("t3/preview/DesktopBrowserChannel") {}
 
@@ -60,6 +69,8 @@ const make = Effect.gen(function* () {
   const controlFd = config.desktopBrowserControlFd;
   const changes = yield* PubSub.unbounded<{ key: DesktopTabKey; attached: boolean }>();
   const attachedTabs = new Set<string>();
+  const crashes = yield* PubSub.unbounded<{ key: DesktopTabKey; message: string | null }>();
+  const crashedTabs = new Map<string, string>();
   const inbound = new Map<string, Queue.Queue<string>>();
   const writeLock = yield* Semaphore.make(1);
 
@@ -83,6 +94,11 @@ const make = Effect.gen(function* () {
       pointer: Effect.fn("DesktopBrowserChannel.pointer")(function () {
         return Effect.void;
       }),
+      reload: Effect.fn("DesktopBrowserChannel.reload")(function () {
+        return Effect.void;
+      }),
+      crashes: Stream.empty,
+      crashOf: () => undefined,
     });
   }
 
@@ -123,11 +139,16 @@ const make = Effect.gen(function* () {
           return PubSub.publish(changes, { key, attached: true });
         case "detached": {
           attachedTabs.delete(id);
+          crashedTabs.delete(id);
           const queue = inbound.get(id);
           return (queue ? Queue.shutdown(queue) : Effect.void).pipe(
             Effect.andThen(PubSub.publish(changes, { key, attached: false })),
           );
         }
+        case "crash":
+          if (event.message === null) crashedTabs.delete(id);
+          else crashedTabs.set(id, event.message);
+          return PubSub.publish(crashes, { key, message: event.message });
       }
     }),
     Effect.catchCause((cause) => Effect.logWarning("desktop browser channel stopped", { cause })),
@@ -228,6 +249,11 @@ const make = Effect.gen(function* () {
     pointer: Effect.fn("DesktopBrowserChannel.pointer")(function (key, pointer) {
       return command({ type: "pointer", ...key, ...pointer });
     }),
+    reload: Effect.fn("DesktopBrowserChannel.reload")(function (key) {
+      return command({ type: "reload", ...key });
+    }),
+    crashes: Stream.fromPubSub(crashes),
+    crashOf: (key) => crashedTabs.get(keyOf(key)),
   });
 });
 
