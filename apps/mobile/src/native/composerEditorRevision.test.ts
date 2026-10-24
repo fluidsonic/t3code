@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   acknowledgeComposerNativeEvent,
   assumeComposerControlledState,
+  forgetComposerSnapshotsRewrittenTo,
   isComposerNativeEcho,
   pruneAcknowledgedComposerNativeEvents,
   resolveComposerControlledEventCount,
@@ -162,5 +163,46 @@ describe("typing immediately before an intercepted paste", () => {
     );
     expect(isComposerNativeEcho("pasted", { start: 6, end: 6 }, 2, snapshots)).toBe(false);
     expect(acknowledgeComposerNativeEvent(2, 1)).toBeNull();
+  });
+});
+
+describe("forgetComposerSnapshotsRewrittenTo", () => {
+  it("applies a lone `!` the parent restores after Backspace leaves shell mode", () => {
+    const snapshots = [
+      { eventCount: 4, value: "!", selection: { start: 1, end: 1 } },
+      { eventCount: 5, value: "!", selection: { start: 1, end: 1 } },
+      { eventCount: 6, value: "", selection: { start: 0, end: 0 } },
+    ];
+    // Without the rewrite record, the restored `!` resolves to a superseded revision.
+    expect(resolveComposerControlledEventCount("!", { start: 1, end: 1 }, 6, snapshots)).toBe(5);
+
+    const rewritten = forgetComposerSnapshotsRewrittenTo(snapshots, 6, "!");
+    expect(resolveComposerControlledEventCount("!", { start: 1, end: 1 }, 6, rewritten)).toBe(6);
+    expect(isComposerNativeEcho("!", { start: 1, end: 1 }, 6, rewritten)).toBe(false);
+    expect(isComposerNativeEcho("!", null, 6, rewritten)).toBe(false);
+  });
+
+  it("applies the draft that dropped a space typed after a command's `!`", () => {
+    const snapshots = [
+      { eventCount: 2, value: "!", selection: { start: 1, end: 1 } },
+      { eventCount: 3, value: "! ", selection: { start: 2, end: 2 } },
+    ];
+    expect(resolveComposerControlledEventCount("!", { start: 1, end: 1 }, 3, snapshots)).toBe(2);
+
+    const rewritten = forgetComposerSnapshotsRewrittenTo(snapshots, 3, "!");
+    expect(resolveComposerControlledEventCount("!", { start: 1, end: 1 }, 3, rewritten)).toBe(3);
+    expect(isComposerNativeEcho("!", { start: 1, end: 1 }, 3, rewritten)).toBe(false);
+  });
+
+  it("keeps native events newer than the rewritten one", () => {
+    const snapshots = [
+      { eventCount: 2, value: "!", selection: { start: 1, end: 1 } },
+      { eventCount: 3, value: "! ", selection: { start: 2, end: 2 } },
+      { eventCount: 4, value: "!", selection: { start: 1, end: 1 } },
+    ];
+    expect(forgetComposerSnapshotsRewrittenTo(snapshots, 3, "!")).toEqual([
+      snapshots[1],
+      snapshots[2],
+    ]);
   });
 });
