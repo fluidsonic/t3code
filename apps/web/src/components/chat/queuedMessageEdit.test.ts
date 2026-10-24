@@ -1,5 +1,6 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 import {
   DraftId,
@@ -84,6 +85,20 @@ describe("queued message file edits", () => {
     expect(store.getComposerDraft(threadTarget)?.prompt).toBe("Original message");
     expect(store.getComposerDraft(threadTarget)?.files).toEqual([file]);
     expect(store.getComposerDraft(editTarget)).toBeNull();
+  });
+
+  it("finds an untouched queued command edit clean", () => {
+    const store = useComposerDraftStore.getState();
+    // Opened the way `useQueuedRunEdit` opens a queued command for editing.
+    const { prompt, shellMode } = composerPromptForMessage({
+      text: "npm test",
+      shellCommand: true,
+    });
+    store.setPrompt(editTarget, prompt, { shellMode });
+    expect(recoverQueuedMessageEdit({ editTarget, threadTarget, originalText: prompt })).toBe(
+      "clean",
+    );
+    expect(store.getComposerDraft(threadTarget)).toBeNull();
   });
 
   it("does not overwrite a separate draft when the queued run leaves", () => {

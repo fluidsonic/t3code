@@ -37,6 +37,7 @@ import {
   mergeRestartCancelledBackgroundWork,
   neverStarted,
 } from "./RestartBackgroundNote.ts";
+import { isUserShellCommandItem } from "@t3tools/provider-core/server/userShellCommand";
 
 export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRuntimeRecoveryError>()(
   "ProviderRuntimeRecoveryError",
@@ -157,13 +158,16 @@ const cancelledItem = (
 ): OrchestrationV2ThreadProjection["turnItems"][number] =>
   item.type === "secret_request" && item.secretStatus === "pending"
     ? { ...item, status: "cancelled", secretStatus: "cancelled", completedAt: now, updatedAt: now }
-    : {
-        ...item,
-        ...("streaming" in item ? { streaming: false } : {}),
-        status: "cancelled",
-        completedAt: now,
-        updatedAt: now,
-      };
+    : // A `! cmd` cut off by the restart counts as stopped: never re-run, never sent to an agent.
+      isUserShellCommandItem(item)
+      ? { ...item, status: "interrupted", completedAt: now, updatedAt: now }
+      : {
+          ...item,
+          ...("streaming" in item ? { streaming: false } : {}),
+          status: "cancelled",
+          completedAt: now,
+          updatedAt: now,
+        };
 
 function latestStartedRun(
   projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -310,7 +314,8 @@ export const make = Effect.gen(function* () {
       const recordCancelledBackgroundItem = (
         item: OrchestrationV2ThreadProjection["turnItems"][number],
       ) => {
-        if (!isBackgroundCapableTurnItemType(item.type)) return;
+        // The agent never started a person's `! cmd`, so it is not told to restart one.
+        if (!isBackgroundCapableTurnItemType(item.type) || isUserShellCommandItem(item)) return;
         const awaitingId = awaitingProviderThreadId(item, projection.runs);
         const ownProviderThread =
           item.providerThreadId === awaitingId
@@ -328,9 +333,57 @@ export const make = Effect.gen(function* () {
           cancelledBackgroundNativeIds.add(item.nativeItemRef.nativeId);
         }
       };
+      // A run still running its `! cmd` batch when the server went down has commands that
+      // finished: their results go back to the front of the queue, held like it, and reach the
+      // agent as that run's turn once it resumes. A command cut off mid-run is stopped below.
+      const startingRunIds =
+        projection.thread.hasShellCommands === true
+          ? runs
+              .filter(
+                (run) =>
+                  run.status === "starting" &&
+                  projection.turnItems.some(
+                    (item) =>
+                      item.runId === run.id &&
+                      isUserShellCommandItem(item) &&
+                      isNonterminalTurnItemStatus(item.status),
+                  ),
+              )
+              .map((run) => run.id)
+          : [];
+      const finishedShellRunIds =
+        startingRunIds.length === 0
+          ? new Set<string>()
+          : new Set(
+              (yield* projections
+                .getThreadRecords(projection.thread.id, ["turnItems"], {
+                  turnItemTypes: ["command_execution"],
+                  turnItemRunIds: startingRunIds,
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderRuntimeRecoveryError({
+                        operation: "read-projections",
+                        threadId: projection.thread.id,
+                        cause,
+                      }),
+                  ),
+                )).turnItems.flatMap((item) =>
+                isUserShellCommandItem(item) &&
+                item.runId !== null &&
+                (item.status === "completed" || item.status === "failed")
+                  ? [item.runId]
+                  : [],
+              ),
+            );
+      const requeuedRuns = runs.filter((run) => finishedShellRunIds.has(run.id));
+      const shellRunIds = new Set<string>(startingRunIds);
       const unstartedRuns = runs.filter(
         (run) =>
           run.status === "starting" &&
+          // A `! cmd` batch cut off by the restart is never retried.
+          !shellRunIds.has(run.id) &&
           neverStarted(run) &&
           !projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId) &&
           !projection.runtimeRequests.some(
@@ -341,15 +394,26 @@ export const make = Effect.gen(function* () {
       );
       const queuedRuns = projection.runs.filter((run) => run.status === "queued");
       const pendingRuns = [...unstartedRuns, ...queuedRuns];
-      const queuedMessages =
+      // A command cut off mid-run ends the rest of its group (a code block's Run all), as a stop
+      // does: they must not run once the held queue resumes.
+      const cutOffShellMessageIds = new Set(
+        (projection.turnItems ?? []).flatMap((item) =>
+          isUserShellCommandItem(item) &&
+          isNonterminalTurnItemStatus(item.status) &&
+          item.userShellMessageId !== undefined
+            ? [item.userShellMessageId]
+            : [],
+        ),
+      );
+      const fetchedMessages =
         pendingRuns.length === 0
           ? []
           : [
               ...(yield* projections
-                .getMessagesById(
-                  projection.thread.id,
-                  pendingRuns.map((run) => run.userMessageId),
-                )
+                .getMessagesById(projection.thread.id, [
+                  ...pendingRuns.map((run) => run.userMessageId),
+                  ...cutOffShellMessageIds,
+                ])
                 .pipe(
                   Effect.mapError(
                     (cause) =>
@@ -361,11 +425,25 @@ export const make = Effect.gen(function* () {
                   ),
                 )).values(),
             ];
-      const bufferedMessageIds = new Set(
-        queuedMessages.filter(isBufferedProviderNotification).map((message) => message.id),
+      const brokenShellGroups = new Set(
+        fetchedMessages.flatMap((message) =>
+          cutOffShellMessageIds.has(message.id) && message.shellCommandGroup !== undefined
+            ? [message.shellCommandGroup]
+            : [],
+        ),
+      );
+      const cancelledQueuedMessageIds = new Set(
+        fetchedMessages
+          .filter(
+            (message) =>
+              isBufferedProviderNotification(message) ||
+              (message.shellCommandGroup !== undefined &&
+                brokenShellGroups.has(message.shellCommandGroup)),
+          )
+          .map((message) => message.id),
       );
       const retryableMessageIds = new Set(
-        queuedMessages
+        fetchedMessages
           .filter(
             (message) =>
               message.createdBy === "user" &&
@@ -417,16 +495,29 @@ export const make = Effect.gen(function* () {
         });
       }
       runs = runs.filter((run) => !retryableRunIds.has(run.id));
+      const waitingRuns = queuedRunsInDeliveryOrder({
+        thread: projection.thread,
+        runs: queuedRuns,
+        messages: fetchedMessages,
+      });
+      for (const run of waitingRuns) {
+        if (cancelledQueuedMessageIds.has(run.userMessageId)) runs.push(run);
+      }
+      // Requeued and retried runs take the front of the queue, so the runs waiting behind them
+      // move back. Without any, the queue keeps its positions and only gets held.
+      const frontRuns = [...requeuedRuns, ...retryableRuns];
       const heldRuns = [
-        ...retryableRuns,
-        ...queuedRunsInDeliveryOrder({ runs: queuedRuns, messages: queuedMessages }),
+        ...frontRuns,
+        ...waitingRuns.filter((run) => !cancelledQueuedMessageIds.has(run.userMessageId)),
       ];
       for (const [index, run] of heldRuns.entries()) {
-        if (bufferedMessageIds.has(run.userMessageId)) {
-          runs.push(run);
+        const queuePosition = frontRuns.length === 0 ? run.queuePosition : index + 1;
+        if (
+          run.status === "queued" &&
+          run.queueHeld === true &&
+          queuePosition === run.queuePosition
+        )
           continue;
-        }
-        if (run.queueHeld === true && retryableRuns.length === 0) continue;
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",
@@ -438,7 +529,7 @@ export const make = Effect.gen(function* () {
             ...run,
             status: "queued",
             queueHeld: true,
-            ...(retryableRuns.length === 0 ? {} : { queuePosition: index + 1 }),
+            ...(frontRuns.length === 0 ? {} : { queuePosition }),
           },
         });
       }
@@ -471,6 +562,26 @@ export const make = Effect.gen(function* () {
         });
       }
       for (const run of runs) {
+        if (finishedShellRunIds.has(run.id)) {
+          for (const item of projection.turnItems.filter(
+            (candidate) =>
+              candidate.runId === run.id &&
+              isUserShellCommandItem(candidate) &&
+              isNonterminalTurnItemStatus(candidate.status),
+          )) {
+            events.push({
+              id: yield* allocateEventId(),
+              type: "turn-item.updated",
+              threadId: projection.thread.id,
+              runId: run.id,
+              ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: cancelledItem(item, now),
+            });
+          }
+          continue;
+        }
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",
