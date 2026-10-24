@@ -1,4 +1,5 @@
 import { useSidebarWorkspaceTabs } from "../workspace/useSystemWorkspaceTabBar";
+import { cn } from "../../lib/cn";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
@@ -29,7 +30,21 @@ import {
 import { StackActions, useFocusEffect, useNavigation } from "@react-navigation/native";
 import type { ReactNode } from "react";
 import { useEffect, useEffectEvent, useRef, useState, type RefObject } from "react";
-import { Keyboard, Platform, View, type ViewStyle } from "react-native";
+import { AccessibilityInfo, Keyboard, Platform, View, type ViewStyle } from "react-native";
+import { composerDraftIsShellCommand } from "@t3tools/client-runtime/user-shell-command";
+import {
+  droppedShellPrefixSpaces,
+  selectionAfterDroppedShellPrefixSpaces,
+  shellCommandFromPrompt,
+} from "@t3tools/shared/shellCommand";
+import {
+  SHELL_COMMAND_PLACEHOLDER,
+  SHELL_COMMANDS_OFF,
+  deletesLoneShellPrefix,
+  keepQueuedCommandPrefix,
+  pasteStartsShellCommand,
+} from "../../lib/composerShellCommand";
+import { useCanRunShellCommands } from "../../state/shell-commands";
 import { composerImageGallery } from "../../lib/composerImageGallery";
 import { filePreviewGallery } from "../../lib/filePreviewGallery";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
@@ -113,6 +128,9 @@ import {
 } from "./use-thread-settings-sheet-presentation";
 
 export const COMPOSER_COLLAPSED_CHROME = 60;
+
+// Shell mode's monospace face; the native editors resolve it by name.
+const SHELL_COMMAND_FONT_FAMILY = Platform.OS === "ios" ? "Menlo" : "monospace";
 
 const COLLAPSED_EDITOR_DEFAULT_INSET = 6;
 // iOS puts line-height slack above glyphs. DM Sans's lowercase midline is
@@ -210,6 +228,8 @@ export interface ThreadComposerProps {
   readonly draftKey?: string;
   readonly queuedEdit?: {
     readonly existingAttachments: ReadonlyArray<ChatAttachment>;
+    /** The queued message is a `! cmd`; its kind can't change while editing. */
+    readonly shellCommand: boolean;
     readonly saving: boolean;
     readonly onRemoveExistingAttachment: (attachmentId: string) => void;
   } | null;
@@ -334,6 +354,8 @@ export function ComposerSurface(props: {
   readonly children: ReactNode;
   readonly style: ViewStyle;
   readonly animateLayout?: boolean;
+  /** A faint wash over the surface, such as shell mode's. */
+  readonly tintColor?: string;
 }) {
   const colors = useUniwindTheme();
   const targetBorderRadius =
@@ -380,6 +402,15 @@ export function ComposerSurface(props: {
       >
         {null}
       </AnimatedGlassSurface>
+      {props.tintColor ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            { position: "absolute", inset: 0, backgroundColor: props.tintColor },
+            animatedShapeStyle,
+          ]}
+        />
+      ) : null}
       <Animated.View
         collapsable={false}
         layout={layoutTransition}
@@ -399,7 +430,8 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
   const { themeVariables: materialTheme } = useAppearancePreferences();
   const composerPanel = materialTheme["--color-composer-panel"];
   const navigation = useNavigation();
-  const foregroundColor = useUniwindTheme()["--color-foreground"];
+  const uniwindTheme = useUniwindTheme();
+  const foregroundColor = uniwindTheme["--color-foreground"];
   const bodyText = useScaledTextRole("body");
   const fallbackInputRef = useRef<ComposerEditorHandle>(null);
   const inputRef = props.editorRef ?? fallbackInputRef;
@@ -433,10 +465,49 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
   const [previewVideo, setPreviewVideo] = useState<VideoPreviewSource | null>(null);
   const composerOwnerKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
   const composerDraftKey = props.draftKey ?? composerOwnerKey;
-  const { text: draftMessage, attachments: draftAttachments } = useComposerDraft(composerDraftKey);
+  const composerDraft = useComposerDraft(composerDraftKey);
+  const { text: draftMessage, attachments: draftAttachments } = composerDraft;
   const queuedEdit = props.queuedEdit ?? null;
+  // Without terminal access or the environment's opt-in a newly typed `!` is plain text. A queued
+  // edit keeps its message's kind, so a queued message's `!` stays prose too.
+  const canRunShellCommands =
+    useCanRunShellCommands(props.environmentId) && queuedEdit?.shellCommand !== false;
+  // The draft's own flag decides, so a command drafted before shell commands became unavailable
+  // still shows as one, and can't be sent until its `!` goes.
+  const isShellMode =
+    queuedEdit?.shellCommand ??
+    composerDraftIsShellCommand({ prompt: draftMessage, shellMode: composerDraft.shellMode });
+  const shellCommandsOff = isShellMode && !canRunShellCommands;
+  // Until both the feature and this draft's shell mode are off, edits take the shell-aware
+  // handlers; otherwise the composer handles text exactly as it did before shell commands.
+  const shellFeatureActive = canRunShellCommands || isShellMode;
+  // Per draft: switching to a thread whose draft is in the other mode is not a mode change.
+  const announcedShellModeRef = useRef({ draftKey: composerDraftKey, shellMode: isShellMode });
+  // The editor reports its caret right after the text it reported; an edit the draft rewrote
+  // (a dropped space after the `!`, a restored lone `!`) moves it.
+  const adjustNextSelectionRef = useRef<
+    ((selection: { start: number; end: number }) => { start: number; end: number }) | null
+  >(null);
+  useEffect(() => {
+    const announced = announcedShellModeRef.current;
+    announcedShellModeRef.current = { draftKey: composerDraftKey, shellMode: isShellMode };
+    if (announced.draftKey !== composerDraftKey || announced.shellMode === isShellMode) return;
+    AccessibilityInfo.announceForAccessibility(isShellMode ? "Shell mode" : "Message mode");
+  }, [composerDraftKey, isShellMode]);
+  const keepQueuedEditKind = (text: string) =>
+    queuedEdit?.shellCommand === true ? keepQueuedCommandPrefix(text) : { text, shift: 0 };
+  const refuseShellAttachment = () =>
+    Dialog.alert(
+      "Commands can't include attachments",
+      queuedEdit?.shellCommand === true
+        ? "A queued command stays a command."
+        : "Delete the leading ! to send a message instead.",
+    );
+  // A lone `!` in shell mode has nothing to run, like an empty prompt.
   const hasContent =
-    draftMessage.trim().length > 0 ||
+    (isShellMode
+      ? shellCommandFromPrompt(draftMessage) !== null
+      : draftMessage.trim().length > 0) ||
     draftAttachments.length > 0 ||
     (queuedEdit?.existingAttachments.length ?? 0) > 0;
   const stripAttachments = composerStripAttachments(draftAttachments);
@@ -536,6 +607,8 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     hasThread: !props.isDraft,
     hasCompactableConversation: props.hasCompactableConversation,
     onChangeDraftMessage: props.onChangeDraftMessage,
+    // A command has no slash commands, mentions or skills.
+    enabled: !isShellMode,
     onUpdateInteractionMode:
       selectedProviderStatus?.showInteractionModeToggle === false
         ? undefined
@@ -550,7 +623,8 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     readDraftMessage: () => getComposerDraftSnapshot(composerDraftKey).text,
     subscribeToDraftChanges: (onChange) => appAtomRegistry.subscribe(composerDraftsAtom, onChange),
     selection: composerMenu.selection,
-    onChangeDraftMessage: (text) => setComposerDraftText(composerDraftKey, text),
+    onChangeDraftMessage: (text) =>
+      setComposerDraftText(composerDraftKey, text, { canRunShellCommands }),
     onChangeSelection: composerMenu.onSelectionChange,
   });
   const isSubmissionLocked =
@@ -582,6 +656,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
   const contextImports = useAtomValue(composerContextImportsAtom);
   const sendBlockedReason =
     (queuedEdit?.saving === true ? "Saving…" : null) ??
+    (shellCommandsOff ? SHELL_COMMANDS_OFF : null) ??
     props.sendBlockedReason ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
     attachmentBlockReason;
@@ -849,9 +924,18 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
             onPress={openSettings}
           />
         ) : null}
+        {shellCommandsOff ? (
+          <Text
+            accessibilityLiveRegion="polite"
+            className="px-3 py-2 text-xs text-foreground-muted"
+          >
+            {SHELL_COMMANDS_OFF}
+          </Text>
+        ) : null}
 
         <ComposerSurface
           animateLayout={false}
+          tintColor={isShellMode ? uniwindTheme["--color-shell-tint"] : undefined}
           style={{
             borderRadius: usesLargeControls ? 31 : 27,
             borderCurve: "circular",
@@ -867,19 +951,22 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
             }}
           >
             <ComposerDictationDraftContent
-              className="flex-row items-end"
+              className={cn("flex-row items-end", isShellMode && "ps-3")}
               compact
               hidden={showsCompactDictation}
             >
-              <ComposerAttachmentButton
-                size={usesLargeControls ? "large" : "regular"}
-                disabled={isSubmissionLocked}
-                supportsFiles={Boolean(
-                  props.serverConfig?.environment.capabilities.fileAttachments,
-                )}
-                onPickMedia={props.onPickDraftMedia}
-                onPickFiles={props.onPickDraftFiles}
-              />
+              {/* A command can't carry files, so shell mode has no attachment button. */}
+              {isShellMode ? null : (
+                <ComposerAttachmentButton
+                  size={usesLargeControls ? "large" : "regular"}
+                  disabled={isSubmissionLocked}
+                  supportsFiles={Boolean(
+                    props.serverConfig?.environment.capabilities.fileAttachments,
+                  )}
+                  onPickMedia={props.onPickDraftMedia}
+                  onPickFiles={props.onPickDraftFiles}
+                />
+              )}
               <Animated.View
                 className="min-w-0 flex-1"
                 onLayout={compactEditor.onEditorLayout}
@@ -994,14 +1081,55 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                 value={draftMessage}
                 // The save uses a draft snapshot; further typing would be discarded on success.
                 readOnly={isSubmissionLocked}
+                shellMode={isShellMode}
                 skills={composerMenu.skills}
                 selection={composerMenu.selection}
-                onChangeText={(text) => {
-                  if (!isSubmissionLocked) props.onChangeDraftMessage(text);
+                onChangeText={
+                  shellFeatureActive
+                    ? (editedText) => {
+                        adjustNextSelectionRef.current = null;
+                        if (isSubmissionLocked) return;
+                        if (
+                          queuedEdit === null &&
+                          deletesLoneShellPrefix({
+                            previousText: getComposerDraftSnapshot(composerDraftKey).text,
+                            shellMode: isShellMode,
+                            nextText: editedText,
+                          })
+                        ) {
+                          setComposerDraftText(composerDraftKey, "!", { shellMode: false });
+                          adjustNextSelectionRef.current = () => ({ start: 1, end: 1 });
+                          return "!";
+                        }
+                        const { text, shift } = keepQueuedEditKind(editedText);
+                        props.onChangeDraftMessage(text);
+                        const storedText = getComposerDraftSnapshot(composerDraftKey).text;
+                        const dropped = droppedShellPrefixSpaces({ typedText: text, storedText });
+                        if (dropped === 0 && shift === 0) return;
+                        adjustNextSelectionRef.current = (selection) =>
+                          selectionAfterDroppedShellPrefixSpaces(
+                            { start: selection.start + shift, end: selection.end + shift },
+                            dropped,
+                          );
+                        return storedText;
+                      }
+                    : (text) => {
+                        if (!isSubmissionLocked) props.onChangeDraftMessage(text);
+                      }
+                }
+                // Stays wrapped when the feature turns off: the lone `!` restored by Backspace
+                // can end shell mode between its change event and the caret that follows it.
+                onSelectionChange={(nextSelection) => {
+                  const adjust = adjustNextSelectionRef.current;
+                  adjustNextSelectionRef.current = null;
+                  composerMenu.onSelectionChange(adjust ? adjust(nextSelection) : nextSelection);
                 }}
-                onSelectionChange={composerMenu.onSelectionChange}
                 onPasteImages={(uris) => {
                   if (isSubmissionLocked) return;
+                  if (isShellMode) {
+                    refuseShellAttachment();
+                    return;
+                  }
                   pendingNativeImagePasteCountRef.current += 1;
                   void props.onNativePasteImages(uris).finally(() => {
                     pendingNativeImagePasteCountRef.current -= 1;
@@ -1015,9 +1143,24 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                       selection: paste.selection,
                       text: paste.text,
                     });
-                    const selection = { start: insertion.cursor, end: insertion.cursor };
-                    props.onChangeDraftMessage(insertion.value);
-                    composerMenu.onSelectionChange(selection);
+                    const { text, shift } = keepQueuedEditKind(insertion.value);
+                    const selection = {
+                      start: insertion.cursor + shift,
+                      end: insertion.cursor + shift,
+                    };
+                    props.onChangeDraftMessage(text);
+                    if (!shellFeatureActive) {
+                      composerMenu.onSelectionChange(selection);
+                      return;
+                    }
+                    // A command drops the spaces pasted after its `!`.
+                    const dropped = droppedShellPrefixSpaces({
+                      typedText: text,
+                      storedText: getComposerDraftSnapshot(composerDraftKey).text,
+                    });
+                    composerMenu.onSelectionChange(
+                      selectionAfterDroppedShellPrefixSpaces(selection, dropped),
+                    );
                   };
                   const capabilities = props.serverConfig?.environment.capabilities;
                   const advertisedMax =
@@ -1033,6 +1176,27 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                       Math.max(0, paste.selection.end - paste.selection.start) +
                       paste.text.length >
                     PROVIDER_SEND_TURN_MAX_INPUT_CHARS;
+                  // A command has to be in the text to run, so it never folds into a file.
+                  if (
+                    isShellMode ||
+                    (canRunShellCommands &&
+                      queuedEdit === null &&
+                      pasteStartsShellCommand({
+                        value: paste.value,
+                        selection: paste.selection,
+                        text: paste.text,
+                      }))
+                  ) {
+                    if (wouldExceedInputLimit) {
+                      Dialog.alert(
+                        "Pasted text is too large for this command",
+                        "Remove some text, then paste again.",
+                      );
+                      return;
+                    }
+                    insertPaste();
+                    return;
+                  }
                   const canAttach =
                     maxBytes !== null &&
                     countComposerDraftAttachmentsAfterSelection(composerDraftKey, {
@@ -1078,7 +1242,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                   }
                   insertPaste();
                 }}
-                placeholder={props.placeholder}
+                placeholder={isShellMode ? SHELL_COMMAND_PLACEHOLDER : props.placeholder}
                 onFocus={handleFocus}
                 onBlur={handleBlur}
                 onSubmit={(alternate) =>
@@ -1098,6 +1262,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                 textStyle={{
                   ...bodyText,
                   color: foregroundColor,
+                  ...(isShellMode ? { fontFamily: SHELL_COMMAND_FONT_FAMILY } : {}),
                 }}
               />
             </Animated.View>
@@ -1134,15 +1299,18 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
                   />
                 ) : (
                   <View className="min-w-0 flex-1 flex-row items-center justify-between">
-                    <ComposerAttachmentButton
-                      size={usesLargeControls ? "large" : "regular"}
-                      disabled={isSubmissionLocked}
-                      supportsFiles={Boolean(
-                        props.serverConfig?.environment.capabilities.fileAttachments,
-                      )}
-                      onPickMedia={props.onPickDraftMedia}
-                      onPickFiles={props.onPickDraftFiles}
-                    />
+                    {/* A command can't carry files, so shell mode has no attachment button. */}
+                    {isShellMode ? null : (
+                      <ComposerAttachmentButton
+                        size={usesLargeControls ? "large" : "regular"}
+                        disabled={isSubmissionLocked}
+                        supportsFiles={Boolean(
+                          props.serverConfig?.environment.capabilities.fileAttachments,
+                        )}
+                        onPickMedia={props.onPickDraftMedia}
+                        onPickFiles={props.onPickDraftFiles}
+                      />
+                    )}
                     {modelControl}
                   </View>
                 )}

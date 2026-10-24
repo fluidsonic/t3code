@@ -3,11 +3,40 @@ import type { ExtraProps as ReactMarkdownExtraProps } from "react-markdown";
 
 import { fnv1a32, type DiffThemeName } from "../../lib/diffRendering";
 
+/**
+ * What a closed assistant code block can do with the command it shows. Which blocks offer the
+ * command actions is `userShellCommandFromCodeBlock`'s rule, and for untagged blocks
+ * `shellCommandsFromUntaggedCodeBlock`'s.
+ */
+export interface CodeBlockShellActions {
+  /** Runs a one-line command in the terminal drawer. */
+  readonly runInTerminal?: ((command: string) => void) | undefined;
+  /** Runs the block's command as a shell command message, as if sent from the composer. */
+  readonly runCommand?: ((command: string) => void) | undefined;
+  /**
+   * Runs several in order, each as its own command message, each after the one before succeeds.
+   * When one fails, the agent hears which did not run.
+   */
+  readonly runCommands?: ((commands: ReadonlyArray<string>) => void) | undefined;
+  /** Puts the command into the composer in shell mode. */
+  readonly editCommand?: ((command: string) => void) | undefined;
+  /** Puts the command on the prompt of the terminal Run in terminal uses, without running it. */
+  readonly editInTerminal?: ((command: string) => void) | undefined;
+  /** Types the command at the cursor of the terminal on screen, without running it. */
+  readonly copyToTerminal?: ((command: string) => void) | undefined;
+  /** Whether a terminal is on screen to copy to; read when the actions menu opens. */
+  readonly canCopyToTerminal?: (() => boolean) | undefined;
+}
+
 const CODE_FENCE_LANGUAGE_REGEX = /(?:^|\s)language-([^\s]+)/;
 
+/** The fence's own language tag, or null for an untagged fence. */
+export function extractFenceLanguageTag(className: string | undefined): string | null {
+  return className?.match(CODE_FENCE_LANGUAGE_REGEX)?.[1] ?? null;
+}
+
 export function extractFenceLanguage(className: string | undefined): string {
-  const match = className?.match(CODE_FENCE_LANGUAGE_REGEX);
-  const raw = match?.[1] ?? "text";
+  const raw = extractFenceLanguageTag(className) ?? "text";
   // Shiki doesn't bundle a gitignore grammar; ini is a close match.
   return raw === "gitignore" ? "ini" : raw;
 }

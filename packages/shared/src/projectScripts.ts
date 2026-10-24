@@ -88,3 +88,13 @@ export function settleProjectScript(scripts: readonly ProjectScript[]): ProjectS
 export function projectScriptTerminalInput(command: string): string {
   return ` ${command}\r`;
 }
+
+/**
+ * Whether `command` can go on a shell's prompt to edit without running. Only a single line can:
+ * the terminal's input stream runs each line of a multi-line one, unless the program has enabled
+ * bracketed paste, which a client writing to the terminal can't see, a shell that is still
+ * starting hasn't done yet, and PowerShell may not do; its markers then appear as typed text.
+ */
+export function canEditInTerminal(command: string): boolean {
+  return !/[\r\n]/.test(command);
+}

@@ -630,6 +630,10 @@ it.effect(
         "provider-turn.steer",
         "provider-turn.restart",
         "runtime-request.respond",
+        "user-shell-command.run",
+        "user-shell-command.stop",
+        "provider-turn.hold",
+        "provider-turn.release",
       ]);
       const events = committedInput?.events ?? [];
       assert.deepEqual(
@@ -1366,5 +1370,137 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
         : [],
     );
     assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("requeues finished shell command results and ends the cut-off command's group", () => {
+  const threadId = ThreadId.make("thread_recovery_shell");
+  const runId = RunId.make("run_shell_batch");
+  const shellItem = (id: string, status: "completed" | "running") => ({
+    id: TurnItemId.make(`item_${id}`),
+    threadId,
+    runId,
+    nodeId: NodeId.make("node_shell_batch"),
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: id === "one" ? 1 : 2,
+    status,
+    title: null,
+    startedAt: null,
+    completedAt: null,
+    updatedAt: null,
+    type: "command_execution",
+    input: `echo ${id}`,
+    userShellMessageId: MessageId.make(`message_${id}`),
+  });
+  let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
+    null;
+  const run = {
+    id: runId,
+    threadId,
+    status: "starting",
+    ordinal: 2,
+    queuePosition: null,
+    activeAttemptId: RunAttemptId.make("attempt_shell_batch"),
+    rootNodeId: NodeId.make("node_shell_batch"),
+    providerThreadId: null,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    userMessageId: MessageId.make("message_one"),
+  };
+  const later = {
+    ...run,
+    id: RunId.make("run_later"),
+    status: "queued",
+    ordinal: 3,
+    queuePosition: 1,
+    userMessageId: MessageId.make("message_later"),
+  };
+  // Sent with the cut-off command by a Run all: it must not run once the queue resumes.
+  const grouped = {
+    ...later,
+    id: RunId.make("run_grouped"),
+    ordinal: 4,
+    queuePosition: 2,
+    userMessageId: MessageId.make("message_three"),
+  };
+  const groupMessages = ["message_two", "message_three"].map((id) => ({
+    id: MessageId.make(id),
+    shellCommand: true,
+    shellCommandGroup: MessageId.make("message_one"),
+  }));
+  const projection = {
+    thread: { id: threadId, projectId: "project", hasShellCommands: true },
+    runtimeRequests: [],
+    providerSessions: [],
+    providerThreads: [],
+    providerTurns: [],
+    runs: [run, later, grouped],
+    attempts: [{ id: run.activeAttemptId, runId, rootNodeId: run.rootNodeId, status: "pending" }],
+    nodes: [{ id: run.rootNodeId, runId, status: "pending", kind: "root_turn" }],
+    messages: [],
+    subagents: [],
+    turnItems: [shellItem("two", "running")],
+  } as unknown as OrchestrationV2ThreadProjection;
+  const layer = ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () => Effect.succeed([threadId]),
+          getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          getThreadRecords: (_threadId, fields: ReadonlyArray<string>) =>
+            Effect.succeed(
+              (fields.includes("messages")
+                ? { messages: groupMessages }
+                : {
+                    turnItems: [shellItem("one", "completed"), shellItem("two", "running")],
+                  }) as never,
+            ),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) => {
+            committedInput = input;
+            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+          },
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+      ),
+    ),
+  );
+  return Effect.gen(function* () {
+    yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).recover;
+    const events = (committedInput as typeof committedInput)?.events ?? [];
+    const runUpdates = events.flatMap((event) =>
+      event.type === "run.updated" ? [event.payload] : [],
+    );
+    // Held at the front of the queue, its attempt and node left to start its turn.
+    assert.deepEqual(
+      runUpdates.map((update) => [
+        update.id,
+        update.status,
+        update.queuePosition,
+        update.queueHeld,
+      ]),
+      [
+        [runId, "queued", 1, true],
+        [later.id, "queued", 2, true],
+        [grouped.id, "cancelled", null, undefined],
+      ],
+    );
+    assert.isFalse(events.some((event) => event.type === "run-attempt.updated"));
+    assert.isFalse(events.some((event) => event.type === "node.updated"));
+    // The command the restart cut off counts as stopped.
+    const items = events.flatMap((event) =>
+      event.type === "turn-item.updated" ? [event.payload] : [],
+    );
+    assert.deepEqual(
+      items.map((item) => [item.id, item.status]),
+      [[TurnItemId.make("item_two"), "interrupted"]],
+    );
   }).pipe(Effect.provide(layer));
 });

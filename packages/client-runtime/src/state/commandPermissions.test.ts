@@ -12,6 +12,10 @@ import {
   AuthPreviewOperateScope,
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
+  AuthTerminalOperateScope,
+  CommandId,
+  MessageId,
+  ORCHESTRATION_V2_WS_METHODS,
   ThreadId,
   EnvironmentId,
   ScheduledTaskId,
@@ -289,6 +293,47 @@ it.effect.each(["commit", "push", "commit_push", "create_pr", "commit_push_pr"] 
         yield* command.authorize(registry, env, withThread);
       }),
     ),
+);
+
+it.effect("needs terminal access to send a `! cmd` as a message or a new thread", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      const dispatch = createCommandPermissions(
+        runtime,
+        ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      );
+      const launch = createCommandPermissions(runtime, ORCHESTRATION_V2_WS_METHODS.launchThread);
+      const message = {
+        type: "message.dispatch",
+        commandId: CommandId.make("send"),
+        threadId: ThreadId.make("thread"),
+        messageId: MessageId.make("message"),
+        text: "ls",
+        attachments: [],
+      };
+      const command = { ...message, shellCommand: true };
+      const launchInput = { initialMessage: { text: "ls", attachments: [], shellCommand: true } };
+      yield* dispatch.authorize(registry, env, message);
+      expect(
+        (yield* dispatch.authorize(registry, env, command).pipe(Effect.flip)).requiredScope,
+      ).toBe(AuthTerminalOperateScope);
+      expect(
+        (yield* launch.authorize(registry, env, launchInput).pipe(Effect.flip)).requiredScope,
+      ).toBe(AuthTerminalOperateScope);
+      registry.set(
+        sessions(env),
+        AsyncResult.success({
+          ...grant(true),
+          scopes: [AuthOrchestrationOperateScope, AuthTerminalOperateScope],
+          permissions: [AuthOrchestrationOperateScope, AuthTerminalOperateScope],
+        }),
+      );
+      yield* dispatch.authorize(registry, env, command);
+      yield* launch.authorize(registry, env, launchInput);
+    }),
+  ),
 );
 
 it.effect("honors exact empty permissions and preserves legacy parent grants", () =>

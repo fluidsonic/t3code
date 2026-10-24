@@ -237,7 +237,7 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
     const restoreFailedDraft = () => {
       appAtomRegistry.set(fanoutSelectionsAtom, failedSelections);
       if (clearedDraft) {
-        restoreComposerDraft(composerDraftTarget, sendSnapshot);
+        restoreComposerDraft(composerDraftTarget, sendSnapshot, { shellMode: false });
         if (composerRef.current && currentRouteThreadKeyRef.current === routeThreadKey) {
           promptRef.current = messageText;
           composerRef.current.resetCursorState({

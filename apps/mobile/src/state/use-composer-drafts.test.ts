@@ -183,6 +183,7 @@ import {
   clearComposerDraftContentState,
   subscribeComposerDraftModelReconciliation,
   clearComposerDraftsEnvironment,
+  ComposerDraftKindConflictError,
   ComposerDraftPersistenceError,
   composerDraftsAtom,
   composerCloudDraftsAtom,
@@ -208,7 +209,9 @@ import {
   setComposerDraftText,
   insertComposerDraftContext,
   insertComposerDraftText,
+  readComposerDraftSelection,
   rememberComposerDraftSelection,
+  returnStoppedShellCommandToDraft,
   setComposerDraftAttachmentUpload,
   waitForComposerDraftsLoaded,
   setStickyComposerModelSelection,
@@ -2068,6 +2071,208 @@ describe("mobile composer drafts", () => {
         instanceId: "codex",
         model: "gpt-5.6-sol",
       },
+    });
+  });
+
+  const shell = { canRunShellCommands: true };
+
+  it("returns a stopped command to an empty composer in shell mode and never replaces a draft", () => {
+    expect(returnStoppedShellCommandToDraft("stopped-empty", "npm test", shell)).toBe("returned");
+    expect(getComposerDraftSnapshot("stopped-empty")).toMatchObject({
+      text: "!npm test",
+      shellMode: true,
+    });
+    expect(readComposerDraftSelection("stopped-empty", "!npm test")).toEqual({ start: 9, end: 9 });
+
+    setComposerDraftText("stopped-draft", "half-written thought");
+    // The caller offers it instead, so it isn't lost.
+    expect(returnStoppedShellCommandToDraft("stopped-draft", "npm test", shell)).toBe("draft");
+    expect(getComposerDraftSnapshot("stopped-draft").text).toBe("half-written thought");
+
+    // A lone `!` has no command to keep, so the stopped one takes its place.
+    setComposerDraftText("stopped-prefix", "!", shell);
+    expect(returnStoppedShellCommandToDraft("stopped-prefix", "npm test", shell)).toBe("returned");
+    expect(getComposerDraftSnapshot("stopped-prefix")).toMatchObject({
+      text: "!npm test",
+      shellMode: true,
+    });
+
+    // Where commands can no longer be sent, it would come back as prose; it stays out.
+    expect(
+      returnStoppedShellCommandToDraft("stopped-off", "npm test", { canRunShellCommands: false }),
+    ).toBe("unavailable");
+    expect(getComposerDraftSnapshot("stopped-off").text).toBe("");
+  });
+
+  it("enters shell mode on a `!` in an empty composer and keeps the Backspace opt-out while the `!` stays", () => {
+    setComposerDraftText("shell", "!", shell);
+    expect(getComposerDraftSnapshot("shell").shellMode).toBe(true);
+    setComposerDraftText("shell", "! ls", shell);
+    expect(getComposerDraftSnapshot("shell").shellMode).toBe(true);
+    setComposerDraftText("shell", "!", { ...shell, shellMode: false });
+    setComposerDraftText("shell", "!important", shell);
+    expect(getComposerDraftSnapshot("shell").shellMode).toBeUndefined();
+    // A `!` put in front of existing text stays prose.
+    setComposerDraftText("shell", "important", shell);
+    setComposerDraftText("shell", "!important", shell);
+    expect(getComposerDraftSnapshot("shell").shellMode).toBeUndefined();
+    // Pasted into the empty composer, it is a command.
+    setComposerDraftText("shell", "", shell);
+    setComposerDraftText("shell", "!important", shell);
+    expect(getComposerDraftSnapshot("shell").shellMode).toBe(true);
+    expect(
+      decodePersistedComposerState({
+        schemaVersion: 1,
+        drafts: { shell: getComposerDraftSnapshot("shell") },
+      }).drafts.shell,
+    ).toMatchObject({ text: "!important", shellMode: true });
+    expect(
+      clearComposerDraftContentState({ shell: getComposerDraftSnapshot("shell") }, "shell"),
+    ).toEqual({});
+  });
+
+  it("drops spaces after a command's `!`, whose gap the editor draws, but nowhere else", () => {
+    setComposerDraftText("gap", "!", shell);
+    setComposerDraftText("gap", "! ", shell);
+    expect(getComposerDraftSnapshot("gap")).toMatchObject({ text: "!", shellMode: true });
+    setComposerDraftText("gap", "!  git status", shell);
+    expect(getComposerDraftSnapshot("gap").text).toBe("!git status");
+    setComposerDraftText("gap", "! ls", { ...shell, shellMode: true });
+    expect(getComposerDraftSnapshot("gap").text).toBe("!ls");
+    // Prose that starts with `!` after the Backspace opt-out keeps its spaces.
+    setComposerDraftText("gap", "!", { ...shell, shellMode: false });
+    setComposerDraftText("gap", "! wow", shell);
+    expect(getComposerDraftSnapshot("gap")).toMatchObject({ text: "! wow" });
+    expect(getComposerDraftSnapshot("gap").shellMode).toBeUndefined();
+  });
+
+  it("keeps a leading `!` as prose, with its spaces, where commands are unavailable", () => {
+    setComposerDraftText("prose", "!");
+    setComposerDraftText("prose", "! ls");
+    expect(getComposerDraftSnapshot("prose")).toMatchObject({ text: "! ls" });
+    expect(getComposerDraftSnapshot("prose").shellMode).toBeUndefined();
+  });
+
+  it("brings a queued or pending command back as one where commands can't be sent", () => {
+    // Prose would send it to the agent; a command stays blocked until its `!` goes.
+    setComposerDraftText("restored", "!npm test", { shellMode: true, canRunShellCommands: false });
+    expect(getComposerDraftSnapshot("restored")).toMatchObject({
+      text: "!npm test",
+      shellMode: true,
+    });
+    setComposerDraftText("restored", "!npm test -w");
+    expect(getComposerDraftSnapshot("restored")).toMatchObject({ shellMode: true });
+  });
+
+  it("edits, inserts and merges a `!` draft as before while commands are off", () => {
+    setComposerDraftText("off-head", "!x");
+    insertComposerDraftText("off-head", "  ", { text: "!x", start: 1, end: 1 });
+    expect(getComposerDraftSnapshot("off-head")).toEqual({ text: "!  x", attachments: [] });
+    // The caret lands after the inserted spaces, none of which were dropped.
+    expect(readComposerDraftSelection("off-head", "!  x")).toEqual({ start: 3, end: 3 });
+    insertComposerDraftText(
+      "off-head",
+      " ",
+      { text: "!  x", start: 1, end: 1 },
+      { canRunShellCommands: false },
+    );
+    expect(getComposerDraftSnapshot("off-head").text).toBe("!   x");
+    expect(
+      mergeComposerDraftContentState({}, "merged", { text: "! hi", attachments: [] }).merged,
+    ).toEqual({ text: "! hi", attachments: [] });
+  });
+
+  it("keeps a command drafted while available a command once commands are unavailable", () => {
+    setComposerDraftText("off", "!ls", shell);
+    setComposerDraftText("off", "!ls -a");
+    expect(getComposerDraftSnapshot("off")).toMatchObject({ text: "!ls -a", shellMode: true });
+    // Backspace on the lone `!` turns it into an ordinary message, which stays one.
+    setComposerDraftText("off", "!");
+    setComposerDraftText("off", "!", { shellMode: false });
+    setComposerDraftText("off", "!ls");
+    expect(getComposerDraftSnapshot("off")).toMatchObject({ text: "!ls" });
+    expect(getComposerDraftSnapshot("off").shellMode).toBeUndefined();
+  });
+
+  it("places the caret after an insert into a command whose `!` lost a space", () => {
+    setComposerDraftText("insert", "!ls", shell);
+    insertComposerDraftText("insert", " ", { text: "!ls", start: 1, end: 1 }, shell);
+    expect(getComposerDraftSnapshot("insert").text).toBe("!ls");
+    expect(readComposerDraftSelection("insert", "!ls")).toEqual({ start: 1, end: 1 });
+    insertComposerDraftText("insert", " -a", { text: "!ls", start: 3, end: 3 }, shell);
+    expect(readComposerDraftSelection("insert", "!ls -a")).toEqual({ start: 6, end: 6 });
+  });
+
+  describe("restoring into a draft", () => {
+    const command = (text: string) => ({ text: `! ${text}`, shellCommand: true, attachments: [] });
+    const prose = (text: string) => ({ text, attachments: [] });
+    const shellDraft = (text: string): ComposerDraft => ({
+      text,
+      shellMode: true,
+      attachments: [],
+    });
+
+    it("joins prose to prose as before", () => {
+      expect(
+        mergeComposerDraftContentState({ key: { text: "Draft", attachments: [] } }, "key", {
+          text: "more",
+          attachments: [],
+        }).key,
+      ).toEqual({ text: "Draft\n\nmore", attachments: [] });
+    });
+
+    it("brings a command back as one into an empty composer or onto a lone `!`", () => {
+      expect(mergeComposerDraftContentState({}, "key", command("npm test")).key).toEqual({
+        text: "!npm test",
+        shellMode: true,
+        attachments: [],
+      });
+      expect(
+        mergeComposerDraftContentState({ key: shellDraft("!") }, "key", command("npm test")).key,
+      ).toEqual({ text: "!npm test", shellMode: true, attachments: [] });
+      // Prose replaces a lone `!` rather than running as its command.
+      expect(
+        mergeComposerDraftContentState({ key: shellDraft("!") }, "key", prose("fix the bug")).key,
+      ).toEqual({ text: "fix the bug", attachments: [] });
+    });
+
+    it.each([
+      { name: "prose onto a command", draft: shellDraft("!ls"), content: prose("fix the bug") },
+      {
+        name: "a command onto prose",
+        draft: { text: "Draft", attachments: [] },
+        content: command("npm test"),
+      },
+      { name: "a command onto another", draft: shellDraft("!ls"), content: command("npm test") },
+    ])("keeps the draft untouched instead of joining $name", ({ draft, content }) => {
+      const current = { key: draft };
+      expect(() => mergeComposerDraftContentState(current, "key", content)).toThrow(
+        ComposerDraftKindConflictError,
+      );
+      expect(current.key).toBe(draft);
+    });
+
+    it("leaves a command alone when the same one is restored again", () => {
+      const current = { key: shellDraft("!npm test") };
+      expect(mergeComposerDraftContentState(current, "key", command("npm test"))).toBe(current);
+    });
+
+    it("keeps a saved draft of the other kind archived when signing back in", async () => {
+      const load = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+      onTestFinished(() => load.mockRestore());
+      await waitForComposerDraftsLoaded();
+      const key = "environment-1:kind-conflict";
+      const saved: ComposerDraft = { text: "fix the bug", attachments: [] };
+      appAtomRegistry.set(composerDraftsAtom, { [key]: shellDraft("!ls") });
+      appAtomRegistry.set(composerCloudDraftsAtom, {
+        accountId: null,
+        signedOut: { account: { drafts: { [key]: saved }, queuedMessages: [] } },
+      });
+      await restoreCloudComposerDrafts("account");
+      expect(getComposerDraftSnapshot(key)).toEqual(shellDraft("!ls"));
+      expect(appAtomRegistry.get(composerCloudDraftsAtom).signedOut).toEqual({
+        account: { drafts: { [key]: saved }, queuedMessages: [] },
+      });
     });
   });
 
