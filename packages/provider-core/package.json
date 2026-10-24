@@ -186,6 +186,10 @@
     "./server/usageLimits": {
       "types": "./src/server/usageLimits.ts",
       "import": "./src/server/usageLimits.ts"
+    },
+    "./server/userShellCommand": {
+      "types": "./src/server/userShellCommand.ts",
+      "import": "./src/server/userShellCommand.ts"
     }
   },
   "scripts": {

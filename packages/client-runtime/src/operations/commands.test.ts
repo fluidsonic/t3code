@@ -35,12 +35,15 @@ import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import { v2Now, v2Projection, v2ThreadId } from "../state/orchestrationV2TestFixtures.ts";
+import { RpcPermissionGuard } from "../rpc/client.ts";
 import {
   archiveThread,
+  editQueuedRun,
   interruptThreadTurn,
   revertThreadCheckpoint,
   resumeThreadQueue,
   startThreadTurn,
+  stopUserShellCommand,
 } from "./commands.ts";
 
 const layerTestCrypto = Layer.succeed(
@@ -260,6 +263,92 @@ describe("V2 environment commands", () => {
           worktreePath: "/workspace/project-worktrees/feature",
           branch: "feature",
         },
+      });
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
+  it.effect("marks `! cmd` sends, launches and queued edits as shell commands", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const launches: OrchestrationV2ThreadLaunchInput[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [], launches });
+      const message = {
+        messageId: MessageId.make("message-shell"),
+        role: "user" as const,
+        text: "npm test",
+        shellCommand: true,
+        attachments: [],
+      };
+      const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          // Shell sends need terminal access; the command boundary checks it.
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
+        );
+
+      yield* run(
+        startThreadTurn({
+          threadId: v2ThreadId,
+          message,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          dispatchMode: "queue",
+        }),
+      );
+      yield* run(
+        startThreadTurn({
+          threadId: v2ThreadId,
+          message,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          titleSeed: "npm test",
+          bootstrap: {
+            createThread: {
+              projectId: ProjectId.make("project-1"),
+              title: "Thread",
+              modelSelection: v2Projection.thread.modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdAt: "2026-10-23T00:00:00.000Z",
+            },
+          },
+        }),
+      );
+      yield* run(
+        editQueuedRun({
+          threadId: v2ThreadId,
+          runId: RunId.make("queued-shell"),
+          text: "npm run lint",
+          shellCommand: true,
+        }),
+      );
+      yield* run(
+        stopUserShellCommand({
+          commandId: CommandId.make("stop-shell"),
+          threadId: v2ThreadId,
+          turnItemId: TurnItemId.make("item-shell"),
+        }),
+      );
+
+      expect(commands[0]).toMatchObject({
+        type: "message.dispatch",
+        text: "npm test",
+        shellCommand: true,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      expect(launches[0]?.initialMessage).toMatchObject({ text: "npm test", shellCommand: true });
+      expect(commands[1]).toMatchObject({
+        type: "queued-run.edit",
+        text: "npm run lint",
+        shellCommand: true,
+      });
+      expect(commands[2]).toEqual({
+        type: "user-shell-command.stop",
+        commandId: "stop-shell",
+        threadId: v2ThreadId,
+        turnItemId: "item-shell",
       });
     }).pipe(Effect.provide(layerTestCrypto)),
   );

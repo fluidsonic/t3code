@@ -23,8 +23,10 @@ import {
   MAX_STASH_ENTRIES,
   type PromptStashEntry,
   partitionStashAttachments,
+  promptAfterStashRestore,
   usePromptStashStore,
 } from "../../promptStashStore";
+import { composerDraftIsShellCommand } from "@t3tools/client-runtime/user-shell-command";
 import { type PendingUserInput } from "../../session-logic";
 import { type ReviewCommentContext } from "../../reviewCommentContext";
 import { collapseExpandedComposerCursor } from "../../composer-logic";
@@ -190,6 +192,22 @@ export function useComposerStash(input: {
     ) {
       return;
     }
+    const currentShellMode = composerDraftIsShellCommand(
+      getComposerDraft(composerDraftTarget) ?? { prompt: "" },
+    );
+    // Shell commands only: a command and prose never merge, so the entry stays in the stash.
+    if (menuEntry.shellCommand === true || currentShellMode) {
+      const outcome = promptAfterStashRestore({
+        currentPrompt: promptRef.current,
+        currentShellMode,
+        restoredPrompt: menuEntry.prompt,
+        restoredShellCommand: menuEntry.shellCommand === true,
+      });
+      if ("refused" in outcome) {
+        toastManager.add({ type: "info", title: outcome.refused });
+        return;
+      }
+    }
 
     const { entry, durable } = takeStashEntry(menuEntry.id);
     if (!entry) return;
@@ -217,18 +235,39 @@ export function useComposerStash(input: {
         : reference.source;
     });
     const currentPrompt = promptRef.current;
-    const nextPrompt =
-      restoredPrompt.length === 0
-        ? currentPrompt
-        : currentPrompt.trim().length
-          ? `${currentPrompt.replace(/\s+$/, "")}\n\n${restoredPrompt}`
-          : restoredPrompt;
-    let promptChanged = nextPrompt !== currentPrompt;
-    if (promptChanged) {
-      promptRef.current = nextPrompt;
-      setComposerDraftPrompt(composerDraftTarget, nextPrompt);
-      setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
-      setComposerTrigger(null);
+    let promptChanged = false;
+    if (entry.shellCommand === true || currentShellMode) {
+      const outcome = promptAfterStashRestore({
+        currentPrompt,
+        currentShellMode,
+        restoredPrompt,
+        restoredShellCommand: entry.shellCommand === true,
+      });
+      if (!("refused" in outcome) && outcome.prompt !== currentPrompt) {
+        promptChanged = true;
+        promptRef.current = outcome.prompt;
+        setComposerDraftPrompt(composerDraftTarget, outcome.prompt, {
+          shellMode: outcome.shellMode,
+        });
+        setComposerCursor(
+          collapseExpandedComposerCursor(outcome.prompt, outcome.prompt.length, outcome.shellMode),
+        );
+        setComposerTrigger(null);
+      }
+    } else {
+      const nextPrompt =
+        restoredPrompt.length === 0
+          ? currentPrompt
+          : currentPrompt.trim().length
+            ? `${currentPrompt.replace(/\s+$/, "")}\n\n${restoredPrompt}`
+            : restoredPrompt;
+      promptChanged = nextPrompt !== currentPrompt;
+      if (promptChanged) {
+        promptRef.current = nextPrompt;
+        setComposerDraftPrompt(composerDraftTarget, nextPrompt);
+        setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
+        setComposerTrigger(null);
+      }
     }
 
     let unrestoredFileNames: string[] = [];
@@ -455,6 +494,9 @@ export function useComposerStash(input: {
       return;
     }
     const prompt = promptRef.current.trim();
+    const shellCommand = composerDraftIsShellCommand(
+      getComposerDraft(composerDraftTarget) ?? { prompt: "" },
+    );
     const attachmentDraft = readAttachmentDraft();
     const images = [...attachmentDraft.images];
     const files = [...attachmentDraft.files];
@@ -534,6 +576,7 @@ export function useComposerStash(input: {
         unreadableImageNames: [],
         pendingImageCount: images.length,
         ...(stashedRecords.length > 0 ? { records: stashedRecords } : {}),
+        ...(shellCommand ? { shellCommand: true } : {}),
       });
 
       // If it was rejected (quota) the store has already rolled itself back,

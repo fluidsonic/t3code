@@ -30,6 +30,20 @@ import type {
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
 import { draftModelPickMatchesThread } from "@t3tools/shared/model";
+import {
+  droppedShellPrefixSpaces,
+  isShellCommandPrompt,
+  selectionAfterDroppedShellPrefixSpaces,
+  shellCommandFromPrompt,
+  shellCommandMessageText,
+  shellCommandPrompt,
+  withoutSpaceAfterShellPrefix,
+} from "@t3tools/shared/shellCommand";
+import {
+  composerDraftIsShellCommand,
+  composerPromptForMessage,
+  nextComposerShellMode,
+} from "@t3tools/client-runtime/user-shell-command";
 
 import { writeFileAtomically } from "../lib/atomic-file";
 import { createComposerContextHistory, referencedComposerContext } from "../lib/composerContext";
@@ -121,7 +135,7 @@ function matchingComposerDraftSelection(
 }
 
 /** Read the post-chip-insertion selection or the editor restores the pre-insert caret before the chip. */
-function readComposerDraftSelection(
+export function readComposerDraftSelection(
   draftKey: string,
   text: string,
 ): { start: number; end: number } | null {
@@ -360,6 +374,8 @@ export class ComposerDraftPersistenceError extends Schema.TaggedError<ComposerDr
 
 export interface ComposerDraft {
   readonly text: string;
+  /** The text is a `! cmd` shell command; read it through `composerDraftIsShellCommand`. */
+  readonly shellMode?: boolean;
   readonly context?: OrchestrationMessageContext;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly importedShareIds?: ReadonlyArray<string>;
@@ -378,6 +394,8 @@ export interface ComposerDraftProject {
 
 export interface ComposerDraftContent {
   readonly text: string;
+  /** `text` is a shell command in its message form, `! cmd`; it comes back in shell mode. */
+  readonly shellCommand?: boolean;
   readonly context?: OrchestrationMessageContext;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly sourceShareId?: string;
@@ -425,6 +443,7 @@ const PersistedComposerContextSchema = Schema.Struct({
 
 const ComposerDraftSchema = Schema.Struct({
   text: Schema.String,
+  shellMode: Schema.optional(Schema.Boolean),
   context: Schema.optional(PersistedComposerContextSchema),
   attachments: Schema.Array(DraftComposerAttachmentSchema),
   importedShareIds: Schema.optional(Schema.Array(Schema.String)),
@@ -582,6 +601,124 @@ function restoreMissingComposerFileReferences(
     changed = true;
   }
   return changed ? { ...draft, text, context: { version: 1, records } } : draft;
+}
+
+/** A draft's text as merge content, so a `! cmd` moves as a command rather than prose. */
+export function composerDraftTextContent(
+  draft: Pick<ComposerDraft, "text" | "shellMode">,
+): Pick<ComposerDraftContent, "text" | "shellCommand"> {
+  if (!composerDraftIsShellCommand({ prompt: draft.text, shellMode: draft.shellMode })) {
+    return { text: draft.text };
+  }
+  return {
+    text: shellCommandMessageText(shellCommandFromPrompt(draft.text) ?? ""),
+    shellCommand: true,
+  };
+}
+
+function withShellMode(draft: ComposerDraft, shellMode: boolean): ComposerDraft {
+  if ((draft.shellMode === true) === shellMode) return draft;
+  const { shellMode: _shellMode, ...rest } = draft;
+  return shellMode ? { ...rest, shellMode: true } : rest;
+}
+
+/** A shell-mode draft's lone `!` has no command yet, so it holds nothing to keep. */
+function draftHoldsShellCommand(draft: Pick<ComposerDraft, "text" | "shellMode">): boolean {
+  return (
+    composerDraftIsShellCommand({ prompt: draft.text, shellMode: draft.shellMode }) &&
+    shellCommandFromPrompt(draft.text) !== null
+  );
+}
+
+function incomingMergeText(content: Pick<ComposerDraftContent, "text" | "shellCommand">) {
+  const incoming = composerPromptForMessage(content);
+  const empty = incoming.shellMode
+    ? shellCommandFromPrompt(incoming.prompt) === null
+    : incoming.prompt.length === 0;
+  return { ...incoming, empty };
+}
+
+/**
+ * Whether bringing `content` back into `draft` would put a `! cmd` and other text in one draft.
+ * Joined, the prose would run as part of the command, or the command would go to the agent as
+ * prose. The draft is kept instead and the content stays where it was, offered to the person.
+ */
+export function composerDraftMergeMixesKinds(
+  draft: Pick<ComposerDraft, "text" | "shellMode"> | undefined,
+  content: Pick<ComposerDraftContent, "text" | "shellCommand">,
+): boolean {
+  if (!draft) return false;
+  const existingCommand = draftHoldsShellCommand(draft);
+  const incoming = incomingMergeText(content);
+  if (!existingCommand && !incoming.shellMode) return false;
+  if (incoming.empty) return false;
+  if (!existingCommand) return draft.text.trim().length > 0 && !isLoneShellPrefix(draft);
+  // The same command again is a retried restore, which leaves the draft as it is.
+  return (
+    !incoming.shellMode ||
+    shellCommandFromPrompt(draft.text) !== shellCommandFromPrompt(incoming.prompt)
+  );
+}
+
+/** Nothing typed or attached; a lone shell-mode `!` has no command in it yet. */
+export function composerDraftIsBlank(draft: ComposerDraft): boolean {
+  return (
+    draft.attachments.length === 0 && (draft.text.trim().length === 0 || isLoneShellPrefix(draft))
+  );
+}
+
+function isLoneShellPrefix(draft: Pick<ComposerDraft, "text" | "shellMode">): boolean {
+  return (
+    composerDraftIsShellCommand({ prompt: draft.text, shellMode: draft.shellMode }) &&
+    !draftHoldsShellCommand(draft)
+  );
+}
+
+export class ComposerDraftKindConflictError extends Schema.TaggedError<ComposerDraftKindConflictError>()(
+  "ComposerDraftKindConflictError",
+  { incomingShellCommand: Schema.Boolean },
+) {
+  override get message(): string {
+    return this.incomingShellCommand
+      ? "Send or clear your draft first. A shell command can't be added to it."
+      : "Send or clear the shell command in the composer first. Text can't be added to it.";
+  }
+}
+
+/**
+ * The text and mode after bringing `content` back into `existing`. A command lands only on its
+ * own; see `composerDraftMergeMixesKinds`.
+ */
+function mergeComposerDraftTextContent(
+  existing: Pick<ComposerDraft, "text" | "shellMode">,
+  content: Pick<ComposerDraftContent, "text" | "shellCommand">,
+): { readonly text: string; readonly shellMode: boolean } {
+  if (composerDraftMergeMixesKinds(existing, content)) {
+    throw new ComposerDraftKindConflictError({
+      incomingShellCommand: content.shellCommand === true,
+    });
+  }
+  const incoming = incomingMergeText(content);
+  if (incoming.empty) {
+    return {
+      text: existing.text,
+      shellMode: composerDraftIsShellCommand({
+        prompt: existing.text,
+        shellMode: existing.shellMode,
+      }),
+    };
+  }
+  if (incoming.shellMode) {
+    return {
+      text: draftHoldsShellCommand(existing)
+        ? existing.text
+        : withoutSpaceAfterShellPrefix(incoming.prompt),
+      shellMode: true,
+    };
+  }
+  // Prose replaces a lone `!`, which had no command to keep.
+  const base = isLoneShellPrefix(existing) ? "" : existing.text;
+  return { text: mergeComposerDraftText(base, incoming.prompt), shellMode: false };
 }
 
 function normalizeDraft(draft: ComposerDraft | undefined): ComposerDraft {
@@ -1215,6 +1352,7 @@ export async function restoreCloudComposerDrafts(accountId: string): Promise<voi
   await waitForComposerDraftsLoaded();
   const cloud = appAtomRegistry.get(composerCloudDraftsAtom);
   const saved = cloud.signedOut[accountId];
+  const kept: Record<string, ComposerDraft> = {};
   if (saved) {
     if (!(await threadOutboxManager.load())) throw new Error("Could not restore queued messages.");
     for (const message of saved.queuedMessages) {
@@ -1229,36 +1367,43 @@ export async function restoreCloudComposerDrafts(accountId: string): Promise<voi
       const restored = { ...current };
       for (const [key, draft] of Object.entries(saved.drafts)) {
         const existing = current[key];
-        const attachmentIds = new Set(existing?.attachments.map((attachment) => attachment.id));
-        restored[key] = existing
-          ? {
-              ...draft,
-              ...existing,
-              text: mergeComposerDraftText(existing.text, draft.text),
-              context: mergeReferencedComposerContext(
-                mergeComposerDraftText(existing.text, draft.text),
-                draft.context,
-                existing.context,
-              ),
-              // A concurrent import must not lose files, even above the send limit.
-              attachments: [
-                ...existing.attachments,
-                ...draft.attachments.filter((attachment) => !attachmentIds.has(attachment.id)),
-              ],
-              importedShareIds: [
-                ...new Set([
-                  ...(existing.importedShareIds ?? []),
-                  ...(draft.importedShareIds ?? []),
-                ]),
-              ],
-            }
-          : draft;
+        if (!existing) {
+          restored[key] = draft;
+          continue;
+        }
+        const savedText = composerDraftTextContent(draft);
+        if (composerDraftMergeMixesKinds(existing, savedText)) {
+          // A command and prose can't share a draft. The one typed here stays as it is; the saved
+          // one stays saved, with its files, rather than being joined to it.
+          kept[key] = draft;
+          continue;
+        }
+        const { text, shellMode } = mergeComposerDraftTextContent(existing, savedText);
+        const attachmentIds = new Set(existing.attachments.map((attachment) => attachment.id));
+        restored[key] = withShellMode(
+          {
+            ...draft,
+            ...existing,
+            text,
+            context: mergeReferencedComposerContext(text, draft.context, existing.context),
+            // A concurrent import must not lose files, even above the send limit.
+            attachments: [
+              ...existing.attachments,
+              ...draft.attachments.filter((attachment) => !attachmentIds.has(attachment.id)),
+            ],
+            importedShareIds: [
+              ...new Set([...(existing.importedShareIds ?? []), ...(draft.importedShareIds ?? [])]),
+            ],
+          },
+          shellMode,
+        );
       }
       return restored;
     });
   }
   const signedOut = { ...cloud.signedOut };
   delete signedOut[accountId];
+  if (Object.keys(kept).length > 0) signedOut[accountId] = { drafts: kept, queuedMessages: [] };
   appAtomRegistry.set(composerCloudDraftsAtom, { accountId, signedOut });
   schedulePersistComposerState();
   await flushComposerDrafts();
@@ -1281,31 +1426,103 @@ export function setStickyComposerModelSelection(modelSelection: ModelSelection):
   schedulePersistComposerState();
 }
 
-export function setComposerDraftText(draftKey: string, value: string): void {
+export interface ComposerDraftTextOptions {
+  /**
+   * Whether this composer can send `! cmd` commands (see `useCanRunShellCommands`; never while
+   * editing a queued message). Without it a newly typed leading `!` is prose and keeps its
+   * spaces, while a draft already in shell mode stays a command.
+   */
+  readonly canRunShellCommands?: boolean;
+  /**
+   * Overrides the mode, which otherwise follows the edit (see `nextComposerShellMode`): recalling a
+   * command, editing a queued one, or leaving with Backspace. A command brought back stays one
+   * even where commands can't be sent, like any draft already in shell mode; it just can't be
+   * sent until its `!` goes.
+   */
+  readonly shellMode?: boolean;
+}
+
+export function setComposerDraftText(
+  draftKey: string,
+  value: string,
+  options?: ComposerDraftTextOptions,
+): void {
   let removed: ReadonlyArray<DraftComposerAttachment> = [];
+  const available = options?.canRunShellCommands === true;
   updateComposerDrafts((current) => {
     const existing = normalizeDraft(current[draftKey]);
-    const context = referencedComposerContext(value, existing.context);
-    const draft = withReferencedContextFiles(existing, value, context);
+    // Without the feature, and outside a draft already in shell mode, a leading `!` is prose
+    // and the text is kept exactly as typed, as before shell commands existed.
+    const shellMode =
+      isShellCommandPrompt(value) &&
+      (options?.shellMode ??
+        ((available || existing.shellMode === true) &&
+          nextComposerShellMode({
+            previousPrompt: existing.text,
+            previousShellMode: existing.shellMode === true,
+            nextPrompt: value,
+            available,
+          })));
+    // The editors draw the gap after a command's `!`, so a space there is not kept.
+    const text = shellMode ? withoutSpaceAfterShellPrefix(value) : value;
+    const context = referencedComposerContext(text, existing.context);
+    const draft = withShellMode(withReferencedContextFiles(existing, text, context), shellMode);
     removed = existing.attachments.filter((attachment) => !draft.attachments.includes(attachment));
     return withComposerDraft(current, draftKey, draft);
   });
   scheduleUnusedComposerAttachmentCleanup(removed);
 }
 
+/**
+ * A running `! cmd` the person stopped comes back into an empty composer in shell mode, to edit or
+ * run again, as in Claude Code. A draft is never replaced silently: this composer has no prompt
+ * history to keep the command in, so `"draft"` tells the caller to offer it instead.
+ * `"unavailable"`: where commands can't be sent it would come back as prose, so it stays out.
+ */
+export function returnStoppedShellCommandToDraft(
+  draftKey: string,
+  command: string,
+  options: Pick<ComposerDraftTextOptions, "canRunShellCommands">,
+): "returned" | "draft" | "unavailable" {
+  if (options.canRunShellCommands !== true) return "unavailable";
+  if (!composerDraftIsBlank(getComposerDraftSnapshot(draftKey))) return "draft";
+  setComposerDraftText(draftKey, shellCommandPrompt(command), {
+    shellMode: true,
+    canRunShellCommands: true,
+  });
+  const stored = getComposerDraftSnapshot(draftKey).text;
+  rememberComposerDraftSelection(draftKey, stored, { start: stored.length, end: stored.length });
+  return "returned";
+}
+
 export function insertComposerDraftText(
   draftKey: string,
   value: string,
   target: ComposerDraftInsertion,
+  options?: Pick<ComposerDraftTextOptions, "canRunShellCommands">,
 ): void {
   const draft = getComposerDraftSnapshot(draftKey);
   const { start, end } = contextInsertionRange(draftKey, draft, target);
   const text = draft.text.slice(0, start) + value + draft.text.slice(end);
-  setComposerDraftText(draftKey, text);
-  rememberComposerDraftSelection(draftKey, text, {
-    start: start + value.length,
-    end: start + value.length,
-  });
+  if (options?.canRunShellCommands !== true && draft.shellMode !== true) {
+    setComposerDraftText(draftKey, text);
+    rememberComposerDraftSelection(draftKey, text, {
+      start: start + value.length,
+      end: start + value.length,
+    });
+    return;
+  }
+  setComposerDraftText(draftKey, text, options);
+  const stored = getComposerDraftSnapshot(draftKey).text;
+  const caret = start + value.length;
+  rememberComposerDraftSelection(
+    draftKey,
+    stored,
+    selectionAfterDroppedShellPrefixSpaces(
+      { start: caret, end: caret },
+      droppedShellPrefixSpaces({ typedText: text, storedText: stored }),
+    ),
+  );
 }
 
 export function appendComposerDraftText(draftKey: string, value: string): void {
@@ -1570,6 +1787,7 @@ export function clearComposerDraftContentState(
   const {
     importedShareIds: _importedShareIds,
     context: _context,
+    shellMode: _shellMode,
     modelSelection,
     workspaceSelection,
     project: _project,
@@ -1661,13 +1879,14 @@ export function mergeComposerDraftContentState(
     0,
     PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   );
-  const text = mergeComposerDraftText(existing.text, content.text);
+  const { text, shellMode } = mergeComposerDraftTextContent(existing, content);
   const context = mergeReferencedComposerContext(text, existing.context, content.context);
   const importedShareIds = content.sourceShareId
     ? [...(existing.importedShareIds ?? []), content.sourceShareId]
     : existing.importedShareIds;
   if (
     text === existing.text &&
+    shellMode === (existing.shellMode === true) &&
     attachments.length === existing.attachments.length &&
     content.context === undefined &&
     importedShareIds === existing.importedShareIds
@@ -1681,13 +1900,16 @@ export function mergeComposerDraftContentState(
     // merges carry their own text, and appending chips to it would defeat
     // mergeComposerDraftText's duplicate check on a retried merge.
     [draftKey]: restoreMissingComposerFileReferences(
-      {
-        ...existing,
-        text,
-        attachments,
-        context,
-        ...(importedShareIds ? { importedShareIds } : {}),
-      },
+      withShellMode(
+        {
+          ...existing,
+          text,
+          attachments,
+          context,
+          ...(importedShareIds ? { importedShareIds } : {}),
+        },
+        shellMode,
+      ),
       content.sourceShareId ? attachments.slice(existing.attachments.length) : [],
     ),
   };
@@ -1702,12 +1924,13 @@ export async function mergeComposerDraftContent(
   if (loadPromise !== null) {
     await loadPromise;
   }
+  // Before the debounced write is taken over: a refused merge leaves it scheduled.
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const next = mergeComposerDraftContentState(current, draftKey, content);
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
-  const current = appAtomRegistry.get(composerDraftsAtom);
-  const next = mergeComposerDraftContentState(current, draftKey, content);
   const currentAttachmentIds = new Set(
     normalizeDraft(current[draftKey]).attachments.map((attachment) => attachment.id),
   );
@@ -1731,6 +1954,7 @@ export async function mergeComposerDraftContent(
 export function sameComposerDraftState(a: ComposerDraft, b: ComposerDraft): boolean {
   return (
     a.text === b.text &&
+    a.shellMode === b.shellMode &&
     a.attachments === b.attachments &&
     a.context === b.context &&
     a.importedShareIds === b.importedShareIds &&
@@ -1784,7 +2008,11 @@ export function undoComposerDraftMergeState(
     interactionMode: undoSetting("interactionMode"),
     workspaceSelection: undoSetting("workspaceSelection"),
   };
-  return withComposerDraft(current, draftKey, draft);
+  return withComposerDraft(
+    current,
+    draftKey,
+    withShellMode(draft, existing.shellMode === true && isShellCommandPrompt(text)),
+  );
 }
 
 export async function undoComposerDraftMerge(

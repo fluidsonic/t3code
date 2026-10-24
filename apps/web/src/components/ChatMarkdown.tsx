@@ -63,6 +63,10 @@ import {
   markdownImageSourceFragment,
 } from "@t3tools/client-runtime/markdown-images";
 import { mediaUrlReference } from "@t3tools/client-runtime/media-reference";
+import {
+  shellCommandBlockFromInlineCodeParagraph,
+  shellCommandsFromUntaggedCodeBlock,
+} from "@t3tools/client-runtime/user-shell-command";
 import { mediaKindFromPath, mediaMimeTypeFromExtension } from "@t3tools/shared/mediaPreview";
 import { InlineAudioPreview } from "./files/InlineAudioPreview";
 import * as Cause from "effect/Cause";
@@ -127,7 +131,7 @@ import {
   usePreferredEditor,
 } from "../editorPreferences";
 import { openInEditorMenuLabel } from "../editorLabels";
-import { resolveDiffThemeName } from "../lib/diffRendering";
+import { type DiffThemeName, resolveDiffThemeName } from "../lib/diffRendering";
 import { RenderErrorBoundary } from "./RenderErrorBoundary";
 import { useRenderedAppearance } from "../hooks/useTheme";
 import { useClientSettings } from "../hooks/useSettings";
@@ -186,7 +190,12 @@ import {
 } from "../browser/openFileInPreview";
 import { resolveLinkTarget } from "../browser/browserLinkTarget";
 import { PullRequestLinkPreview } from "./pullRequest/PullRequestLinkPreview";
-import { MarkdownCodeBlock, SuspenseShikiCodeBlock } from "./chat/MarkdownCodeBlock";
+import {
+  MarkdownCodeBlock,
+  ShellCommandsCodeBlock,
+  SuspenseShikiCodeBlock,
+} from "./chat/MarkdownCodeBlock";
+import type { CodeBlockShellActions } from "./chat/MarkdownCodeBlock.logic";
 import { MarkdownMermaidCodeBlock } from "./chat/MarkdownMermaidCodeBlock";
 import { MarkdownTable } from "./chat/MarkdownTable";
 import { MarkdownDetails } from "./chat/MarkdownDetails";
@@ -208,6 +217,7 @@ import { hastHasText, hastPlainTextDeep, plainHastText } from "./chat/markdownHa
 import {
   extractCodeBlock,
   extractFenceLanguage,
+  extractFenceLanguageTag,
   extractFenceTitle,
   extractPreCodeMeta,
   isClosedCodeFence,
@@ -232,7 +242,7 @@ interface ChatMarkdownProps {
   lineBreaks?: boolean;
   parseRawHtml?: boolean;
   onUseArtifactTemplate?: ((template: CodexArtifactTemplate) => void) | undefined;
-  onRunShellCommand?: ((command: string) => void) | undefined;
+  codeBlockShellActions?: CodeBlockShellActions | undefined;
   imageBaseDir?: string | undefined;
   workspaceMutationId?: string | null | undefined;
   onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
@@ -443,7 +453,7 @@ function useChatMarkdownState({
   isStreaming = false,
   skills = EMPTY_MARKDOWN_SKILLS,
   onUseArtifactTemplate,
-  onRunShellCommand,
+  codeBlockShellActions,
   imageBaseDir,
   workspaceMutationId,
   onImageExpand,
@@ -894,7 +904,7 @@ function useChatMarkdownState({
     markdownFileLinkMetaByHref,
     onTaskListChange,
     onUseArtifactTemplate,
-    onRunShellCommand,
+    codeBlockShellActions,
     openChangeRequestLink,
     openDeferredMarkdownLink,
     openExternalLinkInPreview,
@@ -941,6 +951,50 @@ function markdownHeadingRenderer(level: 1 | 2 | 3 | 4 | 5 | 6) {
   };
 }
 
+function HighlightedMarkdownCode({
+  codeBlock,
+  themeName,
+  isStreaming,
+  preProps,
+  children,
+}: {
+  codeBlock: { readonly className: string | undefined; readonly code: string };
+  themeName: DiffThemeName;
+  isStreaming: boolean;
+  preProps: ComponentProps<"pre">;
+  children: ReactNode;
+}) {
+  return (
+    <RenderErrorBoundary
+      resetKeys={[codeBlock.code, codeBlock.className, themeName, isStreaming]}
+      fallback={<pre {...preProps}>{children}</pre>}
+    >
+      <Suspense
+        fallback={
+          <pre {...preProps} className="invisible" aria-hidden>
+            {children}
+          </pre>
+        }
+      >
+        <SuspenseShikiCodeBlock
+          className={codeBlock.className}
+          code={codeBlock.code}
+          themeName={themeName}
+          isStreaming={isStreaming}
+        />
+      </Suspense>
+    </RenderErrorBoundary>
+  );
+}
+
+/** Whether a paragraph is one inline code span, which may be a `! cmd`; checked before the source. */
+function isInlineCodeParagraph(node: ReactMarkdownExtraProps["node"]): boolean {
+  const only = node?.children.length === 1 ? node.children[0] : undefined;
+  return (
+    only?.type === "element" && only.tagName === "code" && only.properties.dataInlineCode != null
+  );
+}
+
 const CHAT_MARKDOWN_COMPONENTS = {
   h1: markdownHeadingRenderer(1),
   h2: markdownHeadingRenderer(2),
@@ -958,8 +1012,33 @@ const CHAT_MARKDOWN_COMPONENTS = {
     }
     return <div {...props}>{children}</div>;
   },
-  p: function MarkdownParagraph({ node: _node, children, ...props }) {
-    const { skills, threadRef } = use(ChatMarkdownRendererContext);
+  p: function MarkdownParagraph({ node, children, ...props }) {
+    const { skills, threadRef, codeBlockShellActions, isStreaming, resolvedTheme } = use(
+      ChatMarkdownRendererContext,
+    );
+    // Agents sometimes give a command as a paragraph of one inline `! cmd` span. Where code
+    // blocks offer commands, it renders as the untagged block it stands for, so it can run. Only
+    // such a paragraph reads the source; its soft wraps are gone from the rendered text.
+    if (
+      codeBlockShellActions?.runCommand !== undefined &&
+      !isStreaming &&
+      isInlineCodeParagraph(node)
+    ) {
+      const text = use(ChatMarkdownTextContext);
+      const commandBlock = shellCommandBlockFromInlineCodeParagraph(
+        text.slice(node?.position?.start.offset ?? 0, node?.position?.end.offset ?? 0),
+      );
+      if (commandBlock !== null) {
+        return (
+          <ShellCommandsCodeBlock
+            code={commandBlock.code}
+            commands={[commandBlock.command]}
+            theme={resolvedTheme}
+            shellActions={codeBlockShellActions}
+          />
+        );
+      }
+    }
     return <p {...props}>{renderSkillInlineMarkdownChildren(children, skills, threadRef)}</p>;
   },
   blockquote: function MarkdownBlockquote({ node: _node, children, ...props }) {
@@ -1516,7 +1595,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
       diffThemeName,
       expandMedia,
       isStreaming,
-      onRunShellCommand,
+      codeBlockShellActions,
       inline,
       mathEnabled,
     } = use(ChatMarkdownRendererContext);
@@ -1538,25 +1617,14 @@ const CHAT_MARKDOWN_COMPONENTS = {
     }
     const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
     const highlightedCode = (
-      <RenderErrorBoundary
-        resetKeys={[codeBlock.code, language, diffThemeName, isStreaming]}
-        fallback={<pre {...props}>{children}</pre>}
+      <HighlightedMarkdownCode
+        codeBlock={codeBlock}
+        themeName={diffThemeName}
+        isStreaming={isStreaming}
+        preProps={props}
       >
-        <Suspense
-          fallback={
-            <pre {...props} className="invisible" aria-hidden>
-              {children}
-            </pre>
-          }
-        >
-          <SuspenseShikiCodeBlock
-            className={codeBlock.className}
-            code={codeBlock.code}
-            themeName={diffThemeName}
-            isStreaming={isStreaming}
-          />
-        </Suspense>
-      </RenderErrorBoundary>
+        {children}
+      </HighlightedMarkdownCode>
     );
     if (language === "mermaid") {
       return (
@@ -1571,17 +1639,37 @@ const CHAT_MARKDOWN_COMPONENTS = {
         </MarkdownMermaidCodeBlock>
       );
     }
+    const shellActions =
+      codeBlockShellActions && !isStreaming && isClosedCodeFence(node, text, codeBlock.code)
+        ? codeBlockShellActions
+        : undefined;
+    const fenceLanguageTag = codeBlockShellActions?.runCommand
+      ? extractFenceLanguageTag(codeBlock.className)
+      : null;
+    // A finished untagged `! cmd` block offers each of its commands on its own row; a block of
+    // several `!` lines holds one per line, so one failing does not run the rest.
+    const commands =
+      shellActions?.runCommand === undefined || (fenceLanguageTag ?? "").length > 0
+        ? null
+        : shellCommandsFromUntaggedCodeBlock(codeBlock.code);
+    if (commands !== null && shellActions !== undefined) {
+      return (
+        <ShellCommandsCodeBlock
+          code={codeBlock.code}
+          commands={commands}
+          theme={resolvedTheme}
+          shellActions={shellActions}
+        />
+      );
+    }
     return (
       <MarkdownCodeBlock
         code={codeBlock.code}
         language={language}
+        fenceLanguageTag={fenceLanguageTag}
         fenceTitle={fenceTitle}
         theme={resolvedTheme}
-        onRunShellCommand={
-          onRunShellCommand && !isStreaming && isClosedCodeFence(node, text, codeBlock.code)
-            ? onRunShellCommand
-            : undefined
-        }
+        shellActions={shellActions}
         isStreaming={isStreaming}
       >
         {highlightedCode}

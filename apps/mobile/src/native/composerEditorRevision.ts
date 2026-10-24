@@ -88,6 +88,22 @@ export function assumeComposerControlledState(
   ];
 }
 
+/**
+ * The parent kept `storedValue` instead of the text native event `eventCount` reported, such as a
+ * lone `!` restored after Backspace leaves shell mode. Older snapshots holding that value were
+ * superseded by the native edit, so they must not mark the parent's render as a stale one the
+ * editor rejects; without them it resolves as a fresh edit at the latest revision.
+ */
+export function forgetComposerSnapshotsRewrittenTo(
+  snapshots: ReadonlyArray<ComposerNativeEventSnapshot>,
+  eventCount: number,
+  storedValue: string,
+): ComposerNativeEventSnapshot[] {
+  return snapshots.filter(
+    (snapshot) => snapshot.eventCount >= eventCount || snapshot.value !== storedValue,
+  );
+}
+
 export function pruneAcknowledgedComposerNativeEvents(
   snapshots: ReadonlyArray<ComposerNativeEventSnapshot>,
   acknowledgedEventCount: number,

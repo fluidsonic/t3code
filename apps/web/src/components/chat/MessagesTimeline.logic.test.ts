@@ -9,6 +9,7 @@ import {
   TurnItemId,
   RuntimeRequestId,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -27,6 +28,7 @@ import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  deriveUserShellCommandOwnsWorkingSlot,
   timelineEntryTurnFoldRunId,
   deriveMessagesTimelineRowsWithState,
   shouldCollapseUserMessage,
@@ -1572,6 +1574,117 @@ describe("deriveMessagesTimelineRows", () => {
       latestRun: { ...input.latestRun, turnEnded: true },
     });
     expect(ended.some((row) => row.kind === "thinking")).toBe(false);
+  });
+
+  it("leaves the working slot to a person's command until its result reaches the agent", () => {
+    const at = "2026-01-01T00:00:00Z";
+    const commandRun = RunId.make("run-command");
+    const commandMessageId = MessageId.make("command");
+    const fixBuild: TimelineEntry = {
+      id: "user-entry",
+      kind: "message",
+      createdAt: at,
+      message: {
+        id: MessageId.make("user"),
+        role: "user",
+        text: "Fix the build",
+        runId: RunId.make("run-1"),
+        createdAt: at,
+        updatedAt: at,
+        streaming: false,
+      },
+    };
+    const commandItem = (
+      overrides: Partial<Extract<OrchestrationV2TurnItem, { type: "command_execution" }>>,
+    ): Extract<OrchestrationV2TurnItem, { type: "command_execution" }> => ({
+      id: TurnItemId.make("item-command"),
+      threadId: ThreadId.make("thread-1"),
+      runId: commandRun,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "pending",
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: DateTime.makeUnsafe(at),
+      type: "command_execution",
+      input: "npm test",
+      userShellMessageId: commandMessageId,
+      ...overrides,
+    });
+    const run = (status: OrchestrationV2Run["status"]) => ({
+      id: commandRun,
+      status,
+      userMessageId: commandMessageId,
+      requestedAt: DateTime.makeUnsafe(at),
+    });
+    const commandMessage = {
+      id: commandMessageId,
+      threadId: ThreadId.make("thread-1"),
+      text: "! npm test",
+      shellCommand: true,
+    };
+    const optimisticCommand = { id: commandMessageId, shellCommand: true };
+    // While anything runs, the composer reports the thread as working.
+    const liveRows = (input: {
+      readonly projection: Parameters<
+        typeof deriveUserShellCommandOwnsWorkingSlot
+      >[0]["projection"];
+      readonly optimisticMessages?: Parameters<
+        typeof deriveUserShellCommandOwnsWorkingSlot
+      >[0]["optimisticMessages"];
+      readonly timelineEntries?: ReadonlyArray<TimelineEntry>;
+    }) =>
+      deriveMessagesTimelineRows({
+        timelineEntries: input.timelineEntries ?? [fixBuild],
+        latestRun: { runId: commandRun, status: "running", startedAt: at, completedAt: null },
+        isWorking: true,
+        activeTurnStartedAt: at,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+        userShellCommandOwnsWorkingSlot: deriveUserShellCommandOwnsWorkingSlot({
+          projection: input.projection,
+          optimisticMessages: input.optimisticMessages ?? [],
+        }),
+      }).map((row) => row.kind);
+
+    // Sent, before the server has it; the phases after are `userShellCommandOwnsWorkingSlot`'s.
+    expect(liveRows({ projection: null, optimisticMessages: [optimisticCommand] })).toEqual([
+      "message",
+    ]);
+    // Queued behind a turn, it waits with the queued messages and leaves the slot to the agent.
+    expect(
+      liveRows({
+        projection: null,
+        optimisticMessages: [{ ...optimisticCommand, inputIntent: "queued_turn" as const }],
+      }),
+    ).toEqual(["message", "working", "thinking"]);
+    expect(
+      liveRows({
+        projection: {
+          thread: { hasShellCommands: true },
+          turnItems: [commandItem({ status: "running", startedAt: DateTime.makeUnsafe(at) })],
+          runs: [run("starting")],
+          messages: [commandMessage],
+        },
+        optimisticMessages: [optimisticCommand],
+      }),
+    ).toEqual(["message"]);
+    // Delivered: the agent's turn starts with the result.
+    expect(
+      liveRows({
+        projection: {
+          thread: { hasShellCommands: true },
+          turnItems: [commandItem({ status: "completed", exitCode: 0, userShellDelivered: true })],
+          runs: [run("running")],
+          messages: [commandMessage],
+        },
+      }),
+    ).toEqual(["message", "working", "thinking"]);
   });
 
   it("keeps a promptless restart in one active visual response", () => {

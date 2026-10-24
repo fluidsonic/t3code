@@ -54,6 +54,7 @@ const baseProps = {
   threadId: "thread:test" as never,
   editingRunId: null,
   editBlockedReason: null,
+  canEditShellCommands: true,
   onEditQueuedRun: () => undefined,
   onCancelEdit: () => undefined,
   timestampFormat: "locale",
@@ -171,4 +172,59 @@ it("shows who sent a queued message and folds automation and agent prompts", asy
 
   await expect.element(page.getByText("Sent by T3 Code")).toBeVisible();
   await expect.element(page.getByText("Continue where you left off.")).toBeVisible();
+});
+
+it("shows a queued command as `! cmd` and edits it as a command", async () => {
+  setup();
+  state.projection = { projection: { messages: [] } };
+  state.workflow = {
+    activeRun: { id: "run:active" },
+    canPromoteToSteer: true,
+    canReorder: true,
+    queuedRuns: [
+      {
+        run: { id: "run:command", userMessageId: "message:command" },
+        text: "! npm test",
+        attachments: [],
+        shellCommand: true,
+      },
+    ],
+  };
+  const onEditQueuedRun = vi.fn();
+  await using _screen = await renderQueue({ onEditQueuedRun });
+
+  await expect.element(page.getByText("! npm test", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Edit queued message", exact: true }).click();
+  expect(onEditQueuedRun).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ text: "! npm test", shellCommand: true }),
+  );
+});
+
+it("still shows a queued command but offers no edit once shell commands are unavailable", async () => {
+  setup();
+  state.projection = { projection: { messages: [] } };
+  state.workflow = {
+    activeRun: { id: "run:active" },
+    canPromoteToSteer: true,
+    canReorder: true,
+    queuedRuns: [
+      {
+        run: { id: "run:command", userMessageId: "message:command" },
+        text: "npm test",
+        attachments: [],
+        shellCommand: true,
+      },
+      {
+        run: { id: "run:message", userMessageId: "message:message" },
+        text: "Then explain the failures",
+        attachments: [],
+      },
+    ],
+  };
+  await using _screen = await renderQueue({ canEditShellCommands: false });
+
+  await expect.element(page.getByText("! npm test", { exact: true }).first()).toBeVisible();
+  const editButtons = page.getByRole("button", { name: "Edit queued message", exact: true });
+  await expect.element(editButtons.nth(0)).toBeDisabled();
+  await expect.element(editButtons.nth(1)).toBeEnabled();
 });

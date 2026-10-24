@@ -132,6 +132,8 @@ describe("thread outbox", () => {
           },
         ],
       },
+      // Lost in a round trip, a Run all would run only its first command.
+      followingShellCommands: [{ messageId: MessageId.make("group-next"), text: "! git push" }],
     };
     expect(
       decodeQueuedThreadMessage(JSON.parse(JSON.stringify(encodeQueuedThreadMessage(message)))),

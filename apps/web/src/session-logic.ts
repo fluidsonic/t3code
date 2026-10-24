@@ -1,5 +1,6 @@
 import type { ThreadStructure, ThreadStructureRuntime } from "@t3tools/client-runtime/state/shell";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
+import { isUserShellCommandItem } from "@t3tools/client-runtime/user-shell-command";
 import {
   type AssetResource,
   type OrchestrationV2Checkpoint,
@@ -599,10 +600,23 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
         : [],
     ),
   );
+  // A person's `! cmd` result renders inside its message, not as a work row. History pages can
+  // load a result without its message; that result stays visible as a command row.
+  const shellResultByMessageId = new Map(
+    input.visibleTurnItems.flatMap(({ item }) =>
+      isUserShellCommandItem(item) ? [[item.userShellMessageId, item] as const] : [],
+    ),
+  );
+  const visibleMessageIds = new Set(
+    input.visibleTurnItems.flatMap(({ item }) =>
+      item.type === "user_message" ? [item.messageId] : [],
+    ),
+  );
   for (const row of input.visibleTurnItems) {
     const { item } = row;
     if (turnItemIsWorkspacePreparation(item)) continue;
     if (item.type === "checkpoint") continue;
+    if (isUserShellCommandItem(item) && visibleMessageIds.has(item.userShellMessageId)) continue;
     if (item.type === "user_message" && foldedAnswerMessageIds.has(item.messageId)) continue;
     const createdAt = projectedItemCreatedAt(row);
     const attempt = resolveAttempt(item);
@@ -646,6 +660,10 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
           ? {
               createdBy: item.createdBy,
               creationSource: item.creationSource,
+              ...(item.shellCommand === true ? { shellCommand: true } : {}),
+              ...(item.shellCommand === true && shellResultByMessageId.has(item.messageId)
+                ? { shellCommandResult: shellResultByMessageId.get(item.messageId) }
+                : {}),
               ...(item.senderThreadId !== undefined ? { senderThreadId: item.senderThreadId } : {}),
               ...(item.idleCompaction !== undefined ? { idleCompaction: item.idleCompaction } : {}),
               ...(item.scheduledTaskId !== undefined
@@ -765,7 +783,12 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
   }
 
   for (const message of input.optimisticMessages) {
-    if (message.inputIntent !== "queued_turn" && !retainedMessageIds.has(message.id)) {
+    // A queued message waits in the queue and a `! cmd` above the composer, not in the transcript.
+    if (
+      message.inputIntent !== "queued_turn" &&
+      message.shellCommand !== true &&
+      !retainedMessageIds.has(message.id)
+    ) {
       retainedMessageIds.add(message.id);
       entries.push({
         id: message.id,
@@ -921,7 +944,8 @@ function reuseTimelineEntries(
   ) {
     return null;
   }
-  // Answer rows can replace a message already present in the retained prefix.
+  // Answer rows can replace a message already present in the retained prefix, and a command's
+  // result belongs to its message there.
   if (
     appended &&
     input.visibleTurnItems
@@ -929,7 +953,8 @@ function reuseTimelineEntries(
       .some(
         ({ item }) =>
           (item.type === "user_input_request" && item.questionAnswer !== undefined) ||
-          (item.type === "user_message" && item.messageId.startsWith("async-answer:")),
+          (item.type === "user_message" && item.messageId.startsWith("async-answer:")) ||
+          isUserShellCommandItem(item),
       )
   )
     return null;
@@ -992,7 +1017,12 @@ export function deriveTimelineEntriesFromVisibleTurnItemsWithState(
     entries: entries.map((entry) => {
       if (entry.kind !== "message" || entry.projectedItem === undefined) return entry;
       const before = previousMessages.get(entry.id);
-      if (before?.projectedItem !== entry.projectedItem) return entry;
+      // A command's result lives on its message but arrives through its own item.
+      if (
+        before?.projectedItem !== entry.projectedItem ||
+        before.message.shellCommandResult !== entry.message.shellCommandResult
+      )
+        return entry;
       return before.attempt === entry.attempt ? before : { ...entry, message: before.message };
     }),
   };

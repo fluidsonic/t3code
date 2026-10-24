@@ -18,6 +18,7 @@ import {
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import { deriveThreadCheckpointSummaries } from "@t3tools/client-runtime/state/thread-checkpoints";
+import { userShellCommandOwnsWorkingSlot } from "@t3tools/client-runtime/user-shell-command";
 import { getReviewSectionIdForCheckpoint } from "../features/review/reviewModel";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
@@ -1528,6 +1529,54 @@ it("accepts ready attachment-only answers while preserving selected options", ()
   ).toBeNull();
 });
 
+it("shows no Thinking row until a person's shell command reaches the agent", () => {
+  const at = "2026-06-20T00:00:02.000Z";
+  const feed = buildThreadFeed([projected(userMessage(at), 0)]);
+  const latestRun = { runId, status: "running" as const, startedAt: at, completedAt: null };
+  const shellMessageId = MessageId.make("message-shell");
+  const shell = (overrides: { readonly userShellDelivered?: true } = {}) => ({
+    ...command(at),
+    userShellMessageId: shellMessageId,
+    ...overrides,
+  });
+  const run = (status: "starting" | "running") => ({
+    id: runId,
+    status,
+    userMessageId: shellMessageId,
+    requestedAt: DateTime.makeUnsafe(at),
+  });
+  const rows = (
+    projection: Parameters<typeof userShellCommandOwnsWorkingSlot>[0]["projection"],
+    sendingShellMessageIds: ReadonlyArray<MessageId> = [],
+  ) =>
+    deriveThreadFeedPresentation(
+      feed,
+      latestRun,
+      new Set(),
+      new Set(),
+      at,
+      false,
+      undefined,
+      userShellCommandOwnsWorkingSlot({ projection, sendingShellMessageIds }),
+    ).map((row) => row.type);
+  // Still in the outbox.
+  expect(rows(null, [shellMessageId])).toEqual(["message"]);
+  // Finished, with its run yet to start the agent's turn.
+  const thread = { hasShellCommands: true };
+  expect(rows({ thread, turnItems: [shell()], runs: [run("starting")], messages: [] })).toEqual([
+    "message",
+  ]);
+  // Delivered: the agent's turn runs with the result.
+  expect(
+    rows({
+      thread,
+      turnItems: [shell({ userShellDelivered: true })],
+      runs: [run("running")],
+      messages: [],
+    }),
+  ).toEqual(["message", "thinking"]);
+});
+
 it("stops stranded thinking after a steer and follows the next thought or tool", () => {
   const at = "2026-06-20T00:00:02.000Z";
   const thought = (id: string): OrchestrationV2TurnItem => ({
@@ -1876,5 +1925,45 @@ describe("streamed feed updates", () => {
       );
     expect(showsDelegation(steps[2]!)).toBe(true);
     expect(showsDelegation(steps[3]!)).toBe(false);
+  });
+});
+
+describe("user shell commands", () => {
+  const shellMessage = {
+    ...userMessage(),
+    text: "! npm test",
+    shellCommand: true,
+  };
+  const result = (status: "running" | "completed", updatedAt: string) =>
+    ({
+      ...base("turn-item:user-shell:message-user", updatedAt, 1),
+      status,
+      completedAt: status === "running" ? null : DateTime.makeUnsafe(updatedAt),
+      type: "command_execution",
+      input: "npm test",
+      output: "ok",
+      exitCode: status === "running" ? undefined : 0,
+      userShellMessageId: MessageId.make("message-user"),
+    }) as OrchestrationV2TurnItem;
+
+  it("folds a delivered command's result into its message instead of a work row", () => {
+    const cache = createThreadFeedCache();
+    const message = projected(shellMessage, 0);
+    const done = { ...result("completed", "2026-06-20T00:00:04.000Z"), userShellDelivered: true };
+    const feed = buildThreadFeed([message, projected(done, 1), projected(assistantMessage(), 2)], {
+      cache,
+    });
+    expect(feed.map((entry) => entry.type)).toEqual(["message", "message"]);
+    expect(feed[0]).toMatchObject({
+      message: { shellCommand: true, shellCommandResult: { status: "completed" } },
+    });
+  });
+
+  it("shows a result whose message is outside the loaded history as an ordinary command", () => {
+    const done = { ...result("completed", "2026-06-20T00:00:04.000Z"), userShellDelivered: true };
+    const orphan = buildThreadFeed([projected(done, 0), projected(assistantMessage(), 1)], {
+      cache: createThreadFeedCache(),
+    });
+    expect(orphan[0]?.type).not.toBe("message");
   });
 });
