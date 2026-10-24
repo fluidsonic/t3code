@@ -41,6 +41,8 @@ import type { EnvironmentThreadStatus } from "@t3tools/client-runtime/state/thre
 import type { TimelineEntry } from "../../session-logic";
 
 const TIMELINE_SCROLL_CANCEL_SENTINEL = Object.freeze({});
+/** Marks `ShellCommandsControl`'s panel above the composer. */
+const SHELL_COMMAND_PANEL_SELECTOR = "[data-shell-command-panel]";
 
 interface TimelineAnchor {
   readonly threadKey: string | null;
@@ -120,6 +122,8 @@ function createTimelineFollowStore() {
       composerOverlay = element;
     },
     readComposerOverlayHeight: () => composerOverlay?.getBoundingClientRect().height ?? 0,
+    composerShowsShellCommandPanel: () =>
+      composerOverlay?.querySelector(SHELL_COMMAND_PANEL_SELECTOR) != null,
     dispatch: (visit: TimelineFollowVisit, event: TimelineFollowEvent) => {
       const before = read(visit);
       const after = transitionTimelineFollow(before, event);
@@ -290,7 +294,13 @@ export function useTimelineFollow(input: TimelineFollowInput) {
   });
   if (!sameRunObservation(runObservation.observation, observedRun)) {
     setObservedRun(runObservation.observation);
-    const startedRunAnchor = runObservation.anchorMessageId;
+    // A run opened by a `! cmd` shows up only once the command's result reaches the agent. Like
+    // its send, which leaves the command above the composer, that keeps following the end: the
+    // command lands at the bottom rather than jumping to the top over an empty screen.
+    const startedRunAnchor =
+      dispatchedUserItem?.item.type === "user_message" && dispatchedUserItem.item.shellCommand
+        ? null
+        : runObservation.anchorMessageId;
     if (startedRunAnchor !== null && !anchorPending && timelineLiveFollowEnabled) {
       setShowScrollToBottom(false);
       setTimelineAnchor({ threadKey: activeThreadKey, messageId: startedRunAnchor });
@@ -541,6 +551,23 @@ export function useTimelineFollow(input: TimelineFollowInput) {
     timelineEntries,
     timelineLiveFollowEnabled,
   ]);
+
+  // A command leaving the shell command panel shrinks the end spacer, and the browser pulls the
+  // scroll position up before same-frame rows lengthen the list again. That is layout, not a
+  // scroll away; only a shrink while the panel was showing counts.
+  const previousComposerInsetRef = useRef(composerTimelineInset);
+  const shellCommandPanelShownRef = useRef(false);
+  useLayoutEffect(() => {
+    const shrank = composerTimelineInset < previousComposerInsetRef.current;
+    const panelWasShown = shellCommandPanelShownRef.current;
+    previousComposerInsetRef.current = composerTimelineInset;
+    shellCommandPanelShownRef.current = followStore.composerShowsShellCommandPanel();
+    if (!shrank || !panelWasShown) return;
+    viewportRef.current?.rebaseline();
+    if (readCurrentFollow().mode === "following") {
+      void legendListRef.current?.scrollToEnd({ animated: false });
+    }
+  }, [composerTimelineInset, followStore, legendListRef, readCurrentFollow]);
 
   /** Arms the anchor for a message the user just sent, before its run exists. */
   const anchorNewTurn = (threadKey: string, messageId: MessageId) => {
