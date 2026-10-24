@@ -40,6 +40,10 @@ export async function editPendingThreadMessage(message: QueuedThreadMessage): Pr
   try {
     if (!(await confirmThreadOutboxMessageQueued(message))) return false;
     const revision = threadOutboxRevision(message.messageId);
+    // The composer holds one command, so a Run all's several are only cancelled.
+    if (message.followingShellCommands !== undefined) {
+      return await removeThreadOutboxMessage(message, revision);
+    }
     await waitForComposerDraftsLoaded();
     const snapshot = getComposerDraftSnapshot(draftKey);
     const attachmentIds = new Set(snapshot.attachments.map((attachment) => attachment.id));
