@@ -234,6 +234,8 @@ function install() {
     if (!app) fail(`no .app in ${dmg}`);
     step("rm", ["-rf", INSTALL_PATH]);
     step("ditto", [join(mountPoint, app!), INSTALL_PATH]);
+    // Unsigned builds only carry the linker's signature on the main binary; seal the whole bundle.
+    step("codesign", ["--force", "--deep", "--sign", "-", INSTALL_PATH]);
   } finally {
     spawnSync("hdiutil", ["detach", "-quiet", mountPoint]);
     rmSync(mountPoint, { recursive: true, force: true });
