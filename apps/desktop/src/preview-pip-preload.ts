@@ -1,7 +1,10 @@
 import type { DesktopPreviewRecordingFrame } from "@t3tools/contracts";
 import { contextBridge, ipcRenderer } from "electron";
 
-import { PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL } from "./ipc/channels.ts";
+import {
+  PREVIEW_PICTURE_IN_PICTURE_CRASHED_CHANNEL,
+  PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL,
+} from "./ipc/channels.ts";
 
 contextBridge.exposeInMainWorld("previewPictureInPicture", {
   onFrame: (listener: (frame: DesktopPreviewRecordingFrame) => void) => {
@@ -12,5 +15,11 @@ contextBridge.exposeInMainWorld("previewPictureInPicture", {
     ipcRenderer.on(PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL, wrappedListener);
     return () =>
       ipcRenderer.removeListener(PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL, wrappedListener);
+  },
+  onCrashed: (listener: () => void) => {
+    const wrappedListener = () => listener();
+    ipcRenderer.on(PREVIEW_PICTURE_IN_PICTURE_CRASHED_CHANNEL, wrappedListener);
+    return () =>
+      ipcRenderer.removeListener(PREVIEW_PICTURE_IN_PICTURE_CRASHED_CHANNEL, wrappedListener);
   },
 });
