@@ -9,6 +9,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EventStore from "../EventStore.ts";
 import * as ProjectionStore from "../ProjectionStore.ts";
+import { turnItemPositionKey } from "../TurnItemPositionStore.ts";
 
 export interface ProjectionReplayVerification {
   readonly valid: boolean;
@@ -139,7 +140,7 @@ export const layer: Layer.Layer<
                 )
                 VALUES (
                   ${stored.event.threadId},
-                  ${stored.event.payload.id},
+                  ${turnItemPositionKey(stored.event.payload)},
                   ${stored.event.payload.ordinal}
                 )
                 ON CONFLICT(thread_id, turn_item_id) DO UPDATE SET
