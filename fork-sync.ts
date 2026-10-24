@@ -20,6 +20,9 @@ const REPO = process.env.T3_FORK_REPO ?? join(process.env.HOME ?? "", "Documents
 const UPSTREAM_REPO = "pingdotgg/t3code";
 const FORK_REPO = "fluidsonic/t3code";
 const INTEGRATION = "fluidsonic/main";
+const MAIN_CHECKOUT = join(process.env.HOME ?? "", "Documents/t3-code");
+// Local `main` in MAIN_CHECKOUT carries this commit on top of upstream; it never belongs in a topic.
+const NOTES_SUBJECT = "fork: agent notes";
 const APP_ID = "com.fluidsonic.t3marc";
 const PRODUCT_NAME = "T3 Marc";
 const OFFICIAL_APP_ID = "com.t3tools.t3code";
@@ -129,6 +132,7 @@ function sync() {
   git("fetch", "--quiet", "upstream", "main");
   git("fetch", "--quiet", "--prune", "origin");
   const upstreamMain = git("rev-parse", "upstream/main");
+  updateMainCheckout();
   const entries = listEntries();
 
   for (const entry of entries) {
@@ -152,6 +156,7 @@ function sync() {
       env: { ...env, GIT_EDITOR: "true" },
     });
     if (!rebase.ok) finishInProgress("rebase", `rebasing ${entry.branch}`);
+    stripNotes(entry.branch, base);
     entry.newTip = git("rev-parse", "HEAD");
     if (entry.newTip === base) entry.dropped = "all of its commits are upstream";
   }
@@ -188,6 +193,30 @@ function sync() {
   });
   if (build.status !== 0) fail("desktop build failed");
   report.push(`built ${newestDmg()}; run \`node fork-sync.ts install\` to install it`);
+}
+
+function stripNotes(branch: string, base: string) {
+  for (;;) {
+    const notes = git("log", "--format=%H", "--fixed-strings", `--grep=${NOTES_SUBJECT}`, `${base}..HEAD`)
+      .split("\n")
+      .find((sha) => sha && git("log", "-1", "--format=%s", sha) === NOTES_SUBJECT);
+    if (!notes) return;
+    const rebase = exec("git", ["rebase", "--onto", `${notes}^`, notes], { env: { ...env, GIT_EDITOR: "true" } });
+    if (!rebase.ok) finishInProgress("rebase", `removing the notes commit from ${branch}`);
+    report.push(`${branch}: removed the "${NOTES_SUBJECT}" commit`);
+  }
+}
+
+function updateMainCheckout() {
+  const inMain = (...argv: string[]) => exec("git", ["-C", MAIN_CHECKOUT, ...argv]);
+  if (inMain("branch", "--show-current").out !== "main") return report.push(`${MAIN_CHECKOUT} isn't on main; left as is`);
+  if (inMain("status", "--porcelain", "--untracked-files=no").out) return report.push(`${MAIN_CHECKOUT} has uncommitted changes; main left as is`);
+  if (inMain("merge-base", "--is-ancestor", "upstream/main", "HEAD").ok) return;
+  if (!inMain("rebase", "upstream/main").ok) {
+    inMain("rebase", "--abort");
+    return report.push(`couldn't rebase ${MAIN_CHECKOUT} main onto upstream; left as is`);
+  }
+  report.push(`${MAIN_CHECKOUT} main rebased onto upstream`);
 }
 
 function check() {
