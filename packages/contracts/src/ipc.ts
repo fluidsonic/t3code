@@ -572,6 +572,8 @@ export type DesktopPreviewNavStatus =
       title: string;
       code: number;
       description: string;
+      /** The guest's renderer died; a reload revives it. */
+      crashed?: true;
     };
 
 export type DesktopPreviewColorScheme = "system" | "light" | "dark";
