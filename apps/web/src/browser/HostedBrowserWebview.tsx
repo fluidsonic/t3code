@@ -212,7 +212,6 @@ export function HostedBrowserWebview(props: {
     });
     webview.addEventListener("did-attach", register);
     webview.addEventListener("dom-ready", register);
-    webview.addEventListener("render-process-gone", recoverGuest);
     webview.addEventListener("focus", dismissHostPopups);
     webview.addEventListener("ipc-message", guestPointerDown);
     register();
@@ -222,7 +221,6 @@ export function HostedBrowserWebview(props: {
       unsubscribeState();
       webview.removeEventListener("did-attach", register);
       webview.removeEventListener("dom-ready", register);
-      webview.removeEventListener("render-process-gone", recoverGuest);
       webview.removeEventListener("focus", dismissHostPopups);
       webview.removeEventListener("ipc-message", guestPointerDown);
     };
