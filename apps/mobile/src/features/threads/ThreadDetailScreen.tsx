@@ -76,6 +76,8 @@ import {
 } from "@t3tools/client-runtime/state/thread-execution";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { useCanRunShellCommands } from "../../state/shell-commands";
+import type { CodeBlockShellActions } from "./threadShellCommandPresentation";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
@@ -200,6 +202,8 @@ import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
 import { WorkspaceMutationIdProvider } from "./WorkspaceMutationIdProvider";
 import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
+import { ThreadShellCommandsPanel } from "./thread-shell-command";
+import { type LiveUserShellCommand } from "@t3tools/client-runtime/user-shell-command";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import { ThreadGuestShareBar } from "./ThreadGuestShareBar";
 import { ThreadSideChatsRow } from "./ThreadSideChatsRow";
@@ -270,6 +274,11 @@ export interface ThreadDetailScreenProps {
   readonly isSavingQueuedEdit: boolean;
   readonly onCancelQueuedRunEdit: () => void;
   readonly onRemoveQueuedEditAttachment: (attachmentId: string) => void;
+  /** `! cmd` commands until their results reach the agent; see `liveUserShellCommands`. */
+  readonly liveShellCommands: ReadonlyArray<LiveUserShellCommand>;
+  /** See `userShellCommandOwnsWorkingSlot`. */
+  readonly userShellCommandOwnsWorkingSlot: boolean;
+  readonly onStoppedShellCommand: (command: string) => void;
   readonly environmentId: EnvironmentId;
   readonly projectWorkspaceRoot: string | null;
   readonly threadCwd: string | null;
@@ -315,6 +324,14 @@ export interface ThreadDetailScreenProps {
   readonly onSubmitUserInput: () => Promise<unknown>;
   readonly onDismissUserInput: () => Promise<unknown>;
   readonly showContent?: boolean;
+  /** What a tapped runnable code block offers; gated here on the environment's grants and setting. */
+  readonly codeBlockShellActions?: {
+    readonly runCommand: (command: string) => void;
+    readonly runCommands: (commands: ReadonlyArray<string>) => void;
+    /** `onPlaced` runs once the command is in the composer. */
+    readonly editCommand: (command: string, onPlaced: () => void) => void;
+    readonly editInTerminal?: (command: string) => void;
+  };
 }
 
 // iOS questions overlay the controls; Android questions stack with child approvals.
@@ -500,6 +517,18 @@ function ThreadDetailBody(
   const agentsSegment = resolveSubagentPillSegment(turnSubagents);
   const defaultComposerEditorRef = useRef<ComposerEditorHandle>(null);
   const composerEditorRef = props.draftMode?.editorRef ?? defaultComposerEditorRef;
+  const canRunShellCommands = useCanRunShellCommands(props.environmentId);
+  const sourceShellActions = props.codeBlockShellActions;
+  const codeBlockShellActions: CodeBlockShellActions | undefined =
+    canRunShellCommands && sourceShellActions && !props.draftMode
+      ? {
+          runCommand: props.canOperateThread ? sourceShellActions.runCommand : undefined,
+          runCommands: props.canOperateThread ? sourceShellActions.runCommands : undefined,
+          editCommand: (command) =>
+            sourceShellActions.editCommand(command, () => composerEditorRef.current?.focus()),
+          editInTerminal: sourceShellActions.editInTerminal,
+        }
+      : undefined;
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
   const editingRunId = props.queuedRunEdit?.runId ?? null;
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- focuses the composer editor on the next animation frame when a queued run edit starts
@@ -1307,7 +1336,9 @@ function ThreadDetailBody(
     if (AsyncResult.isFailure(edited)) {
       const error = squashAtomCommandFailure(edited);
       Dialog.alert(
-        "Could not edit message",
+        message.followingShellCommands === undefined
+          ? "Could not edit message"
+          : "Could not cancel commands",
         error instanceof Error ? error.message : "Please try again.",
       );
       return;
@@ -1315,6 +1346,7 @@ function ThreadDetailBody(
     if (
       edited.value &&
       !scope.aborted &&
+      message.followingShellCommands === undefined &&
       selectedThreadKey === scopedThreadKey(message.environmentId, message.threadId)
     ) {
       composerEditorRef.current?.focus();
@@ -1444,6 +1476,7 @@ function ThreadDetailBody(
                   latestRun={props.activityRun}
                   activeWorkStartedAt={props.activeWorkStartedAt}
                   runlessWorkActive={props.runlessWorkActive ?? false}
+                  userShellCommandOwnsWorkingSlot={props.userShellCommandOwnsWorkingSlot}
                   listRef={listRef}
                   freeze={freeze}
                   anchorMessageId={anchorMessageId}
@@ -1468,6 +1501,7 @@ function ThreadDetailBody(
                   onIsAtEndChange={setIsAtEnd}
                   skills={selectedProviderSkills}
                   onUseArtifactTemplate={handleUseArtifactTemplate}
+                  codeBlockShellActions={codeBlockShellActions}
                 />
               </ColumnWidth>
             </WorkspaceMutationIdProvider>
@@ -1583,6 +1617,12 @@ function ThreadDetailBody(
                       });
                     }}
                   />
+                  <ThreadShellCommandsPanel
+                    environmentId={props.environmentId}
+                    commands={props.liveShellCommands}
+                    themeAppearance={themeAppearance}
+                    onStoppedRunningCommand={props.onStoppedShellCommand}
+                  />
                   <ComposerPanels
                     className="w-full"
                     style={Platform.OS === "android" ? composerPanelsHeightStyle : undefined}
@@ -1597,6 +1637,7 @@ function ThreadDetailBody(
                       >
                         <ComposerQueuedEditBanner
                           saving={props.isSavingQueuedEdit}
+                          shellCommand={props.queuedRunEdit.shellCommand === true}
                           onCancel={() => {
                             voiceInputSession.cancel(props.composerDraftKey);
                             props.onCancelQueuedRunEdit();
@@ -1795,7 +1836,9 @@ function ThreadDetailBody(
                             ? props.activePendingApproval.supportsFeedback
                               ? "Send feedback to decline this request"
                               : "Send a message to decline and redirect the agent"
-                            : "Ask anything"
+                            : canRunShellCommands
+                              ? "Ask anything, or ! run shell…"
+                              : "Ask anything"
                         }
                         contentMaxWidth={contentMaxWidth}
                         draftControls={props.draftMode?.controls(draftViewportHeight)}
@@ -1853,6 +1896,7 @@ function ThreadDetailBody(
                             ? null
                             : {
                                 existingAttachments: props.queuedRunEdit.existingAttachments,
+                                shellCommand: props.queuedRunEdit.shellCommand === true,
                                 saving: props.isSavingQueuedEdit,
                                 onRemoveExistingAttachment: props.onRemoveQueuedEditAttachment,
                               }

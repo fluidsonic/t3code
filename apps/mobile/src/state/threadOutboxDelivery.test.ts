@@ -166,6 +166,7 @@ import {
   completeQueuedMessageDelivery,
   type DeliveryRetry,
   prepareQueuedMessageAttachments,
+  queuedMessageServerContent,
   recoverEditedCreationAfterDelivery,
   removeAcknowledgedExistingThreadMessage,
   restoreRejectedQueuedMessage,
@@ -955,6 +956,74 @@ describe("thread outbox recovery rollback", () => {
     }),
   );
 
+  it.effect("brings a rejected `! cmd` back as a command in an empty composer", () =>
+    Effect.gen(function* () {
+      const message = {
+        ...queuedMessage({ messageId: "message-command-restore", text: "npm test" }),
+        shellCommand: true,
+      };
+      const threadKey = `${message.environmentId}:${message.threadId}`;
+      yield* Effect.promise(() => harness.manager.enqueue(message));
+
+      expect(yield* restoreRejectedQueuedMessage(message, "rejected")).toBe("restored");
+
+      expect(composerDrafts.getComposerDraftSnapshot(threadKey)).toMatchObject({
+        text: "!npm test",
+        shellMode: true,
+      });
+    }),
+  );
+
+  it.effect(
+    "reports a rejected Run all instead of putting one of its commands in the composer",
+    () =>
+      Effect.gen(function* () {
+        const message = {
+          ...queuedMessage({ messageId: "message-group-restore", text: "! npm test" }),
+          shellCommand: true,
+          followingShellCommands: [
+            { messageId: MessageId.make("message-group-next"), text: "! ls" },
+          ],
+        };
+        const threadKey = `${message.environmentId}:${message.threadId}`;
+        yield* Effect.promise(() => harness.manager.enqueue(message));
+
+        expect(yield* restoreRejectedQueuedMessage(message, "rejected")).toBe("restored");
+
+        expect(composerDrafts.getComposerDraftSnapshot(threadKey).text).toBe("");
+        expect(remainingMessages()).toEqual([]);
+        expect(appAtomRegistry.get(threadComposerErrorsAtom)[threadKey]).toEqual({
+          message: "rejected",
+          messageId: message.messageId,
+        });
+      }),
+  );
+
+  it.effect(
+    "keeps a rejected message queued rather than joining it to a draft of the other kind",
+    () =>
+      Effect.gen(function* () {
+        const message = queuedMessage({ messageId: "message-onto-command", text: "fix the bug" });
+        const threadKey = `${message.environmentId}:${message.threadId}`;
+        appAtomRegistry.set(composerDrafts.composerDraftsAtom, {
+          [threadKey]: { text: "!ls", shellMode: true, attachments: [] },
+        });
+        yield* Effect.promise(() => harness.manager.enqueue(message));
+
+        expect(yield* restoreRejectedQueuedMessage(message, "rejected")).toBe("blocked");
+
+        expect(composerDrafts.getComposerDraftSnapshot(threadKey)).toEqual({
+          text: "!ls",
+          shellMode: true,
+          attachments: [],
+        });
+        expect(remainingMessages()).toEqual([message]);
+        expect(appAtomRegistry.get(threadComposerErrorsAtom)[threadKey]?.messageId).toBe(
+          message.messageId,
+        );
+      }),
+  );
+
   it.effect("leaves no error when the restored text is resent before recovery finishes", () =>
     Effect.gen(function* () {
       const message = queuedMessage({ messageId: "message-resent", text: "resend me" });
@@ -1018,4 +1087,38 @@ describe("thread outbox recovery rollback", () => {
       expect(appAtomRegistry.get(threadComposerErrorsAtom)[draftKey]?.message).toBe("too large");
     }),
   );
+});
+
+describe("queued message delivery payload", () => {
+  const context = {
+    version: 1 as const,
+    records: [
+      {
+        version: 1 as const,
+        kind: "skill" as const,
+        contextId: "skill-1",
+        label: "review",
+        name: "review",
+      },
+    ],
+  } as never;
+
+  it("delivers a `! cmd` exactly as typed, flagged as a command and without context", () => {
+    expect(
+      queuedMessageServerContent({
+        text: "git log --oneline [x](t3-context://v1/skill/skill-1)",
+        shellCommand: true,
+        context,
+      }),
+    ).toEqual({ text: "git log --oneline [x](t3-context://v1/skill/skill-1)", shellCommand: true });
+  });
+
+  it("serializes prose as before", () => {
+    expect(
+      queuedMessageServerContent({
+        text: "Run checks",
+        context: undefined,
+      }),
+    ).toEqual({ text: "Run checks" });
+  });
 });
