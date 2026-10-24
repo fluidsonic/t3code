@@ -153,7 +153,8 @@ function writeDraft(
   environmentId: EnvironmentId,
   request: LinkedDraftRequest,
 ): boolean {
-  if (request.prompt) setComposerDraftText(draftKey, request.prompt.text);
+  // A link fills prose; only the person typing `!` makes a command.
+  if (request.prompt) setComposerDraftText(draftKey, request.prompt.text, { shellMode: false });
   if (request.provider === null) return false;
   const resolved = resolvePromptLinkModelSelection(
     appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.providers ?? [],
