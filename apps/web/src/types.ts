@@ -1,3 +1,4 @@
+import type { UserShellCommandItem } from "@t3tools/client-runtime/user-shell-command";
 import { imageMimeType } from "@t3tools/shared/image";
 import type {
   ChatFileAttachment as ContractChatFileAttachment,
@@ -87,6 +88,15 @@ export interface ChatMessage {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly inputIntent?: OrchestrationV2UserMessageInputIntent | undefined;
+  /** A `! cmd` shell command; `text` is the command without the `!`. */
+  readonly shellCommand?: boolean | undefined;
+  /** The command's result, which joins the transcript with the message once delivered. */
+  readonly shellCommandResult?: UserShellCommandItem | undefined;
+  /**
+   * A command stopped before it reached the agent, kept only in this client's prompt history. It
+   * recalls as a command even where commands can't run, so it is never sent as prose.
+   */
+  readonly shellCommandStopped?: true | undefined;
 }
 
 export interface ProposedPlan {
