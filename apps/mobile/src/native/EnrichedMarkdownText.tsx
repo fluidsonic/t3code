@@ -432,6 +432,8 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
           enableTaskListItemToggle={props.onTaskListItemPress !== undefined}
           onTaskListItemPress={props.onTaskListItemPress}
           enableCodeBlockWrapToggle
+          // Unset unless a block tap is armed, so blocks render and select exactly as before.
+          {...(props.onCodeBlockPress ? { onCodeBlockPress: props.onCodeBlockPress } : {})}
           spoilerOverlay="solid"
           onLinkPress={
             props.onLinkPress || props.onImagePress ? ({ url }) => onLinkPress(url) : undefined

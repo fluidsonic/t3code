@@ -11,12 +11,21 @@ export function isAutomaticCompletionRun(
 }
 
 export function queuedRunsInDeliveryOrder(
-  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
 ): ReadonlyArray<OrchestrationV2Run> {
   const automaticCompletionMessageIds = new Set(
     projection.messages
       .filter((message) => message.delegatedCompletion !== undefined)
       .map((message) => message.id),
+  );
+  // A steer waiting for steered shell commands goes first: it was meant for the running turn.
+  // Only a thread that ran one can hold such a steer.
+  const steeredMessageIds = new Set(
+    projection.thread.hasShellCommands === true
+      ? projection.messages
+          .filter((message) => message.shellSteer === true)
+          .map((message) => message.id)
+      : [],
   );
   const queued = projection.runs
     .filter((run) => run.status === "queued")
@@ -25,11 +34,13 @@ export function queuedRunsInDeliveryOrder(
         (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal) ||
         left.ordinal - right.ordinal,
     );
-  const completions = queued.filter((run) => automaticCompletionMessageIds.has(run.userMessageId));
-  const messages = queued.filter((run) => !automaticCompletionMessageIds.has(run.userMessageId));
+  const steers = queued.filter((run) => steeredMessageIds.has(run.userMessageId));
+  const rest = queued.filter((run) => !steeredMessageIds.has(run.userMessageId));
+  const completions = rest.filter((run) => automaticCompletionMessageIds.has(run.userMessageId));
+  const messages = rest.filter((run) => !automaticCompletionMessageIds.has(run.userMessageId));
   // Completions and messages each keep their queue order and interleave by request time,
   // so neither kind can hold the other back while more of it keeps arriving.
-  const ordered: Array<OrchestrationV2Run> = [];
+  const ordered: Array<OrchestrationV2Run> = [...steers];
   let completionIndex = 0;
   let messageIndex = 0;
   for (;;) {

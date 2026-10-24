@@ -63,8 +63,10 @@ export function isNativeMaintenanceCommand(message: {
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly context?: import("@t3tools/contracts").OrchestrationMessageContext | undefined;
+  readonly shellCommand?: boolean | undefined;
 }): boolean {
   return (
+    message.shellCommand !== true &&
     message.attachments.length === 0 &&
     ["/compact", "/logout"].includes(message.text.trim().toLowerCase())
   );

@@ -138,6 +138,23 @@ describe("pending timeline messages", () => {
     expect(result[0]?.acknowledged).toBe(false);
   });
 
+  it("shows each command of a waiting Run all as sent", () => {
+    const group: QueuedThreadMessage = {
+      ...pending("first"),
+      text: "! npm test",
+      shellCommand: true,
+      followingShellCommands: [{ messageId: MessageId.make("second"), text: "! git push" }],
+    };
+    const entries = appendPendingThreadMessages([], [], [group]);
+    expect(
+      entries.map((entry) => (entry.type === "message" ? [entry.id, entry.message.text] : null)),
+    ).toEqual([
+      ["first", "! npm test"],
+      ["second", "! git push"],
+    ]);
+    expect(entries.every((entry) => entry.pendingMessage === group)).toBe(true);
+  });
+
   it("retains context records while a message is waiting for delivery", () => {
     const record = {
       version: 1 as const,
