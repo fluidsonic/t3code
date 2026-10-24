@@ -29,7 +29,8 @@ const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const report: string[] = [];
 let pushed = false;
-const env = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}` };
+// Homebrew installs rustup keg-only; the desktop build needs cargo.
+const env = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:/opt/homebrew/opt/rustup/bin:${process.env.PATH}` };
 
 class SyncError extends Error {}
 const fail = (message: string): never => {
