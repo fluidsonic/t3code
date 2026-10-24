@@ -432,6 +432,25 @@ describe("AcpRuntimeModel", () => {
     });
   });
 
+  it("explains a command permission with the agent's description, not its title", () => {
+    const request = parsePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "tool-1",
+        title: "Execute `rm -rf ~/probe`",
+        kind: "execute",
+        status: "pending",
+        rawInput: { command: "rm -rf ~/probe", description: "Remove the probe directory" },
+      },
+    });
+
+    expect(request).toMatchObject({
+      detail: "rm -rf ~/probe",
+      title: "Remove the probe directory",
+    });
+  });
+
   it("bounds an oversized cumulative tool_call_update content buffer to a tail window", () => {
     // Mirrors Grok's ACP CLI resending the ENTIRE accumulated terminal output on every
     // tool_call_update notification instead of a delta (see upstream #6556).
