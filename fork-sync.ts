@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Rebuilds `fluidsonic/main` from upstream main plus every `fork/<order>-<name>` branch on origin,
-// then builds "T3 Marc.app".
+// then builds "T3 Code (Marc).app" and publishes it to a local update feed the app updates from.
 //
-//   node fork-sync.ts              sync, check, push, build
+//   node fork-sync.ts              sync, check, push, build, publish to the feed
 //   node fork-sync.ts --dry-run    sync and check only; push and build nothing
-//   node fork-sync.ts install      install the newest build into /Applications
+//   node fork-sync.ts install      install the newest feed build now, quitting and reopening the app
+//   node fork-sync.ts serve        serve the feed on 127.0.0.1; the LaunchAgent keeps this running
 //
 // Branch scheme (the branch list is the source of truth):
 //   fork/10-pr-20145       tracks upstream PR #20145; dropped once the PR is merged or closed
@@ -12,9 +13,11 @@
 //   fork/20-<name>         based on upstream main
 // Orders sort numerically per segment. A topic whose commits all landed upstream is deleted.
 import { spawnSync, type SpawnSyncOptions } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const REPO = process.env.T3_FORK_REPO ?? join(process.env.HOME ?? "", "Documents/t3-code-fork");
 const UPSTREAM_REPO = "pingdotgg/t3code";
@@ -24,16 +27,26 @@ const MAIN_CHECKOUT = join(process.env.HOME ?? "", "Documents/t3-code");
 // Local `main` in MAIN_CHECKOUT carries this commit on top of upstream; it never belongs in a topic.
 const NOTES_SUBJECT = "fork: agent notes";
 const APP_ID = "com.fluidsonic.t3marc";
-const PRODUCT_NAME = "T3 Marc";
+const PRODUCT_NAME = "T3 Code (Marc)";
 const OFFICIAL_APP_ID = "com.t3tools.t3code";
 const INSTALL_PATH = `/Applications/${PRODUCT_NAME}.app`;
+const LEGACY_INSTALL_PATHS = ["/Applications/T3 Marc.app"];
+const META = new URL(".", import.meta.url).pathname;
+const FEED_DIR = join(META, "feed");
+const FEED_PORT = 47825;
+// The app's updater (Squirrel.Mac) accepts only builds matching the running app's designated
+// requirement; ad-hoc signatures never match, so every build is signed with one local identity.
+const SIGNING_KEYCHAIN = join(META, "signing.keychain-db");
+const SIGNING_NAME = "T3 Code Marc Local Signing";
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const report: string[] = [];
 let pushed = false;
-// Homebrew installs rustup keg-only; the desktop build needs cargo.
-const env = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:/opt/homebrew/opt/rustup/bin:${process.env.PATH}` };
+// Homebrew installs rustup keg-only; the desktop build needs cargo. T3 Code sets ELECTRON_RUN_AS_NODE
+// for agents, which would leak into the build's Electron probes.
+const { ELECTRON_RUN_AS_NODE: _electronRunAsNode, ...inheritedEnv } = process.env;
+const env = { ...inheritedEnv, PATH: `${join(REPO, "node_modules/.bin")}:/opt/homebrew/opt/rustup/bin:${process.env.PATH}` };
 
 class SyncError extends Error {}
 const fail = (message: string): never => {
@@ -186,13 +199,9 @@ function sync() {
   }
   git("push", "--quiet", "--force", "origin", INTEGRATION);
 
-  const build = spawnSync("node", ["scripts/build-desktop-artifact.ts", "--platform", "mac", "--target", "dmg"], {
-    cwd: REPO,
-    stdio: "inherit",
-    env: { ...env, T3CODE_DESKTOP_APP_ID: APP_ID, T3CODE_DESKTOP_PRODUCT_NAME: PRODUCT_NAME },
-  });
-  if (build.status !== 0) fail("desktop build failed");
-  report.push(`built ${newestDmg()}; run \`node fork-sync.ts install\` to install it`);
+  publish(build());
+  if (isRunning(APP_ID)) report.push(`${PRODUCT_NAME} offers the update to restart into within a few minutes`);
+  else copyApp(newestFeedZip());
 }
 
 function stripNotes(branch: string, base: string) {
@@ -238,45 +247,144 @@ function check() {
   report.push(`ignored ${failedTests.length} known test failure(s)`);
 }
 
-function newestDmg(): string {
-  const dir = join(REPO, "release");
-  const dmgs = existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".dmg")) : [];
-  if (dmgs.length === 0) fail(`no .dmg in ${dir}`);
-  return join(dir, dmgs.sort((a, b) => statSync(join(dir, b)).mtimeMs - statSync(join(dir, a)).mtimeMs)[0]);
+/** Builds and signs the app; every build gets a newer version so the updater offers it. */
+function build(): { app: string; version: string } {
+  const base = JSON.parse(readFileSync(join(REPO, "apps/server/package.json"), "utf8")).version.split("-")[0];
+  const version = `${base}-marc.${new Date().toISOString().replace(/\D/g, "").slice(0, 12)}`;
+  rmSync(join(REPO, "release"), { recursive: true, force: true });
+  const result = spawnSync("node", ["scripts/build-desktop-artifact.ts", "--platform", "mac", "--target", "zip"], {
+    cwd: REPO,
+    stdio: "inherit",
+    env: { ...env, T3CODE_DESKTOP_APP_ID: APP_ID, T3CODE_DESKTOP_PRODUCT_NAME: PRODUCT_NAME, T3CODE_DESKTOP_VERSION: version },
+  });
+  if (result.status !== 0) fail("desktop build failed");
+  // The build keeps only the zip; unpack it to add the feed and sign.
+  const built = readdirSync(join(REPO, "release")).find((file) => file.endsWith(".zip"));
+  if (!built) fail(`no .zip in ${join(REPO, "release")}`);
+  const unpacked = join(REPO, "release", "unpacked");
+  step("ditto", ["-x", "-k", join(REPO, "release", built!), unpacked]);
+  const app = join(unpacked, `${PRODUCT_NAME}.app`);
+  if (!existsSync(app)) fail(`no ${PRODUCT_NAME}.app in ${built}`);
+  writeFileSync(
+    join(app, "Contents/Resources/app-update.yml"),
+    `provider: generic\nurl: http://127.0.0.1:${FEED_PORT}\nupdaterCacheDirName: t3code-marc-updater\n`,
+  );
+  step("codesign", ["--force", "--deep", "--keychain", SIGNING_KEYCHAIN, "--sign", signingIdentity(), app]);
+  return { app, version };
+}
+
+/** Creates the local signing identity on first use; it must stay the same across builds. */
+function signingIdentity(): string {
+  if (!existsSync(SIGNING_KEYCHAIN)) {
+    const dir = mkdtempSync(join(tmpdir(), "t3-marc-signing-"));
+    try {
+      const openssl = existsSync("/opt/homebrew/bin/openssl") ? "/opt/homebrew/bin/openssl" : "openssl";
+      step(openssl, [
+        "req", "-x509", "-newkey", "rsa:3072", "-nodes", "-days", "36500", "-subj", `/CN=${SIGNING_NAME}`,
+        "-keyout", join(dir, "key.pem"), "-out", join(dir, "cert.pem"),
+        "-addext", "basicConstraints=critical,CA:false",
+        "-addext", "keyUsage=critical,digitalSignature",
+        "-addext", "extendedKeyUsage=critical,codeSigning",
+      ]);
+      step(openssl, ["pkcs12", "-export", "-legacy", "-inkey", join(dir, "key.pem"), "-in", join(dir, "cert.pem"), "-out", join(dir, "id.p12"), "-passout", "pass:t3marc"]);
+      step("security", ["create-keychain", "-p", "", SIGNING_KEYCHAIN]);
+      step("security", ["set-keychain-settings", SIGNING_KEYCHAIN]);
+      step("security", ["unlock-keychain", "-p", "", SIGNING_KEYCHAIN]);
+      step("security", ["import", join(dir, "id.p12"), "-k", SIGNING_KEYCHAIN, "-P", "t3marc", "-T", "/usr/bin/codesign"]);
+      exec("security", ["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", "", SIGNING_KEYCHAIN]);
+      report.push(`created the signing identity in ${SIGNING_KEYCHAIN}; install once by hand to switch to it`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  exec("security", ["unlock-keychain", "-p", "", SIGNING_KEYCHAIN]);
+  const identity = /\b([0-9A-F]{40})\b/.exec(exec("security", ["find-identity", "-p", "codesigning", SIGNING_KEYCHAIN]).out)?.[1];
+  return identity ?? fail(`no signing identity in ${SIGNING_KEYCHAIN}`);
+}
+
+/** Zips the app into the feed and points latest-mac.yml at it, keeping the previous build. */
+function publish({ app, version }: { app: string; version: string }) {
+  mkdirSync(FEED_DIR, { recursive: true });
+  const zipName = `T3-Code-Marc-${version}-${process.arch}.zip`;
+  const zip = join(FEED_DIR, zipName);
+  step("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, zip]);
+  const sha512 = createHash("sha512").update(readFileSync(zip)).digest("base64");
+  const size = statSync(zip).size;
+  writeFileSync(
+    join(FEED_DIR, "latest-mac.yml"),
+    `version: ${version}\nfiles:\n  - url: ${zipName}\n    sha512: ${sha512}\n    size: ${size}\npath: ${zipName}\nsha512: ${sha512}\nreleaseDate: '${new Date().toISOString()}'\n`,
+  );
+  for (const old of feedZips().slice(2)) rmSync(join(FEED_DIR, old));
+  report.push(`published ${version} to ${zip}`);
+}
+
+const feedZips = () =>
+  existsSync(FEED_DIR)
+    ? readdirSync(FEED_DIR)
+        .filter((file) => file.endsWith(".zip"))
+        .sort((a, b) => statSync(join(FEED_DIR, b)).mtimeMs - statSync(join(FEED_DIR, a)).mtimeMs)
+    : [];
+
+function newestFeedZip(): string {
+  const zip = feedZips()[0];
+  return zip ? join(FEED_DIR, zip) : fail(`no build in ${FEED_DIR} yet`);
 }
 
 const isRunning = (bundleId: string) =>
   exec("osascript", ["-e", `application id "${bundleId}" is running`]).out === "true";
 
 function install() {
-  const dmg = newestDmg();
+  const zip = newestFeedZip();
   if (isRunning(OFFICIAL_APP_ID)) fail("Quit T3 Code first; both apps share one data folder and one instance lock.");
   if (isRunning(APP_ID)) {
     exec("osascript", ["-e", `tell application id "${APP_ID}" to quit`]);
     for (let i = 0; i < 30 && isRunning(APP_ID); i++) spawnSync("sleep", ["1"]);
     if (isRunning(APP_ID)) fail(`${PRODUCT_NAME} didn't quit`);
   }
-  const mountPoint = mkdtempSync(join(tmpdir(), "t3-marc-install-"));
-  step("hdiutil", ["attach", "-nobrowse", "-readonly", "-mountpoint", mountPoint, dmg]);
-  try {
-    const app = readdirSync(mountPoint).find((file) => file.endsWith(".app"));
-    if (!app) fail(`no .app in ${dmg}`);
-    step("rm", ["-rf", INSTALL_PATH]);
-    step("ditto", [join(mountPoint, app!), INSTALL_PATH]);
-    // Unsigned builds only carry the linker's signature on the main binary; seal the whole bundle.
-    step("codesign", ["--force", "--deep", "--sign", "-", INSTALL_PATH]);
-  } finally {
-    spawnSync("hdiutil", ["detach", "-quiet", mountPoint]);
-    rmSync(mountPoint, { recursive: true, force: true });
-  }
-  report.push(`installed ${dmg} to ${INSTALL_PATH}`);
+  copyApp(zip);
   spawnSync("open", [INSTALL_PATH]);
 }
 
+function copyApp(zip: string) {
+  const dir = mkdtempSync(join(tmpdir(), "t3-marc-install-"));
+  try {
+    step("ditto", ["-x", "-k", zip, dir]);
+    step("rm", ["-rf", INSTALL_PATH]);
+    step("ditto", [join(dir, `${PRODUCT_NAME}.app`), INSTALL_PATH]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  report.push(`installed ${basename(zip)} to ${INSTALL_PATH}`);
+  for (const legacy of LEGACY_INSTALL_PATHS) {
+    if (!existsSync(legacy)) continue;
+    const id = exec("defaults", ["read", join(legacy, "Contents/Info"), "CFBundleIdentifier"]).out;
+    if (id !== APP_ID) continue;
+    step("rm", ["-rf", legacy]);
+    report.push(`removed ${legacy}`);
+  }
+}
+
+/** Serves the feed's files to the app's updater; loopback only. */
+function serve() {
+  createServer((request, response) => {
+    const name = decodeURIComponent(new URL(request.url ?? "/", "http://localhost").pathname.slice(1));
+    const file = join(FEED_DIR, name);
+    if (request.method !== "GET" || !name || name !== basename(name) || !existsSync(file)) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "Content-Length": statSync(file).size, "Cache-Control": "no-store" });
+    createReadStream(file).pipe(response);
+  }).listen(FEED_PORT, "127.0.0.1", () => console.log(`serving ${FEED_DIR} on http://127.0.0.1:${FEED_PORT}`));
+}
+
 try {
-  if (args[0] === "install") install();
-  else sync();
-  console.log(`\nfork-sync: ok\n${report.map((line) => `- ${line}`).join("\n")}`);
+  if (args[0] === "serve") serve();
+  else {
+    if (args[0] === "install") install();
+    else sync();
+    console.log(`\nfork-sync: ok\n${report.map((line) => `- ${line}`).join("\n")}`);
+  }
 } catch (error) {
   if (!(error instanceof SyncError)) throw error;
   console.error(`\nfork-sync: FAILED\n${error.message}\n${report.map((line) => `- ${line}`).join("\n")}`);
