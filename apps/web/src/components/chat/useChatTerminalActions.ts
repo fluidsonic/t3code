@@ -354,8 +354,7 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
       return;
     }
     void terminalActions.writeToTerminal(visibleTerminalId, command);
-    if (terminalUiState.terminalOpen && activeThreadRef)
-      focusTerminal(activeThreadRef, visibleTerminalId);
+    if (activeThreadRef) focusTerminal(activeThreadRef, visibleTerminalId);
   };
   const copyToVisibleTerminalStable = useStableCallback(copyToVisibleTerminal);
   const addTerminalSurface = () => {
