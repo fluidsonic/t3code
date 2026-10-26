@@ -379,6 +379,8 @@ function serve() {
 }
 
 try {
+  // The retired com.fluidsonic.t3marc.install LaunchAgent still calls `install --auto` until unloaded.
+  if (args.includes("--auto")) process.exit(0);
   if (args[0] === "serve") serve();
   else {
     if (args[0] === "install") install();
