@@ -2957,11 +2957,13 @@ export default function ChatView(props: ChatViewProps) {
         return true;
       }
     } catch {}
-    shellRunExplanationRef.current ??= requestConfirmDialog(
-      "Run in this thread's workspace?\nCommands from code blocks run here, and their output is sent to the agent, which replies to it. You won't be asked again.",
-    )?.finally(() => {
-      shellRunExplanationRef.current = undefined;
-    });
+    if (shellRunExplanationRef.current === undefined) {
+      shellRunExplanationRef.current = requestConfirmDialog(
+        "Run in this thread's workspace?\nCommands from code blocks run here, and their output is sent to the agent, which replies to it. You won't be asked again.",
+      )?.finally(() => {
+        shellRunExplanationRef.current = undefined;
+      });
+    }
     const answer = await shellRunExplanationRef.current;
     // Only an explanation that was shown counts as given.
     try {
