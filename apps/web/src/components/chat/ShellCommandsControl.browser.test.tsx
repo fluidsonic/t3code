@@ -14,8 +14,6 @@ import { page } from "vite-plus/test/browser";
 
 const state = vi.hoisted(() => ({
   projection: null as unknown,
-  /** The threads whose detail the panel loaded. */
-  loaded: [] as Array<unknown>,
   stops: [] as Array<unknown>,
   /** Thread interrupts the composer's Stop fell back to. */
   interrupts: 0,
@@ -25,11 +23,7 @@ const state = vi.hoisted(() => ({
 
 vi.mock(import("../../state/entities"), async (importOriginal) => ({
   ...(await importOriginal()),
-  useQuietThreadProjection: ((ref: unknown) => {
-    if (ref === null) return null;
-    state.loaded.push(ref);
-    return state.projection;
-  }) as never,
+  useQuietThreadProjection: (() => state.projection) as never,
 }));
 
 vi.mock(import("../../state/use-atom-command"), async (importOriginal) => ({
@@ -55,7 +49,12 @@ import {
 } from "../../composerDraftStore";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import type { ChatMessage } from "../../types";
-import { ShellCommandsControl } from "./ShellCommandsControl";
+import { useQuietThreadProjection } from "../../state/entities";
+import {
+  ShellCommandsAnnouncer,
+  ShellCommandsControl,
+  shellCommandRows,
+} from "./ShellCommandsControl";
 import { useStoppedShellCommands } from "./useStoppedShellCommands";
 
 const environmentId = EnvironmentId.make("environment:shell-panel");
@@ -89,7 +88,6 @@ function command(
 }
 
 function setup(threadId: ThreadId) {
-  state.loaded = [];
   state.stops = [];
   state.interrupts = 0;
   state.stopSettled = Promise.resolve();
@@ -113,8 +111,6 @@ function Harness(props: {
   /** The thread whose composer the view shows; ChatView keeps one instance across threads. */
   readonly composerThreadId?: ThreadId;
   readonly optimisticMessages?: ReadonlyArray<ChatMessage>;
-  /** False for a new thread's draft whose thread the server doesn't list yet. */
-  readonly listed?: boolean;
 }) {
   const target = scopeThreadRef(environmentId, props.composerThreadId ?? props.threadId);
   const draft = useComposerThreadDraft(target);
@@ -130,15 +126,17 @@ function Harness(props: {
     },
   });
   const returnStoppedCommand = useStableCallback(stopped.returnStoppedCommand);
+  const rows = shellCommandRows(
+    useQuietThreadProjection(scopeThreadRef(environmentId, props.threadId))?.projection ?? null,
+    props.optimisticMessages ?? [],
+  );
   return (
     <>
+      <ShellCommandsAnnouncer commands={rows.commands} />
       <ShellCommandsControl
         environmentId={environmentId}
-        threadDetailRef={
-          props.listed === false ? null : scopeThreadRef(environmentId, props.threadId)
-        }
+        rows={rows}
         composerDraftTarget={target}
-        optimisticMessages={props.optimisticMessages ?? []}
         onStoppedRunningCommand={returnStoppedCommand}
       />
       <button
@@ -372,50 +370,4 @@ it("keeps announcing a command's result after it leaves for the transcript", asy
   await expect
     .element(page.getByRole("status").filter({ hasText: "Command exited 0" }))
     .toBeInTheDocument();
-});
-
-it("shows a new thread's command as sent without loading the thread before the server lists it", async () => {
-  const threadId = ThreadId.make("thread:shell-panel-new");
-  const threadRef = setup(threadId);
-  // The server has no such thread yet.
-  state.projection = null;
-  const sentAt = "2026-10-24T10:00:01.000Z";
-  const sent: ChatMessage = {
-    id: MessageId.make("message:first"),
-    role: "user",
-    text: "! echo 1",
-    shellCommand: true,
-    runId: null,
-    streaming: false,
-    createdAt: sentAt,
-    updatedAt: sentAt,
-  };
-  await using screen = await render(
-    <Harness threadId={threadId} listed={false} optimisticMessages={[sent]} />,
-  );
-
-  await expect.element(screen.getByRole("listitem")).toHaveTextContent("! echo 1Waiting…");
-  // A thread loaded before it exists stays missing after the server creates it.
-  expect(state.loaded).toEqual([]);
-
-  // Listed, the thread loads; the command, already delivered, has left for the transcript.
-  state.projection = {
-    projection: {
-      thread: { hasShellCommands: true },
-      turnItems: [
-        {
-          ...command("first", "echo 1", "running"),
-          status: "completed",
-          completedAt: now,
-          exitCode: 0,
-          userShellDelivered: true,
-        },
-      ],
-      runs: [{ id: runId, status: "failed" }],
-      messages: [{ id: sent.id, threadId, text: sent.text, shellCommand: true }],
-    },
-  };
-  await screen.rerender(<Harness threadId={threadId} optimisticMessages={[sent]} />);
-  await expect.element(screen.getByRole("listitem")).not.toBeInTheDocument();
-  expect(state.loaded).toContainEqual(threadRef);
 });
