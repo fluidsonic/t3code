@@ -267,7 +267,9 @@ import {
 import {
   type CodeBlockShellActions,
   codeBlockRunnableCommand,
-  markdownMayHaveShellCodeBlock,
+  linkInlineShellCommands,
+  markdownMayHaveShellCommand,
+  shellCommandFromLink,
   splitShellCommandMarkdown,
 } from "./threadShellCommandPresentation";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
@@ -1324,21 +1326,25 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
   const threadIcons = useThreadChipIcons(props.environmentId, liveMarkdown);
   const withGallery = useFilePreviewGallery();
   const onImagePress = props.linkHandlers.onImagePress;
+  const { shellBlockActions = null, streaming = false } = props;
+  const onShellCommandPress = shellBlockActions?.onMore ?? null;
   const linkHandlers: MarkdownLinkHandlers = {
     ...props.linkHandlers,
     ...(onImagePress ? { onImagePress: (href: string) => onImagePress(href, withGallery) } : {}),
-    onLinkPress: (href) => props.linkHandlers.onLinkPress(href, props.reply),
+    onLinkPress: (href) => {
+      const command = shellCommandFromLink(href);
+      if (command === null) props.linkHandlers.onLinkPress(href, props.reply);
+      else onShellCommandPress?.(command);
+    },
     onFileContextMenuAction: (href, actionId) =>
       props.linkHandlers.onFileContextMenuAction(href, actionId, props.reply),
     linkCustomization: (href) =>
       withChipIcon(props.linkHandlers.linkCustomization?.(href), threadIcons.get(href)),
   };
-  const { shellBlockActions = null, streaming = false } = props;
-  const onShellCommandPress = shellBlockActions?.onMore ?? null;
-  // Arms block taps only on finished messages that may hold a command block.
+  // Arms block taps only on finished messages that may hold a command.
   const onCodeBlockPress = useMemo(
     () =>
-      onShellCommandPress === null || streaming || !markdownMayHaveShellCodeBlock(liveMarkdown)
+      onShellCommandPress === null || streaming || !markdownMayHaveShellCommand(liveMarkdown)
         ? undefined
         : (block: { readonly code: string; readonly language: string }) => {
             const command = codeBlockRunnableCommand({
@@ -1383,7 +1389,8 @@ function AssistantMarkdownBlocks(props: {
     | undefined;
   readonly shellBlockActions: ShellCommandBlockActions | null;
 }) {
-  // Where blocks run, `! cmd` blocks and lines render as command blocks, as on the web.
+  // Where blocks run, `! cmd` blocks render as command blocks, as on the web, and inline
+  // commands open their actions when tapped.
   const blockActions =
     props.onCodeBlockPress && props.shellBlockActions?.actions.runCommand
       ? props.shellBlockActions
@@ -1436,7 +1443,10 @@ function AssistantMarkdownBlocks(props: {
             // oxlint-disable-next-line react/no-array-index-key -- a segment's parts never reorder
             key={`markdown:${offset}:${index}`}
             markdown={renderCodexInlineDirectivesAsMarkdown(
-              withReferenceDefinitions(part.markdown, definitions),
+              withReferenceDefinitions(
+                blockActions === null ? part.markdown : linkInlineShellCommands(part.markdown),
+                definitions,
+              ),
             )}
             skills={props.skills}
             models={props.models}
