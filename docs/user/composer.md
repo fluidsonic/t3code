@@ -265,8 +265,8 @@ saved, and both the agent and the thread say so.
 
 While the agent is working, a command queues or steers like any message,
 following your [follow-up behavior](#send-while-the-agent-is-working). If a
-command fails, its result goes to the agent with your next queued message, and
-the messages after that wait until you resume the queue.
+command fails, the commands still waiting don't run, and the agent is told
+which ones. Its result goes to the agent with your next queued message.
 
 A steered command never runs alongside the agent's own work. Claude and Pi
 pause at their next step, run your steered commands one at a time, and then
@@ -284,8 +284,7 @@ it from the agent: nothing of it is sent, and its output is discarded. A
 stopped command that had started running comes back into the composer if the
 composer is empty; otherwise your draft stays as it is, and you can recall the
 command with the Up arrow on web and desktop, or choose to replace your draft
-with it in the mobile app. Stopping a command also holds the
-queue. While your commands are all the thread is doing, the composer's Stop
+with it in the mobile app. While your commands are all the thread is doing, the composer's Stop
 stops them the same way; while the agent is working, it stops the thread, its
 commands included.
 
@@ -300,7 +299,7 @@ it from its **…** menu. In the mobile app, a shell-tagged block, or a `! comma
 for blocks tagged `sh`, `bash`, `zsh` or `shell`, which run as written with your
 shell, and for untagged blocks written as `! command`, as well as a line that is only
 an inline `` `! command` ``, which shows as such a block. In an untagged block with a `!`
-on every line (comments aside), each line is its own command with its own **Run**, and **Run all** runs them in order; with a `!` only on the first line, the block is one command. If one fails, the rest don't run, and the agent is told which ones; if you stop one, the rest don't run either. Blocks in other languages, and
+on every line (comments aside), each line is its own command with its own **Run**, and **Run all** runs them in order; with a `!` only on the first line, the block is one command. If you stop one, the rest don't run either. Blocks in other languages, and
 blocks that show a prompt such as `$ npm test` with its output, are examples
 and can't be run.
 

@@ -1419,6 +1419,8 @@ export function deriveMessagesTimelineRows(input: {
   /** See `deriveUserShellCommandOwnsWorkingSlot`. */
   userShellCommandOwnsWorkingSlot?: boolean;
 }): MessagesTimelineRow[] {
+  // A `! cmd` working for the person shows above the composer, and no agent response is live.
+  const isWorking = input.isWorking && input.userShellCommandOwnsWorkingSlot !== true;
   const timelineEntries = timelineRowEntries(input.timelineEntries);
   const isPendingApproval = (entry: WorkLogEntry) => {
     const item = entry.projectedItem?.item;
@@ -1461,9 +1463,9 @@ export function deriveMessagesTimelineRows(input: {
   const activeVisualResponseRunIds = deriveActiveVisualResponseRunIds({
     timelineEntries: timelineEntries,
     unsettledRunId,
-    isWorking: input.isWorking,
+    isWorking: isWorking,
   });
-  const runlessWorkActive = input.isWorking && input.runlessWorkActive === true;
+  const runlessWorkActive = isWorking && input.runlessWorkActive === true;
   const foldsByAnchorEntryId = deriveTurnFolds({
     timelineEntries: timelineEntries,
     terminalAssistantMessageIds,
@@ -1505,16 +1507,16 @@ export function deriveMessagesTimelineRows(input: {
   const runIdIsActiveResponse = (runId: RunId | null | undefined) =>
     runId == null ? runlessWorkActive : activeVisualResponseRunIds.has(runId);
   const workEntryIsInActiveRun = (entry: WorkLogEntry) =>
-    input.isWorking &&
+    isWorking &&
     entry.toolLifecycleStatus === "inProgress" &&
     (entry.runId == null ? runlessWorkActive : entry.runId === unsettledRunId);
 
-  const activeTurnHeaderIndex = input.isWorking
+  const activeTurnHeaderIndex = isWorking
     ? lastResponseBoundaryIndex(timelineEntries) + 1
     : timelineEntries.length;
 
   const activeToolEntries: Array<Extract<TimelineEntry, { kind: "work" }>> = [];
-  if (input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
+  if (isWorking && (unsettledRunId !== null || runlessWorkActive)) {
     let tailAttemptId: string | null | undefined;
     for (let index = timelineEntries.length - 1; index >= activeTurnHeaderIndex; index -= 1) {
       const entry = timelineEntries[index]!;
@@ -1632,7 +1634,7 @@ export function deriveMessagesTimelineRows(input: {
       workEntryIsInActiveRun(entry.entry),
   );
   const activeRunIsCompaction =
-    input.isWorking && unsettledRunId !== null && compactionRuns.has(unsettledRunId);
+    isWorking && unsettledRunId !== null && compactionRuns.has(unsettledRunId);
   // The item can finish before its run settles; only other work should keep activity visible.
   const compactionRunFinished =
     activeRunIsCompaction &&
@@ -1661,24 +1663,7 @@ export function deriveMessagesTimelineRows(input: {
   const activeCompactionRunId = compactsOnReturn
     ? runningCompactionRunId
     : (resumeCompactionEntry?.entry.runId ?? null);
-  const setupHandedOff =
-    input.worktreeSetup !== null &&
-    input.worktreeSetup !== undefined &&
-    worktreeSetupAgentStarted(input.worktreeSetup) &&
-    input.latestRun?.startedAt != null;
-  const setupOwnsWorkingSlot =
-    !setupHandedOff &&
-    (input.worktreeSetup?.phase === "running" || input.worktreeSetup?.phase === "done");
-  // Visible non-agent work owns the working slot while the agent waits on it, so the agent gets no
-  // "Thinking" row. Worktree setup shows its card under its own working row; a `! cmd` shows in
-  // the composer's shell commands control, so the agent gets no working row either.
-  const workingSlotOwner = setupOwnsWorkingSlot
-    ? "worktree-setup"
-    : input.userShellCommandOwnsWorkingSlot === true
-      ? "user-shell-command"
-      : null;
   const appendWorkingRow = () => {
-    if (workingSlotOwner === "user-shell-command") return;
     if (compactionOnlyRunFinished) return;
     if (runningCompactionRunId !== null && activeCompactionRunId === null) return;
     nextRows.push({
@@ -1714,7 +1699,7 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
-    if (input.isWorking && index === activeTurnHeaderIndex) {
+    if (isWorking && index === activeTurnHeaderIndex) {
       appendWorkingRow();
     }
 
@@ -2082,6 +2067,14 @@ export function deriveMessagesTimelineRows(input: {
     });
   }
 
+  const setupHandedOff =
+    input.worktreeSetup !== null &&
+    input.worktreeSetup !== undefined &&
+    worktreeSetupAgentStarted(input.worktreeSetup) &&
+    input.latestRun?.startedAt != null;
+  const setupOwnsWorkingSlot =
+    !setupHandedOff &&
+    (input.worktreeSetup?.phase === "running" || input.worktreeSetup?.phase === "done");
   if (input.worktreeSetup && (!setupHandedOff || input.worktreeSetup.phase !== "running")) {
     const setupRow = {
       kind: "worktree-setup",
@@ -2118,13 +2111,13 @@ export function deriveMessagesTimelineRows(input: {
   }
 
   const hasWorkingRow = nextRows.some((row) => row.kind === "working");
-  if (input.isWorking && !hasWorkingRow && activeTurnHeaderIndex === timelineEntries.length) {
+  if (isWorking && !hasWorkingRow && activeTurnHeaderIndex === timelineEntries.length) {
     appendWorkingRow();
   }
   if (
-    input.isWorking &&
+    isWorking &&
     input.latestRun?.turnEnded !== true &&
-    workingSlotOwner === null &&
+    !setupOwnsWorkingSlot &&
     !hasActiveCompaction &&
     !compactionOnlyRunFinished &&
     (latestToolFailed || (!hasActivityRow && !input.pendingApprovalRequestIds?.size))
