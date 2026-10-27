@@ -1664,6 +1664,24 @@ describe("deriveMessagesTimelineRows", () => {
         optimisticMessages: [optimisticCommand],
       }),
     ).toEqual(["message"]);
+    // The reply before it stays settled, its timestamp included, so the thread's end holds still.
+    const replyRow = deriveMessagesTimelineRows({
+      timelineEntries: [
+        fixBuild,
+        {
+          id: "reply-entry",
+          kind: "message",
+          createdAt: at,
+          message: { ...fixBuild.message, id: MessageId.make("reply"), role: "assistant" },
+        },
+      ],
+      latestRun: { runId: commandRun, status: "running", startedAt: at, completedAt: null },
+      isWorking: true,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+      userShellCommandOwnsWorkingSlot: true,
+    }).find((row) => row.id === "reply-entry");
+    expect(replyRow?.kind === "message" && replyRow.showAssistantMeta).toBe(true);
     // Delivered: the agent's turn starts with the result.
     expect(
       liveRows({

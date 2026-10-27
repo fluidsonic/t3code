@@ -176,13 +176,20 @@ export function liveUserShellCommands(projection: {
       live.push(item);
     }
   }
+  // A starting run's message can arrive a moment before its item does.
   for (const run of projection.runs) {
-    if (run.status !== "preparing") continue;
+    if (run.status !== "preparing" && run.status !== "starting") continue;
     const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
     if (message?.shellCommand !== true) continue;
     // The id its item will have, so the row stays put when the item replaces it.
     const id = userShellCommandItemId(message.id);
-    if (live.some((item) => item.id === id)) continue;
+    if (
+      projection.turnItems.some(
+        (item) => isUserShellCommandItem(item) && item.userShellMessageId === message.id,
+      )
+    ) {
+      continue;
+    }
     live.push({
       id,
       threadId: message.threadId,
@@ -202,7 +209,7 @@ export function liveUserShellCommands(projection: {
       type: "command_execution",
       input: shellCommandFromMessageText(message.text),
       userShellMessageId: message.id,
-      awaitsWorkspace: true,
+      ...(run.status === "preparing" ? { awaitsWorkspace: true as const } : {}),
     });
   }
   return live.sort((left, right) => left.ordinal - right.ordinal);
