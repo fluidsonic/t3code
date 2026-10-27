@@ -327,7 +327,7 @@ function useWidthTransition<T extends HTMLElement>(key: boolean, onChange: () =>
 
 /**
  * A person's `! cmd` once its result reached the agent: the command, then its exit code and
- * duration, with the output folded behind that line. Until then it lives above the composer.
+ * duration, with the output folded behind that line. Until then it waits at the timeline's end.
  */
 function ShellCommandMessageRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
