@@ -2422,7 +2422,10 @@ code {
   --shell-command-prefix-size: 1.25em;
   --shell-command-gap: 0.45em;
   border-radius: 0.4em;
-  background-color: var(--color-shell-command-tint);
+  /* Inline code's surface, tinted: the tint alone all but vanishes on a dark page. */
+  background:
+    linear-gradient(var(--color-shell-command-tint), var(--color-shell-command-tint)),
+    color-mix(in srgb, var(--contrast-foreground) 10%, transparent);
   padding: 0.15em;
   font-size: 0.85em;
   box-decoration-break: clone;
