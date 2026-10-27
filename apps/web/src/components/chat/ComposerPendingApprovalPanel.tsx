@@ -66,14 +66,6 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
       </span>
       <ComposerBanner.Scroll className="w-full">
         <span className="flex flex-col gap-1">
-          {approval.appName || approval.title ? (
-            <span
-              aria-label="Approval explanation"
-              className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word"
-            >
-              {approval.appName ?? approval.title}
-            </span>
-          ) : null}
           <Detail
             aria-label={detailAriaLabel}
             className={cn(
@@ -93,6 +85,14 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
                   : approval.detail
                 : fallbackLabel}
           </Detail>
+          {approval.appName || approval.title ? (
+            <span
+              aria-label="Approval explanation"
+              className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word"
+            >
+              {approval.appName ?? approval.title}
+            </span>
+          ) : null}
           {approval.reason ? (
             <span className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word">
               {approval.reason}
