@@ -391,10 +391,10 @@ describe("ChatMarkdown streaming", () => {
     }
   });
 
-  it("runs a paragraph of one inline `! cmd` span as a command block", async () => {
+  it("runs an inline `! cmd` in prose from its own buttons", async () => {
     setup();
     const actions = { runCommand: vi.fn(), editCommand: vi.fn() };
-    const text = "Push it:\n\n`! git -C /repo push origin\n  a:production b:staging`\n\nDone.";
+    const text = "Then run `! git -C /repo push origin\n  a:production` once staging is green.";
     const message = (
       markdown: string,
       shellActions: typeof actions | null = actions,
@@ -409,32 +409,30 @@ describe("ChatMarkdown streaming", () => {
     );
     await using screen = await render(message(text));
     const { container, rerender } = screen;
-    const runCommandButtons = () => runButtons(container);
-    await act(async () => runCommandButtons()[0]!.click());
+    const inlineRunButtons = () =>
+      [...container.querySelectorAll<HTMLButtonElement>("button")].filter((button) =>
+        button.getAttribute("aria-label")?.startsWith("Run "),
+      );
+    await act(async () => inlineRunButtons()[0]!.click());
     expect(actions.runCommand).toHaveBeenCalledExactlyOnceWith(
-      "git -C /repo push origin a:production b:staging",
+      "git -C /repo push origin a:production",
     );
     await userEvent.click(menuButtons(container)[0]!);
     await userEvent.click(page.getByRole("menuitem", { name: "Edit in the composer" }));
     expect(actions.editCommand).toHaveBeenCalledExactlyOnceWith(
-      "git -C /repo push origin a:production b:staging",
+      "git -C /repo push origin a:production",
     );
-    expect(container.querySelector("p code")).toBeNull();
 
-    // Without shell commands, or while streaming, it stays inline code in its paragraph.
+    // Without shell commands, or while streaming, it stays inline code.
     for (const element of [message(text, null), message(text, actions, true)]) {
       await rerender(element);
-      expect(runCommandButtons()).toHaveLength(0);
+      expect(inlineRunButtons()).toHaveLength(0);
       expect(container.querySelector("p code")?.textContent).toMatch(/^! git -C \/repo push/);
     }
-    for (const markdown of [
-      "Run `! npm test` now.",
-      "`! npm test` `! npm run lint`",
-      "**`! npm test`**",
-      "`npm test`",
-    ]) {
+    // Code that only starts with `!`, and a command that is a link's text, stay as written.
+    for (const markdown of ["`!isReady`", "`!=`", "[`! npm test`](https://example.com)"]) {
       await rerender(message(markdown));
-      expect(runCommandButtons()).toHaveLength(0);
+      expect(inlineRunButtons()).toHaveLength(0);
     }
   });
 
