@@ -2461,12 +2461,11 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
     readOnlyTools !== undefined && readOnlyPolicyAllowsGlobalReads(runtimePolicy)
       ? readOnlyTools
       : undefined;
-  // acceptEdits approves edits before the callback; the callback must ask for everything else.
+  // Claude handles mode-approved actions before the callback; escalations still need approval.
   const installPermissionCallback =
     downgraded ||
     (runtimePolicy.approvalPolicy === undefined
-      ? runtimePolicy.runtimeMode === "approval-required" ||
-        runtimePolicy.runtimeMode === "auto-accept-edits"
+      ? runtimePolicy.runtimeMode !== "full-access"
       : runtimePolicy.approvalPolicy !== "never");
 
   if (permissionMode === "plan") {
@@ -3280,6 +3279,10 @@ function toSessionPermissionUpdates(
   }));
   if (updates.length > 0) {
     return updates;
+  }
+  // Shell tools need an SDK-scoped suggestion to avoid allowing unrelated commands.
+  if (toolName === "Bash" || toolName === "Monitor") {
+    return [];
   }
   return [
     {
