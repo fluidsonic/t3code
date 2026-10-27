@@ -15,7 +15,7 @@ import {
 } from "@t3tools/shared/shellCommand";
 import * as DateTime from "effect/DateTime";
 
-import type { ThreadStructureTurnItem } from "./state/models.ts";
+import { formatWorkingDurationLabel, type ThreadStructureTurnItem } from "./state/models.ts";
 
 /** The result item of a person's `! cmd` message. */
 export type UserShellCommandItem = Extract<OrchestrationV2TurnItem, { type: "command_execution" }>;
@@ -317,6 +317,16 @@ export function userShellCommandStatusText(
   if (userShellCommandIsActive(presentation.status)) return presentation.summary;
   if (presentation.status === "skipped") return "Skipped";
   return presentation.durationMs === null ? "" : formatDuration(presentation.durationMs);
+}
+
+/** A running command's status line, with how long it has run once it started. */
+export function userShellCommandRunningText(
+  startedAt: UserShellCommandItem["startedAt"],
+  nowMs: number,
+): string {
+  return startedAt === null
+    ? "Running…"
+    : `Running for ${formatWorkingDurationLabel(nowMs - DateTime.toEpochMillis(startedAt))}`;
 }
 
 /** The line under a finished command's output when it did not succeed. */
