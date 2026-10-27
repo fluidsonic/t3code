@@ -1,5 +1,6 @@
 import * as Dialog from "../../components/ui/Dialog";
 import { useRememberThreadProject } from "./useRememberThreadProject";
+import { runAfterExplainingOnce } from "./thread-shell-command";
 import { useOpenPullRequest } from "../../native/useOpenPullRequest";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { buildProjectThreadStartTurnInput } from "../../lib/projectThreadStartTurn";
@@ -24,6 +25,7 @@ import {
   type ProjectScript,
 } from "@t3tools/contracts";
 import {
+  canEditInTerminal,
   projectScriptCwd,
   projectScriptRuntimeEnv,
   projectScriptTerminalInput,
@@ -640,6 +642,8 @@ function ThreadRouteContent(
     ) {
       return;
     }
+    // A person's commands alone stop as their own Stop would, with nothing sent to the agent.
+    if (composer.stopShellCommandsInsteadOfThread()) return;
     return interruptThreadTurn({
       environmentId: selectedThread.environmentId,
       input: {
@@ -709,7 +713,19 @@ function ThreadRouteContent(
     });
   };
 
-  const handleRunProjectScript = async (script: ProjectScript) => {
+  const handleRunProjectScript = (script: ProjectScript) =>
+    runCommandInTerminal({ command: script.command, scriptId: script.id });
+
+  /**
+   * Opens a terminal in the thread's workspace that runs `command`. With `submit: false` it leaves
+   * the command on that terminal's prompt to edit.
+   */
+  const runCommandInTerminal = async (input: {
+    command: string;
+    scriptId: string | null;
+    submit?: boolean;
+  }) => {
+    const script = { id: input.scriptId, command: input.command };
     terminalDebugLog("project-script:press", {
       scriptId: script.id,
       command: script.command,
@@ -761,7 +777,8 @@ function ThreadRouteContent(
         cwd,
         worktreePath: preferredWorktreePath,
         env,
-        initialInput: projectScriptTerminalInput(script.command),
+        initialInput:
+          input.submit === false ? script.command : projectScriptTerminalInput(script.command),
       },
     });
     terminalDebugLog("project-script:staged", {
@@ -1047,6 +1064,9 @@ function ThreadRouteContent(
           isSavingQueuedEdit={composer.isSavingQueuedEdit}
           onCancelQueuedRunEdit={composer.cancelQueuedRunEdit}
           onRemoveQueuedEditAttachment={composer.onRemoveQueuedEditAttachment}
+          liveShellCommands={composer.liveShellCommands}
+          userShellCommandOwnsWorkingSlot={composer.userShellCommandOwnsWorkingSlot}
+          onStoppedShellCommand={composer.returnStoppedShellCommand}
           environmentId={selectedThread.environmentId}
           projectWorkspaceRoot={selectedThreadProject?.workspaceRoot ?? null}
           threadCwd={selectedThreadCwd}
@@ -1078,6 +1098,23 @@ function ThreadRouteContent(
           onChangeUserInputCustomAnswer={requests.onChangeUserInputCustomAnswer}
           onSubmitUserInput={requests.onSubmitUserInput}
           onDismissUserInput={requests.onDismissUserInput}
+          codeBlockShellActions={{
+            runCommand: (command) =>
+              runAfterExplainingOnce(() => void composer.runShellCommand([command])),
+            runCommands: (commands) =>
+              runAfterExplainingOnce(() => void composer.runShellCommand(commands)),
+            editCommand: composer.editShellCommand,
+            ...(selectedThreadProject?.workspaceRoot
+              ? {
+                  // A multi-line command can only go in as a bracketed paste, which a shell
+                  // that hasn't enabled paste mode would run line by line.
+                  editInTerminal: (command: string) => {
+                    if (!canEditInTerminal(command)) return;
+                    void runCommandInTerminal({ command, scriptId: null, submit: false });
+                  },
+                }
+              : {}),
+          }}
         />
       </>
     </>

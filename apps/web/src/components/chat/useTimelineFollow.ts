@@ -160,6 +160,8 @@ interface TimelineFollowInput {
   readonly timelineEntries: ReadonlyArray<TimelineEntry>;
   readonly timelineAnchorMessageId: MessageId | null;
   readonly setTimelineAnchor: Dispatch<SetStateAction<TimelineAnchor>>;
+  /** Rows of the shell command panel at the end of the timeline. */
+  readonly shellCommandCount?: number;
 }
 
 /**
@@ -295,7 +297,13 @@ export function useTimelineFollow(input: TimelineFollowInput) {
   });
   if (!sameRunObservation(runObservation.observation, observedRun)) {
     setObservedRun(runObservation.observation);
-    const startedRunAnchor = runObservation.anchorMessageId;
+    // A run opened by a `! cmd` shows up only once the command's result reaches the agent. Like
+    // the command's send, it keeps following the end: the command lands at the bottom rather than
+    // jumping to the top over an empty screen.
+    const startedRunAnchor =
+      dispatchedUserItem?.item.type === "user_message" && dispatchedUserItem.item.shellCommand
+        ? null
+        : runObservation.anchorMessageId;
     if (startedRunAnchor !== null && !anchorPending && timelineLiveFollowEnabled) {
       setShowScrollToBottom(false);
       setTimelineAnchor({ threadKey: activeThreadKey, messageId: startedRunAnchor });
@@ -573,6 +581,20 @@ export function useTimelineFollow(input: TimelineFollowInput) {
     timelineEntries,
     timelineLiveFollowEnabled,
   ]);
+
+  // A command leaving the shell command panel shrinks the footer, and the browser pulls the scroll
+  // position up before same-frame rows lengthen the list again. That is layout, not a scroll away.
+  const shellCommandCount = input.shellCommandCount ?? 0;
+  const shellCommandCountRef = useRef(shellCommandCount);
+  useLayoutEffect(() => {
+    const left = shellCommandCount < shellCommandCountRef.current;
+    shellCommandCountRef.current = shellCommandCount;
+    if (!left) return;
+    viewportRef.current?.rebaseline();
+    if (readCurrentFollow().mode === "following") {
+      void legendListRef.current?.scrollToEnd({ animated: false });
+    }
+  }, [shellCommandCount, legendListRef, readCurrentFollow]);
 
   /** Arms the anchor for a message the user just sent, before its run exists. */
   const anchorNewTurn = (threadKey: string, messageId: MessageId) => {

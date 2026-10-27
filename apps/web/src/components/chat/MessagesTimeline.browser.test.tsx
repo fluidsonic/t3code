@@ -8,7 +8,9 @@ import {
   RunId,
   ScheduledTaskId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import type { LegendListRef } from "@legendapp/list/react";
 import { createRef, Profiler, StrictMode, type ComponentProps, type ReactElement } from "react";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -22,6 +24,7 @@ import { deriveTimelineEntriesFromVisibleTurnItems } from "../../session-logic";
 import { remarkThoughtPreview } from "./TimelineWorkEntryRow.logic";
 import { parseMarkdownWithMath } from "@t3tools/shared/markdownMath";
 import { collectThreadFindRanges } from "./threadFindHighlights";
+import type { ChatMessage } from "../../types";
 import { toastManager } from "../ui/toast";
 import type { CitedHistory } from "./citationProcedure";
 import type { TimelineNavigation } from "./timelineViewport";
@@ -33,10 +36,11 @@ const environmentQuery = vi.hoisted(() => ({
 }));
 vi.mock(import("~/state/query"), async (original) => ({
   ...(await original()),
-  useEnvironmentQuery: (() => ({
-    data: environmentQuery.data,
+  // Like the real hook, a query that isn't asked for yields nothing.
+  useEnvironmentQuery: ((atom: unknown) => ({
+    data: atom === null ? null : environmentQuery.data,
     dataUpdatedAt: 0,
-    error: environmentQuery.error,
+    error: atom === null ? null : environmentQuery.error,
     failure: null,
     isPending: false,
     isSuccess: false,
@@ -992,4 +996,98 @@ it("renders automatic compaction as one live divider that finishes with its reas
     .toBeVisible();
   expect(container.querySelectorAll('[role="separator"]')).toHaveLength(1);
   expect(container.textContent).not.toContain("Compacting before");
+});
+
+describe("MessagesTimeline shell commands", () => {
+  const result = (
+    overrides: Partial<NonNullable<ChatMessage["shellCommandResult"]>> = {},
+  ): NonNullable<ChatMessage["shellCommandResult"]> => ({
+    id: TurnItemId.make("item-shell"),
+    threadId: ThreadId.make("thread-shell"),
+    runId: RunId.make("run-shell"),
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 1,
+    status: "running",
+    title: null,
+    startedAt: DateTime.makeUnsafe("2026-10-23T10:00:00.000Z"),
+    completedAt: null,
+    updatedAt: DateTime.makeUnsafe("2026-10-23T10:00:00.000Z"),
+    type: "command_execution",
+    input: "npm test",
+    userShellMessageId: MessageId.make("message-shell"),
+    ...overrides,
+  });
+  const shell = (shellCommandResult: NonNullable<ChatMessage["shellCommandResult"]>) =>
+    message("! npm test", { shellCommand: true, shellCommandResult }, "message-shell");
+
+  it("shows a delivered command with its outcome and folds its output behind it", async () => {
+    setup();
+    const props = baseProps();
+    await using screen = await renderElement(
+      <MessagesTimeline
+        {...props}
+        timelineEntries={[
+          shell(
+            result({
+              status: "completed",
+              exitCode: 1,
+              output: "1 test failed",
+              completedAt: DateTime.makeUnsafe("2026-10-23T10:00:02.300Z"),
+              userShellDelivered: true,
+            }),
+          ),
+        ]}
+      />,
+    );
+    // The stored `! npm test` shows its `!` once.
+    expect(screen.text()).toContain("! npm test");
+    expect(screen.text()).not.toContain("! ! npm test");
+    expect(screen.text()).toContain("2.3s");
+    expect(screen.text()).not.toContain("1 test failed");
+    // Stop lives above the composer; a delivered command has nothing to stop.
+    expect(screen.container.querySelector('[aria-label="Stop command"]')).toBeNull();
+
+    await click(screen.button("Exited 1 in 2.3s, show output"));
+    expect(screen.text()).toContain("1 test failed");
+    expect(screen.text()).toContain("exit 1");
+    await expect.element(screen.getByRole("button", { name: "Copy output" })).toBeVisible();
+  });
+
+  it("keeps a command's output open when its row remounts", async () => {
+    setup();
+    const props = baseProps();
+    const entry = shell(
+      result({ status: "completed", exitCode: 0, output: "all passed", userShellDelivered: true }),
+    );
+    const timeline = (entries: ReadonlyArray<Entry>) => (
+      <MessagesTimeline {...props} timelineEntries={entries} />
+    );
+    await using screen = await renderElement(timeline([entry]));
+    await click(screen.button("Exited 0, show output"));
+    expect(screen.text()).toContain("all passed");
+
+    // Virtualization unmounts a row scrolled out of view; the same happens when it leaves the list.
+    await screen.rerender(timeline([]));
+    expect(screen.text()).not.toContain("npm test");
+    await screen.rerender(timeline([entry]));
+    expect(screen.text()).toContain("all passed");
+  });
+
+  it("notes the modes the command ran outside of only when it recorded some", async () => {
+    setup();
+    const props = baseProps();
+    const timeline = (entry: Entry) => <MessagesTimeline {...props} timelineEntries={[entry]} />;
+    const delivered = { status: "completed", exitCode: 0, userShellDelivered: true } as const;
+    await using screen = await renderElement(
+      timeline(shell(result({ ...delivered, bypassedModes: ["supervised", "plan"] }))),
+    );
+    expect(screen.text()).toContain("Ran on this machine outside Supervised and Plan mode.");
+
+    await screen.rerender(timeline(shell(result(delivered))));
+    expect(screen.text()).not.toContain("Ran on this machine");
+  });
 });
