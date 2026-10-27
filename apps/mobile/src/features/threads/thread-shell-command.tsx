@@ -569,9 +569,9 @@ function LiveShellCommandRow(props: {
 const ROW_HIT_SLOP = { left: 8, right: 8, top: 2, bottom: 2 } as const;
 
 /**
- * An untagged block of `! cmd` lines, or a lone inline `` `! cmd` ``, as on the web: each command
- * on its own row with Run and its other actions, and Run all for several. `commands` are what the
- * rows run, without their `!`; Copy copies the block as written.
+ * An untagged block of `! cmd` lines, as on the web: each command on its own row with Run and its
+ * other actions, and Run all for several. `commands` are what the rows run, without their `!`;
+ * Copy copies the block as written.
  */
 export function ShellCommandsCodeBlock(props: {
   readonly code: string;
