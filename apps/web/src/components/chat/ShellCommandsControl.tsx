@@ -9,12 +9,7 @@ import {
   userShellCommandPresentation,
 } from "@t3tools/client-runtime/user-shell-command";
 import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
-import {
-  AuthTerminalOperateScope,
-  type EnvironmentId,
-  type ScopedThreadRef,
-  type TurnItemId,
-} from "@t3tools/contracts";
+import { AuthTerminalOperateScope, type EnvironmentId, type TurnItemId } from "@t3tools/contracts";
 import {
   ChevronDownIcon,
   CircleCheckIcon,
@@ -26,7 +21,6 @@ import {
 import { useId, useState } from "react";
 
 import type { ComposerThreadTarget } from "../../composerDraftStore";
-import { useQuietThreadProjection } from "../../state/entities";
 import { useEnvironmentScope } from "../../state/session";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -54,84 +48,90 @@ export type StoppedRunningCommandHandler = (
   target: ComposerThreadTarget,
 ) => void;
 
-/**
- * A thread's `! cmd` commands until their results reach the agent, above the composer where queued
- * messages wait. Delivered, a command moves into the transcript; stopped, it is gone. A command
- * just sent waits here until the server has it.
- */
-export function ShellCommandsControl(props: {
-  readonly environmentId: EnvironmentId;
-  /**
-   * Null until the thread's detail may load; see resolveThreadDetailRef. A new thread's draft
-   * must not load its thread before the server lists it: a load that finds no thread parks it as
-   * missing, and it stays that way once the thread exists.
-   */
-  readonly threadDetailRef: ScopedThreadRef | null;
-  readonly composerDraftTarget: ComposerThreadTarget;
-  readonly optimisticMessages: ReadonlyArray<
+/** What `ShellCommandsControl` shows: live commands, then sends the server doesn't have yet. */
+export function shellCommandRows(
+  projection: Parameters<typeof liveUserShellCommands>[0] | null,
+  optimisticMessages: ReadonlyArray<
     Pick<ChatMessage, "id" | "text" | "shellCommand" | "inputIntent">
-  >;
-  readonly onStoppedRunningCommand: StoppedRunningCommandHandler;
-}) {
-  const projection = useQuietThreadProjection(props.threadDetailRef)?.projection;
+  >,
+) {
   const commands = projection ? liveUserShellCommands(projection) : NO_COMMANDS;
   // A queued command waits with the queued messages instead.
-  const sending = props.optimisticMessages.filter(
+  const sending = optimisticMessages.filter(
     (message) =>
       message.shellCommand === true &&
       message.inputIntent !== "queued_turn" &&
       !projection?.messages.some((candidate) => candidate.id === message.id) &&
       !commands.some((command) => command.userShellMessageId === message.id),
   );
-  const announcement = useShellCommandAnnouncement(commands);
+  return { commands, sending };
+}
+
+/**
+ * A thread's `! cmd` commands until their results reach the agent, at the end of the timeline
+ * where queued messages wait. Delivered, a command moves into the transcript; stopped, it is gone.
+ * A command just sent waits here until the server has it.
+ */
+export function ShellCommandsControl(props: {
+  readonly environmentId: EnvironmentId;
+  readonly rows: ReturnType<typeof shellCommandRows>;
+  readonly composerDraftTarget: ComposerThreadTarget;
+  readonly onStoppedRunningCommand: StoppedRunningCommandHandler;
+}) {
+  const { commands, sending } = props.rows;
   const count = commands.length + sending.length;
+  if (count === 0) return null;
   return (
-    <>
-      {/* Outside the rows: a command's result is read out while it leaves for the transcript. */}
-      <span role="status" className="sr-only">
-        {announcement}
-      </span>
-      {count === 0 ? null : (
-        <ComposerBanner.Attachment>
-          <ComposerBanner.Root
-            role="region"
-            aria-label={`${count} shell command${count === 1 ? "" : "s"}`}
-            data-chat-composer-collapsed-controls="true"
-            data-shell-command-panel="true"
-            className="relative z-0"
-          >
-            <ComposerBanner.Scroll className="max-h-80">
-              <ComposerBanner.Children render={<ol />}>
-                {commands.map((item) => (
-                  <ShellCommandRow
-                    key={item.id}
-                    environmentId={props.environmentId}
-                    item={item}
-                    composerDraftTarget={props.composerDraftTarget}
-                    onStoppedRunningCommand={props.onStoppedRunningCommand}
-                  />
-                ))}
-                {sending.map((message) => (
-                  <li key={message.id} className="grid" data-user-shell-command="waiting">
-                    <ComposerBanner.Row>
-                      <ComposerBanner.Icon>
-                        <ClockIcon />
-                      </ComposerBanner.Icon>
-                      <ComposerBanner.Content className="text-foreground/80">
-                        <span className="min-w-0 flex-1 truncate">
-                          <ShellCommandText command={shellCommandFromMessageText(message.text)} />
-                        </span>
-                        <span className="shrink-0 text-muted-foreground">Waiting…</span>
-                      </ComposerBanner.Content>
-                    </ComposerBanner.Row>
-                  </li>
-                ))}
-              </ComposerBanner.Children>
-            </ComposerBanner.Scroll>
-          </ComposerBanner.Root>
-        </ComposerBanner.Attachment>
-      )}
-    </>
+    <ComposerBanner.Attachment>
+      <ComposerBanner.Root
+        role="region"
+        aria-label={`${count} shell command${count === 1 ? "" : "s"}`}
+        className="relative z-0"
+      >
+        <ComposerBanner.Scroll className="max-h-80">
+          <ComposerBanner.Children render={<ol />}>
+            {commands.map((item) => (
+              <ShellCommandRow
+                key={item.id}
+                environmentId={props.environmentId}
+                item={item}
+                composerDraftTarget={props.composerDraftTarget}
+                onStoppedRunningCommand={props.onStoppedRunningCommand}
+              />
+            ))}
+            {sending.map((message) => (
+              <li key={message.id} className="grid" data-user-shell-command="waiting">
+                <ComposerBanner.Row>
+                  <ComposerBanner.Icon>
+                    <ClockIcon />
+                  </ComposerBanner.Icon>
+                  <ComposerBanner.Content className="text-foreground/80">
+                    <span className="min-w-0 flex-1 truncate">
+                      <ShellCommandText command={shellCommandFromMessageText(message.text)} />
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">Waiting…</span>
+                  </ComposerBanner.Content>
+                </ComposerBanner.Row>
+              </li>
+            ))}
+          </ComposerBanner.Children>
+        </ComposerBanner.Scroll>
+      </ComposerBanner.Root>
+    </ComposerBanner.Attachment>
+  );
+}
+
+/**
+ * Reads out commands starting and finishing. Mounted apart from the panel, which leaves with its
+ * last command: a command's result is read out while it leaves for the transcript.
+ */
+export function ShellCommandsAnnouncer(props: {
+  readonly commands: ReadonlyArray<LiveUserShellCommand>;
+}) {
+  return (
+    <span role="status" className="sr-only">
+      {useShellCommandAnnouncement(props.commands)}
+    </span>
   );
 }
 
