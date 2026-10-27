@@ -17,8 +17,9 @@ import {
   composerPromptForMessage,
   isRunningUserShellCommand,
   liveUserShellCommands,
+  userShellCommandIsPending,
   nextComposerShellMode,
-  shellCommandBlockFromInlineCodeParagraph,
+  shellCommandFromInlineCode,
   stopComposerShellCommands,
   userShellCommandAnnouncement,
   shellCommandsFromUntaggedCodeBlock,
@@ -481,6 +482,29 @@ describe("liveUserShellCommands", () => {
     expect(live.map((entry) => entry.id)).toEqual(["ran", "running", "waiting"]);
   });
 
+  it("knows a command already on its way, so a repeated Run doesn't send it again", () => {
+    const queued = {
+      id: MessageId.make("message-queued"),
+      threadId: ThreadId.make("thread-1"),
+      text: shellCommandMessageText("git push"),
+      shellCommand: true as const,
+    };
+    const projection = {
+      thread: shellThread,
+      turnItems: [item("running", 1, { status: "running", completedAt: null })],
+      runs: [run("run-1", "starting"), run("run-2", "queued", "message-queued")],
+      messages: [queued],
+    };
+    expect(userShellCommandIsPending(projection, "npm test")).toBe(true);
+    expect(userShellCommandIsPending(projection, "git push")).toBe(true);
+    expect(userShellCommandIsPending(projection, "npm run lint")).toBe(false);
+    // Once its result reaches the agent, it can run again.
+    const delivered = item("running", 1, { userShellDelivered: true });
+    expect(
+      userShellCommandIsPending({ ...projection, turnItems: [delivered], runs: [] }, "npm test"),
+    ).toBe(false);
+  });
+
   it("keeps finished commands while the turn they steer waits for the rest", () => {
     // Held at its steering window while another command runs, or being released with them.
     const finished = commandItem();
@@ -644,43 +668,17 @@ describe("userShellCommandFromCodeBlock", () => {
   });
 });
 
-describe("shellCommandBlockFromInlineCodeParagraph", () => {
-  it("reads a paragraph of only an inline `! cmd` span as an untagged command block", () => {
-    expect(shellCommandBlockFromInlineCodeParagraph("`! npm test`")).toEqual({
-      code: "! npm test",
-      command: "npm test",
-    });
-    expect(shellCommandBlockFromInlineCodeParagraph("`!git status` \n")).toEqual({
-      code: "!git status",
-      command: "git status",
-    });
+describe("shellCommandFromInlineCode", () => {
+  it("reads an inline `! cmd` span, its soft wraps as spaces", () => {
+    expect(shellCommandFromInlineCode("! npm test")).toBe("npm test");
+    expect(shellCommandFromInlineCode(" ! git push origin\n  a:production ")).toBe(
+      "git push origin a:production",
+    );
   });
 
-  it("joins a soft-wrapped span into one line", () => {
-    // A blockquote's or list item's paragraph, sliced from its message, keeps the markers.
-    expect(
-      shellCommandBlockFromInlineCodeParagraph("`! git push origin\n> \t a:production`"),
-    ).toEqual({
-      code: "! git push origin a:production",
-      command: "git push origin a:production",
-    });
-    expect(
-      shellCommandBlockFromInlineCodeParagraph(
-        "`! git -C /repo push origin\n  a:production b:staging`",
-      ),
-    ).toEqual({
-      code: "! git -C /repo push origin a:production b:staging",
-      command: "git -C /repo push origin a:production b:staging",
-    });
-  });
-
-  it("ignores spans with other text, several spans, or no `!`", () => {
-    expect(shellCommandBlockFromInlineCodeParagraph("Run `! npm test`")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("`! npm test` to check.")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("`! npm test` `! npm run lint`")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("`npm test`")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("`!`")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("**`! npm test`**")).toBeNull();
-    expect(shellCommandBlockFromInlineCodeParagraph("    `! npm test`")).toBeNull();
+  it("leaves code that only starts with `!`", () => {
+    for (const code of ["!isReady", "!=", "!important", "!", "! ", "npm test"]) {
+      expect(shellCommandFromInlineCode(code)).toBeNull();
+    }
   });
 });
