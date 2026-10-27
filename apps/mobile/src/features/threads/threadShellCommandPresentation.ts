@@ -1,5 +1,5 @@
 import {
-  shellCommandBlockFromInlineCodeParagraph,
+  shellCommandFromInlineCode,
   shellCommandsFromUntaggedCodeBlock,
   userShellCommandFromCodeBlock,
 } from "@t3tools/client-runtime/user-shell-command";
@@ -26,14 +26,14 @@ const SHELL_LANGUAGE_FENCE = /^[ \t>]*(?:`{3,}|~{3,})[ \t]*(?:sh|bash|zsh|shell)
 const UNTAGGED_COMMAND_FENCE =
   /^[ \t>]*(?:`{3,}|~{3,})[ \t]*\r?\n(?:[ \t>]*(?:#.*)?\r?\n)*[ \t>]*!/m;
 
-// A paragraph that opens with an inline `! cmd` span; see `splitShellCommandMarkdown`.
-const INLINE_COMMAND_PARAGRAPH = /^`[ \t]*!/m;
+// An inline `! cmd` span; see `linkInlineShellCommands`.
+const INLINE_COMMAND = /`! \S/;
 
-export function markdownMayHaveShellCodeBlock(markdown: string): boolean {
+export function markdownMayHaveShellCommand(markdown: string): boolean {
   return (
     SHELL_LANGUAGE_FENCE.test(markdown) ||
     UNTAGGED_COMMAND_FENCE.test(markdown) ||
-    INLINE_COMMAND_PARAGRAPH.test(markdown)
+    INLINE_COMMAND.test(markdown)
   );
 }
 
@@ -56,16 +56,15 @@ export type ShellCommandMarkdownSegment =
 
 /**
  * `markdown` with its command blocks taken out, to render as on the web: each closed top-level
- * untagged `! cmd` block, and each top-level paragraph of one inline `! cmd` span, becomes a
- * command block of its own; the rest stays markdown. Blocks in lists and blockquotes, which are
- * indented or quoted, stay as written: taking them out would break the list or quote apart.
+ * untagged `! cmd` block becomes a command block of its own; the rest stays markdown. Blocks in
+ * lists and blockquotes, which are indented or quoted, stay as written: taking them out would
+ * break the list or quote apart.
  */
 export function splitShellCommandMarkdown(
   markdown: string,
 ): ReadonlyArray<ShellCommandMarkdownSegment> {
   const segments: Array<ShellCommandMarkdownSegment> = [];
   let output: string[] = [];
-  let paragraph: string[] = [];
   let fence: string | null = null;
   // Where an untagged top-level fence's lines start in `output`, while it is open.
   let untaggedFenceStart: number | null = null;
@@ -75,15 +74,6 @@ export function splitShellCommandMarkdown(
     }
     output = [];
     segments.push({ kind: "commands", code, commands });
-  };
-  const endParagraph = () => {
-    const block =
-      paragraph[0]?.startsWith("`") === true
-        ? shellCommandBlockFromInlineCodeParagraph(paragraph.join("\n"))
-        : null;
-    if (block === null) output.push(...paragraph);
-    else pushCommands(block.code, [block.command]);
-    paragraph = [];
   };
   for (const line of markdown.split(/\r\n|\r|\n/)) {
     const fenceLine = FENCE_LINE.exec(line);
@@ -112,24 +102,70 @@ export function splitShellCommandMarkdown(
     }
     // A backtick fence's info string can't contain a backtick; that line is inline code.
     if (fenceLine && !(fenceLine[1]!.startsWith("`") && fenceLine[2]!.includes("`"))) {
-      endParagraph();
       untaggedFenceStart = TOP_LEVEL_UNTAGGED_FENCE.test(line) ? output.length : null;
       output.push(line);
       fence = fenceLine[1]!;
       continue;
     }
-    if (line.trim().length === 0) {
-      endParagraph();
-      output.push(line);
-      continue;
-    }
-    paragraph.push(line);
+    output.push(line);
   }
-  endParagraph();
   if (output.some((line) => line.trim().length > 0)) {
     segments.push({ kind: "markdown", markdown: output.join("\n") });
   }
   return segments;
+}
+
+const SHELL_COMMAND_LINK = "t3-shell-command://v1/";
+// A single-backtick `! cmd` span: not part of a longer backtick run, escaped, or a link's text.
+const INLINE_COMMAND_SPAN = /(^|[^`\\[])(`(! [^`]+)`)(?!`|\]\()/g;
+
+/**
+ * `markdown` with each inline `! cmd` span outside code blocks made a link to its command, so the
+ * native text, which can't hold buttons, opens the command's actions where it is tapped.
+ */
+export function linkInlineShellCommands(markdown: string): string {
+  let fence: string | null = null;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      const fenceLine = FENCE_LINE.exec(line);
+      if (fence !== null) {
+        const closes =
+          fenceLine &&
+          fenceLine[1]![0] === fence[0] &&
+          fenceLine[1]!.length >= fence.length &&
+          fenceLine[2]!.trim().length === 0;
+        if (closes) fence = null;
+        return line;
+      }
+      if (fenceLine && !(fenceLine[1]!.startsWith("`") && fenceLine[2]!.includes("`"))) {
+        fence = fenceLine[1]!;
+        return line;
+      }
+      return line.replace(
+        INLINE_COMMAND_SPAN,
+        (match, before: string, span: string, code: string) => {
+          const command = shellCommandFromInlineCode(code);
+          if (command === null) return match;
+          // Parentheses would end the link's destination.
+          const href = encodeURIComponent(command).replace(/[()]/g, (paren) =>
+            paren === "(" ? "%28" : "%29",
+          );
+          return `${before}[${span}](${SHELL_COMMAND_LINK}${href})`;
+        },
+      );
+    })
+    .join("\n");
+}
+
+/** The command a link from `linkInlineShellCommands` stands for, or null for any other link. */
+export function shellCommandFromLink(href: string): string | null {
+  if (!href.startsWith(SHELL_COMMAND_LINK)) return null;
+  try {
+    return decodeURIComponent(href.slice(SHELL_COMMAND_LINK.length));
+  } catch {
+    return null;
+  }
 }
 
 /** The code of a fence `markdown` leaves open at its end, as an interrupted reply does. */
