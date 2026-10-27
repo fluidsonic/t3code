@@ -6822,6 +6822,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly nativeRequestId: string;
           readonly requestKind: OrchestrationV2RuntimeRequest["kind"];
           readonly prompt?: string;
+          readonly title?: string;
           readonly presentation?: ReturnType<typeof claudeApprovalPresentation>;
           readonly questions?: ReadonlyArray<OrchestrationV2UserInputQuestion>;
         }) {
@@ -6898,7 +6899,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             parentItemId: null,
             ordinal,
             status: "waiting",
-            title: null,
+            title: input.title ?? null,
             startedAt: createdAt,
             completedAt: null,
             updatedAt: createdAt,
@@ -9423,17 +9424,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
 
           const requestKind = providerRequestKindFromClaudeTool(toolName);
-          const prompt =
-            callbackOptions.title ??
-            callbackOptions.description ??
-            callbackOptions.decisionReason ??
-            summarizeClaudeToolRequest(toolName, nativeToolInput);
+          // Claude's decision reason reaches the client separately, as the presentation's reason.
+          const explanation = callbackOptions.title?.trim() || callbackOptions.description?.trim();
+          // The user approves the operation itself; Claude's text only explains it. The command
+          // stays untrimmed: `trim` drops unicode blanks such as U+00A0 that a shell keeps.
+          const command = ["command", "cmd", "script"]
+            .map((key) => inputRecordValue(nativeToolInput, key))
+            .find((value): value is string => typeof value === "string" && value.trim() !== "");
+          const prompt = command ?? summarizeClaudeToolRequest(toolName, nativeToolInput);
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
             nativeRequestId,
             requestKind,
             prompt,
+            ...(explanation ? { title: explanation } : {}),
             presentation: claudeApprovalPresentation({
               permissionMode: context.queryPolicy.permissionMode,
               prompt,
