@@ -617,6 +617,18 @@ export interface DesktopPreviewOpenLinkEvent {
   background: boolean;
 }
 
+/** Keybinding commands the desktop routes to the tab whose page or separate window took the key. */
+export const PREVIEW_TAB_SHORTCUT_COMMANDS = [
+  "preview.zoomIn",
+  "preview.zoomOut",
+  "preview.resetZoom",
+] as const;
+
+export interface DesktopPreviewTabShortcutEvent {
+  tabId: string;
+  command: (typeof PREVIEW_TAB_SHORTCUT_COMMANDS)[number];
+}
+
 export const DesktopPreviewRecordingInputSchema = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("pointer"),
@@ -1186,6 +1198,7 @@ export interface DesktopPreviewBridge {
   onStateChange: (listener: (tabId: string, state: DesktopPreviewTabState) => void) => () => void;
   onPointerEvent: (listener: (event: DesktopPreviewPointerEvent) => void) => () => void;
   onOpenLink: (listener: (event: DesktopPreviewOpenLinkEvent) => void) => () => void;
+  onTabShortcut: (listener: (event: DesktopPreviewTabShortcutEvent) => void) => () => void;
 }
 
 export type ConfirmDialogVariant = "default" | "destructive";
