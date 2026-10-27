@@ -244,6 +244,71 @@ provider supports it. Web and desktop also offer compaction from the context met
 Claude instances can also compact idle threads for you. See
 [compact long conversations](./providers-claude.md#compact-long-conversations).
 
+## Run a shell command
+
+Shell commands are off until you turn them on for an environment: on web and
+desktop, open **Settings → Chat → Shell commands (beta)**; in the mobile app,
+open **Settings → Agent behavior → Shell commands (beta)**.
+
+Type `!` into an empty composer to run a shell command yourself, such as
+`! npm test`, or paste a command that starts with `!` there. A `!` added in
+front of text you already wrote stays ordinary text.
+The command runs on the machine where the agent works, in the thread's
+workspace, in a fresh instance of your shell (PowerShell on Windows) with no
+time limit. It runs as typed, without the
+approvals of Supervised mode or the limits of Plan mode. It cannot answer
+prompts, so use the terminal for interactive commands. When it finishes, the
+agent receives the command, its exit code, duration and output, and responds.
+Long output is saved to a file the agent can read; past 50 MB only its start is
+saved, and both the agent and the thread say so.
+
+While the agent is working, a command queues or steers like any message,
+following your [follow-up behavior](#send-while-the-agent-is-working). If a
+command fails, the commands still waiting don't run, and the agent is told
+which ones. Its result goes to the agent with your next queued message.
+
+A steered command never runs alongside the agent's own work. Claude and Pi
+pause at their next step, run your steered commands one at a time, and then
+continue the same turn with the results, followed by any messages you steered
+meanwhile. Other agents, or Claude and Pi when they can't pause (for example
+because hooks are turned off, or the session started before you turned shell
+commands on), are interrupted instead, and their next turn starts with the
+results. Until then, steered commands and messages wait at the
+front of the queue.
+
+Until the agent receives its result, a command waits or runs above the
+composer, where queued messages wait, with its status and output. It joins the
+conversation, with its result, once it reaches the agent. Stop it there to keep
+it from the agent: nothing of it is sent, and its output is discarded. A
+stopped command that had started running comes back into the composer if the
+composer is empty; otherwise your draft stays as it is, and you can recall the
+command with the Up arrow on web and desktop, or choose to replace your draft
+with it in the mobile app. While your commands are all the thread is doing, the composer's Stop
+stops them the same way; while the agent is working, it stops the thread, its
+commands included.
+
+A command is plain text: it takes no attachments, and a long paste stays in it
+instead of becoming a file. Remove attachments before running one. To send text
+that starts with `!`, type the `!` first and press Backspace once: the `!` stays
+as text until you delete it.
+
+You can also run an agent's finished code block with **Run**, which runs
+it in the thread's workspace and sends the result to the agent, or edit or copy
+it from its **…** menu. In the mobile app, a shell-tagged block, or a `! command` block in a list or quote, runs when you tap it. This works
+for blocks tagged `sh`, `bash`, `zsh` or `shell`, which run as written with your
+shell, and for untagged blocks written as `! command`. In an untagged block with a `!`
+on every line (comments aside), each line is its own command with its own **Run**, and **Run all** runs them in order; with a `!` only on the first line, the block is one command. If you stop one, the rest don't run either. Blocks in other languages, and
+blocks that show a prompt such as `$ npm test` with its output, are examples
+and can't be run. An inline `` `! command` `` in the agent's text gets the same **Run** and **…**;
+in the mobile app, tap it.
+
+Running commands requires terminal access to the environment; without it, or
+while shell commands are off, a newly typed `!` is ordinary text. A command you
+had already started writing stays a command but can't be sent; delete its `!`
+to send it as a message instead. Turning shell commands off only
+refuses new ones: commands already queued or running still run, and a running
+one can still be stopped.
+
 ## Goals
 
 With Codex and Claude, send `/goal` followed by what "done" means, for example

@@ -438,6 +438,27 @@ export interface ProviderAdapterV2SteerInput {
   readonly message: ProviderAdapterV2TurnMessage;
 }
 
+export interface ProviderAdapterV2PauseInput {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly providerTurnId: ProviderTurnId;
+}
+
+/**
+ * `paused`: the agent waits at its steering window until `releaseTurn`. `turn_ended`: the turn
+ * ended first. `unsupported`: this session cannot hold its agent (hooks turned off, say).
+ */
+export type ProviderAdapterV2PauseOutcome = "paused" | "turn_ended" | "unsupported";
+
+export interface ProviderAdapterV2ReleaseInput {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly providerTurnId: ProviderTurnId;
+  /**
+   * Steered text the agent continues with; absent to just let it continue. Attachments travel
+   * as a steer right after the release.
+   */
+  readonly text?: string;
+}
+
 export interface ProviderAdapterV2InterruptInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
@@ -584,6 +605,19 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly steerTurn: (
     input: ProviderAdapterV2SteerInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /**
+   * Holds the running turn at its next steering window, where it would take a steered message
+   * (between tool steps, before its next model request), so steered `! cmd` commands run while
+   * the agent waits. Resolves once it waits there. Interrupting the wait gives up the hold, and
+   * lets the agent continue if it already waits. Absent: steered commands interrupt the turn.
+   */
+  readonly pauseTurn?: (
+    input: ProviderAdapterV2PauseInput,
+  ) => Effect.Effect<ProviderAdapterV2PauseOutcome, ProviderAdapterV2Error>;
+  /** Lets a paused turn continue. False when it no longer waits, so `message` did not reach it. */
+  readonly releaseTurn?: (
+    input: ProviderAdapterV2ReleaseInput,
+  ) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly stopTask?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;

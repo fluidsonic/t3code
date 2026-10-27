@@ -414,6 +414,12 @@ export const OrchestrationV2AppThread = Schema.Struct({
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+  /**
+   * Set once the thread gets its first `! cmd` shell command, and never cleared; a fork inherits
+   * it. The server runs its shell-command reads and rules only for threads that have it, so a
+   * thread that never ran one takes exactly the paths it took before shell commands existed.
+   */
+  hasShellCommands: Schema.optional(Schema.Boolean),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(
     Schema.Union([
@@ -658,6 +664,17 @@ export const OrchestrationV2Run = Schema.Struct({
   ),
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+  /**
+   * Set while steered `! cmd` commands hold this run's provider turn: `pausing` until the agent
+   * reaches its next steering window, `paused` while it waits there for their results, and
+   * `interrupting` until the turn ends so they can run before the next one.
+   */
+  userShellHold: Schema.optional(
+    Schema.Struct({
+      providerTurnId: ProviderTurnId,
+      status: Schema.Literals(["pausing", "paused", "interrupting"]),
+    }),
+  ),
 });
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
 
@@ -1202,6 +1219,23 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
    * the workflow's opening instead and keep the script behind a disclosure.
    */
   workflowScript: Schema.optional(Schema.Boolean),
+  /**
+   * A shell command a person ran from the composer. `text` is `! <command>` so older clients show
+   * it as one; read it with `shellCommandFromMessageText`. Clients send that form (a bare command
+   * starting with `!` would lose it). Only a client send creates one, never an agent.
+   */
+  shellCommand: Schema.optional(Schema.Boolean),
+  /**
+   * Shell commands sent together to run in order, as a code block's Run all does, share the first
+   * one's message id here. When one fails or is stopped, the rest of the group does not run.
+   */
+  shellCommandGroup: Schema.optional(MessageId),
+  /**
+   * Sent as a steer that waits for steered shell commands: a steered command itself, or a message
+   * steered while one holds the agent. It waits at the front of the queue and reaches the agent
+   * with their results, at the agent's next steering window or as the turn that follows it.
+   */
+  shellSteer: Schema.optional(Schema.Boolean),
   id: MessageId,
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
@@ -1386,6 +1420,10 @@ export const OrchestrationV2UserMessageInputIntent = Schema.Literals([
 export type OrchestrationV2UserMessageInputIntent =
   typeof OrchestrationV2UserMessageInputIntent.Type;
 
+/** `supervised` is runtimeMode "approval-required"; `plan` is interactionMode "plan". */
+export const OrchestrationV2UserShellBypassedMode = Schema.Literals(["supervised", "plan"]);
+export type OrchestrationV2UserShellBypassedMode = typeof OrchestrationV2UserShellBypassedMode.Type;
+
 const OrchestrationV2TurnItemBaseFields = {
   toolNonExecutionKind: Schema.optional(Schema.String),
   toolSurface: Schema.optional(ToolActivitySurface),
@@ -1457,6 +1495,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     senderThreadId: Schema.optional(ThreadId),
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
+    shellCommand: OrchestrationV2ConversationMessage.fields.shellCommand,
     inputIntent: OrchestrationV2UserMessageInputIntent,
     text: Schema.String,
     /** Same as the text of message `messageId`. */
@@ -1523,6 +1562,29 @@ export const OrchestrationV2TurnItem = Schema.Union([
     exitCode: Schema.optional(Schema.Int),
     /** Set when the command is a monitor, so background work lists it as a monitor. */
     monitor: Schema.optional(Schema.Boolean),
+    /**
+     * Set when this is the result of a person's `! cmd` shell command message rather than an
+     * agent's tool call. `output` then holds a bounded tail; the full output is a file attachment
+     * on that message.
+     */
+    userShellMessageId: Schema.optional(MessageId),
+    /**
+     * Set once this `! cmd` result reached the agent. Until then the item is the command's live
+     * state: clients show it above the composer, and it stays out of the transcript and of
+     * history, along with its message. A stopped command never gets it.
+     */
+    userShellDelivered: Schema.optional(Schema.Boolean),
+    /**
+     * The command never ran: an earlier command of its group (`shellCommandGroup`) failed. Its
+     * status is `failed`, without an exit code, and the agent is told it was skipped.
+     */
+    userShellSkipped: Schema.optional(Schema.Boolean),
+    /**
+     * Thread modes a person's shell command ran outside of, as they were when it was sent. A
+     * command runs on the machine directly; recording them keeps a later mode change from
+     * relabeling past commands. Absent when it bypassed none.
+     */
+    bypassedModes: Schema.optional(Schema.Array(OrchestrationV2UserShellBypassedMode)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2294,6 +2356,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     senderThreadId: Schema.optional(ThreadId),
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
+    shellCommand: OrchestrationV2ConversationMessage.fields.shellCommand,
     inputIntent: OrchestrationV2UserMessageInputIntent,
     text: Schema.String,
     context: Schema.optional(OrchestrationMessageContext),
@@ -2357,6 +2420,10 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     exitCode: Schema.optional(Schema.Int),
     /** Set when the command is a monitor, so background work lists it as a monitor. */
     monitor: Schema.optional(Schema.Boolean),
+    userShellMessageId: Schema.optional(MessageId),
+    userShellDelivered: Schema.optional(Schema.Boolean),
+    userShellSkipped: Schema.optional(Schema.Boolean),
+    bypassedModes: Schema.optional(Schema.Array(OrchestrationV2UserShellBypassedMode)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -3001,6 +3068,16 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     messageId: MessageId,
     text: Schema.String,
+    /** `text` is a shell command to run (see `OrchestrationV2ConversationMessage.shellCommand`). */
+    shellCommand: Schema.optional(Schema.Boolean),
+    /**
+     * More shell commands to run after this one, in order, as one group (see
+     * `OrchestrationV2ConversationMessage.shellCommandGroup`). Sent in the same command, so all of
+     * them wait in order before the first one can finish.
+     */
+    followingShellCommands: Schema.optional(
+      Schema.Array(Schema.Struct({ messageId: MessageId, text: Schema.String })),
+    ),
     context: Schema.optional(OrchestrationMessageContext),
     attachments: Schema.Array(ChatAttachment),
     titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -3107,6 +3184,16 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
   }),
+  /**
+   * Stops one waiting or running `! cmd` shell command. Nothing of it reaches the agent, and it
+   * never enters the transcript.
+   */
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.stop"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+  }),
   Schema.Struct({
     type: Schema.Literal("queued-run.edit"),
     context: Schema.optional(OrchestrationMessageContext),
@@ -3114,6 +3201,12 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     text: Schema.String,
+    /**
+     * Must be set exactly when the queued message is a shell command. It makes the edit require
+     * terminal permission, and the server rejects a mismatch, so an edit can neither change a
+     * command without that permission nor turn a message into a command.
+     */
+    shellCommand: Schema.optional(Schema.Boolean),
     // Replaces all attachments; absent preserves them for older clients editing text.
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
   }),
@@ -3309,6 +3402,50 @@ const OrchestrationV2InternalCommand = Schema.Union([
     delivery: Schema.optional(OrchestrationV2SecretRequestDelivery),
     secretStatus: OrchestrationV2SecretRequestStatus,
   }),
+  /**
+   * A person's `! cmd` process ended. Internal so only the server's executor reports results; a
+   * client stops a command with `user-shell-command.stop`.
+   */
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.finish"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+    /** Absent when the process never started or was killed before it exited on its own. */
+    exitCode: Schema.optional(Schema.Int),
+    /** The process was killed by a stop, an archive, or a delete rather than exiting. */
+    stopped: Schema.Boolean,
+    /** A bounded tail of the combined output. */
+    output: Schema.String,
+    /** The whole output, saved as a file when the tail could not hold it. */
+    fullOutput: Schema.optional(ChatAttachment),
+    startedAt: Schema.DateTimeUtc,
+    completedAt: Schema.DateTimeUtc,
+  }),
+  /**
+   * How a pause requested for steered `! cmd` commands went: the agent waits at its steering
+   * window, or it could not be paused there and its turn is interrupted instead.
+   */
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.hold"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    providerTurnId: ProviderTurnId,
+    outcome: Schema.Literals(["paused", "unavailable"]),
+  }),
+  /**
+   * Whether the results and messages a paused turn was released with reached its agent. They
+   * join the transcript in that turn, or, when they did not, are delivered as the next turn.
+   */
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.released"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    messageIds: Schema.Array(MessageId),
+    delivered: Schema.Boolean,
+  }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
@@ -3406,6 +3543,8 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
     Schema.Struct({
       messageId: Schema.optional(MessageId),
       text: Schema.String,
+      /** A new thread may open with a `! cmd` shell command; see `message.dispatch`. */
+      shellCommand: Schema.optional(Schema.Boolean),
       context: Schema.optional(OrchestrationMessageContext),
       attachments: Schema.Array(ChatAttachment),
     }),

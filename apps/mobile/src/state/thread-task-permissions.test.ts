@@ -86,6 +86,7 @@ vi.mock("@effect/atom-react", async () => {
   return { useAtomValue: <A>(atom: Atom.Atom<A>) => appAtomRegistry.get(atom) };
 });
 vi.mock("./entities", () => ({ useServerConfigs: () => new Map() }));
+vi.mock("./shell-commands", () => ({ readCanRunShellCommands: () => false }));
 vi.mock("./session", () => ({
   readEnvironmentScope: (environmentId: string, scope: string) =>
     scope === AuthOrchestrationOperateScope && state.grantedEnvironments.has(environmentId),

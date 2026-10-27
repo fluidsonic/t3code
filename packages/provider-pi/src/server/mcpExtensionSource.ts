@@ -7,6 +7,10 @@ export const T3_MCP_URL_ENV = "T3_MCP_URL";
 export const T3_MCP_BEARER_ENV = "T3_MCP_BEARER_TOKEN";
 export const T3_PI_RUNTIME_MODE_ENV = "T3_PI_RUNTIME_MODE";
 export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
+/** A file whose presence asks the bridge to hold Pi before its next tool call. */
+export const T3_PI_HOLD_FILE_ENV = "T3_PI_HOLD_FILE";
+/** The dialog the bridge raises while it holds Pi; the adapter answers it to let Pi continue. */
+export const PI_T3_HOLD_TITLE = "t3-code:hold";
 
 // These tools trigger file-change approvals, bypassed by Auto-accept edits.
 export const PI_FILE_CHANGE_TOOLS = ["edit", "write"] as const;
@@ -21,6 +25,8 @@ const URL_ENV = ${JSON.stringify(T3_MCP_URL_ENV)};
 const TOKEN_ENV = ${JSON.stringify(T3_MCP_BEARER_ENV)};
 const RUNTIME_MODE_ENV = ${JSON.stringify(T3_PI_RUNTIME_MODE_ENV)};
 const EXTENSION_PATH_ENV = ${JSON.stringify(T3_PI_MCP_EXTENSION_PATH_ENV)};
+const HOLD_FILE_ENV = ${JSON.stringify(T3_PI_HOLD_FILE_ENV)};
+const HOLD_TITLE = ${JSON.stringify(PI_T3_HOLD_TITLE)};
 const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify(T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim())};
 const PROTOCOL = "2025-06-18";
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -319,7 +325,15 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
       NodePath.resolve(tool.sourceInfo.path) === NodePath.resolve(extensionPath));
   };
 
+  // T3 Code holds Pi before its next tool call, in every mode, while steered shell commands
+  // run: it creates the hold file to ask, and answers this dialog to let Pi continue. Only a
+  // session launched with shell commands on gets the hold file, so the check costs nothing else.
+  const holdFile = env(HOLD_FILE_ENV);
+
   pi.on("tool_call", async (event, ctx) => {
+    if (holdFile !== undefined && (await NodeFSP.access(holdFile).then(() => true, () => false))) {
+      await ctx.ui.confirm(HOLD_TITLE, "", { signal: ctx.signal });
+    }
     const mode = runtimeMode();
     if (mode === "full-access") return;
     if ((event.toolName === "tool_search" ? hasBuiltinToolSearch() : READ_ONLY_TOOLS.has(event.toolName)) || isReadOnlyMcpTool(event.toolName)) {

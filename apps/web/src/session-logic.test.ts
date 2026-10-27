@@ -1338,6 +1338,117 @@ describe("work-log failure policy (#7999/#7893)", () => {
   });
 });
 
+describe("user shell commands in the v2 timeline", () => {
+  const timestamp = DateTime.makeUnsafe("2026-10-23T10:00:00.000Z");
+  const threadId = ThreadId.make("shell-thread");
+  const base = (id: string, ordinal: number) => ({
+    id: TurnItemId.make(id),
+    threadId,
+    runId: RunId.make("shell-run"),
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal,
+    status: "completed" as const,
+    title: null,
+    startedAt: timestamp,
+    completedAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const visible = (item: OrchestrationV2TurnItem, position: number) => ({
+    position,
+    visibility: "local" as const,
+    sourceThreadId: item.threadId,
+    sourceItemId: item.id,
+    item,
+  });
+  const message: OrchestrationV2TurnItem = {
+    ...base("shell-message-item", 0),
+    type: "user_message",
+    messageId: MessageId.make("shell-message"),
+    shellCommand: true,
+    text: "npm test",
+    attachments: [],
+    inputIntent: "turn_start",
+    createdBy: "user",
+    creationSource: "web",
+  };
+  const result: OrchestrationV2TurnItem = {
+    ...base("shell-result", 1),
+    type: "command_execution",
+    input: "npm test",
+    exitCode: 1,
+    userShellMessageId: MessageId.make("shell-message"),
+  };
+
+  it("shows the result inside its message instead of as agent work", () => {
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [visible(message, 0), visible(result, 1)],
+      optimisticMessages: [],
+    });
+    expect(entries.map((entry) => entry.kind)).toEqual(["message"]);
+    expect(entries[0]).toMatchObject({
+      message: { text: "npm test", shellCommand: true, shellCommandResult: result },
+    });
+  });
+
+  it("attaches a result that arrives after its message was already shown", () => {
+    const input = { visibleTurnItems: [visible(message, 0)], optimisticMessages: [] };
+    const previous = deriveTimelineEntriesFromVisibleTurnItemsWithState(input);
+    const next = deriveTimelineEntriesFromVisibleTurnItemsWithState(
+      { ...input, visibleTurnItems: [visible(message, 0), visible(result, 1)] },
+      previous,
+    );
+    expect(next.entries).toHaveLength(1);
+    expect(next.entries[0]).toMatchObject({ message: { shellCommandResult: result } });
+  });
+
+  it("keeps a command that was just sent out of the transcript until its result is delivered", () => {
+    const sentAt = "2026-10-23T10:00:01.000Z";
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [],
+      optimisticMessages: [
+        {
+          id: MessageId.make("optimistic-shell"),
+          role: "user",
+          text: "! npm test",
+          shellCommand: true,
+          runId: null,
+          streaming: false,
+          createdAt: sentAt,
+          updatedAt: sentAt,
+        },
+      ],
+    });
+    expect(entries).toEqual([]);
+  });
+
+  it("keeps a result visible when its message isn't loaded", () => {
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [visible(result, 1)],
+      optimisticMessages: [],
+    });
+    expect(entries.map((entry) => entry.kind)).toEqual(["work"]);
+  });
+
+  it("follows the result as it finishes while its message stays the same", () => {
+    const shownMessage = visible(message, 0);
+    const running = { ...result, status: "running" as const, exitCode: undefined };
+    const input = {
+      visibleTurnItems: [shownMessage, visible(running, 1)],
+      optimisticMessages: [],
+    };
+    const previous = deriveTimelineEntriesFromVisibleTurnItemsWithState(input);
+    const next = deriveTimelineEntriesFromVisibleTurnItemsWithState(
+      { ...input, visibleTurnItems: [shownMessage, visible(result, 1)] },
+      previous,
+    );
+    expect(next.entries[0]).toMatchObject({ message: { shellCommandResult: result } });
+  });
+});
+
 describe("incremental v2 timeline entries", () => {
   it("retains history and attachment previews through decoded streaming updates", () => {
     const fixture = makeStreamingTimelineFixture("Partial");
