@@ -4,7 +4,7 @@ import {
   scopedThreadKey,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import { PREVIEW_TAB_SHORTCUT_COMMANDS, type ScopedThreadRef } from "@t3tools/contracts";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useEffectEvent, useRef } from "react";
 
@@ -193,10 +193,12 @@ export function ReopenClosedViewShortcut() {
         isWeb: false,
       },
     };
-    // Guest browser processes miss app keydown listeners; desktop forwards the chords as menu actions.
+    // Guest browser processes miss app keydown listeners; desktop forwards the chords as menu
+    // actions, and zoom chords to the tab they were pressed in.
     const commands = [
       ...(hasHistory ? (["view.reopenClosed"] as const) : []),
       ...PREVIEW_FORWARDED_LAYOUT_COMMANDS,
+      ...PREVIEW_TAB_SHORTCUT_COMMANDS,
     ];
     void preview
       .setForwardedShortcuts(
