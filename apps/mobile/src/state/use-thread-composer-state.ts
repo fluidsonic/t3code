@@ -5,6 +5,7 @@ import {
   isRunningUserShellCommand,
   liveUserShellCommands,
   stopComposerShellCommands,
+  userShellCommandIsPending,
   userShellCommandOwnsWorkingSlot as deriveUserShellCommandOwnsWorkingSlot,
 } from "@t3tools/client-runtime/user-shell-command";
 import * as DateTime from "effect/DateTime";
@@ -585,18 +586,27 @@ export function useThreadComposerState() {
     }
     const threadKey = scopedThreadKey(thread.environmentId, thread.id);
     const texts = JSON.stringify(commands.map(shellCommandMessageText));
-    // A double tap must not run a code block twice. Read live: the outbox holds the first tap's
-    // send at once, and a tap held up by the first-run dialog runs after this render's is stale.
-    const alreadyQueued = (
-      appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom)[threadKey] ?? []
-    ).some(
-      (message) =>
-        message.shellCommand === true &&
-        JSON.stringify([
-          message.text,
-          ...(message.followingShellCommands ?? []).map((next) => next.text),
-        ]) === texts,
-    );
+    // Tapping Run again before the command's result reaches the agent sends nothing more. Read
+    // live: the outbox holds the first tap's send at once, and the thread then has it.
+    const projection = appAtomRegistry.get(
+      environmentThreadDetails.quietThreadAtom({
+        environmentId: thread.environmentId,
+        threadId: thread.id,
+      }),
+    )?.projection;
+    const alreadyQueued =
+      (
+        appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom)[threadKey] ?? []
+      ).some(
+        (message) =>
+          message.shellCommand === true &&
+          JSON.stringify([
+            message.text,
+            ...(message.followingShellCommands ?? []).map((next) => next.text),
+          ]) === texts,
+      ) ||
+      (projection !== undefined &&
+        commands.some((next) => userShellCommandIsPending(projection, next)));
     if (alreadyQueued) return null;
     const settings = getComposerDraftSnapshot(threadKey);
     const modelSelection = settings.modelSelection ?? thread.modelSelection;
