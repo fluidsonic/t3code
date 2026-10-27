@@ -51,7 +51,6 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
     >
       <span className="flex w-full min-w-0 items-center gap-2 text-2xs text-muted-foreground">
         <span className="shrink-0 font-medium text-warning">{fallbackLabel}</span>
-        {approval.appName ? <span className="min-w-0 truncate">{approval.appName}</span> : null}
         {approval.fullAccessOverride ? (
           <Popover>
             <PopoverTrigger openOnHover render={<InlineButton tone="muted" />}>
@@ -74,6 +73,14 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
       </span>
       <ComposerBanner.Scroll className="w-full">
         <span className="flex flex-col gap-1">
+          {approval.appName ? (
+            <span
+              aria-label="Approval explanation"
+              className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word"
+            >
+              {approval.appName}
+            </span>
+          ) : null}
           <Detail
             aria-label={detailAriaLabel}
             className={cn(
