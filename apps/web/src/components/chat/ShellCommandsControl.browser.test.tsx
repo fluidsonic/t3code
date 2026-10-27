@@ -161,10 +161,11 @@ function Harness(props: {
 it("shows commands until delivered, with their status and Stop", async () => {
   const threadId = ThreadId.make("thread:shell-panel-status");
   setup(threadId);
+  using _now = vi.spyOn(Date, "now").mockReturnValue(DateTime.toEpochMillis(now) + 12_000);
   await using screen = await render(<Harness threadId={threadId} />);
 
   const rows = screen.getByRole("listitem");
-  await expect.element(rows.nth(0)).toHaveTextContent("! npm testRunning…");
+  await expect.element(rows.nth(0)).toHaveTextContent("! npm testRunning for 12s");
   await expect.element(rows.nth(1)).toHaveTextContent("! npm run lintWaiting…");
   await expect
     .element(page.getByRole("button", { name: "Stop command", exact: true }).nth(1))
@@ -326,7 +327,9 @@ it("shows a command just sent as waiting, without a transcript entry, until the 
     },
   };
   await screen.rerender(<Harness threadId={threadId} optimisticMessages={[sent]} />);
-  await expect.element(screen.getByRole("listitem")).toHaveTextContent("! npm run buildRunning…");
+  await expect
+    .element(screen.getByRole("listitem"))
+    .toMatchTextContent("! npm run buildRunning for");
 });
 
 it("keeps announcing a command's result after it leaves for the transcript", async () => {
