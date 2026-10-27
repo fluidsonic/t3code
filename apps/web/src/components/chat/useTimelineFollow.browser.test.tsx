@@ -105,9 +105,8 @@ const workingTurn: TimelineEntry[] = [
 interface Thread {
   readonly entries: ReadonlyArray<TimelineEntry>;
   readonly runId: RunId;
-  /** Height of the composer, with the shell command panel above it. */
   readonly composerInset: number;
-  /** Whether the shell command panel shows above the composer. */
+  /** Whether the shell command panel shows at the end of the timeline. */
   readonly shellCommandPanel?: true;
   /** The server's visible user messages; a new run's first one is what a sent turn anchors to. */
   readonly serverUserMessages?: ReadonlyArray<{
@@ -141,12 +140,12 @@ function Timeline({ thread }: { thread: Thread }) {
     assistantMessageId: null,
   };
   const {
-    attachComposerOverlay,
     attachTimelineViewport,
     onTimelineAnchorReadyStable,
     onTimelineAnchorSizeChangedStable,
     timelineLiveFollowEnabled,
     onIsAtEndChangeStable,
+    onTimelineFooterGrowStable,
   } = useTimelineFollow({
     legendListRef: listRef,
     composerTimelineInset: thread.composerInset,
@@ -160,13 +159,11 @@ function Timeline({ thread }: { thread: Thread }) {
     timelineEntries: thread.entries,
     timelineAnchorMessageId: anchor.messageId,
     setTimelineAnchor: setAnchor,
+    shellCommandCount: thread.shellCommandPanel ? 1 : 0,
   });
   return (
     // Exposes the anchor a newly sent turn sets: it holds that turn's message near the top.
     <div data-anchor={anchor.messageId ?? ""} className="flex min-h-0 flex-1 flex-col">
-      <div ref={attachComposerOverlay} hidden>
-        {thread.shellCommandPanel ? <div data-shell-command-panel="true" /> : null}
-      </div>
       <MessagesTimeline
         isWorking
         listRef={listRef}
@@ -197,21 +194,23 @@ function Timeline({ thread }: { thread: Thread }) {
         onIsAtEndChange={onIsAtEndChangeStable}
         onViewportAttach={attachTimelineViewport}
         timelineEntries={[...thread.entries]}
+        footer={thread.shellCommandPanel ? <div className="h-20" /> : null}
+        onFooterGrow={onTimelineFooterGrowStable}
       />
     </div>
   );
 }
 
-it("keeps following the end when delivered commands leave the panel above the composer", async () => {
+it("keeps following the end when delivered commands leave the shell command panel", async () => {
   const container = document.createElement("div");
   container.style.cssText = "height: 600px; width: 900px; display: flex; flex-direction: column;";
-  // Two commands wait in the panel above the composer while the agent works.
+  // Two commands wait in the panel while the agent works.
   await using screen = await render(
     <Timeline
       thread={{
         entries: workingTurn,
         runId: WORKING_RUN,
-        composerInset: 200,
+        composerInset: 100,
         shellCommandPanel: true,
       }}
     />,
@@ -276,14 +275,14 @@ it("ends at the bottom after a sent command is delivered and the agent replies",
     screen.getByText("Running the tests now.").element().getBoundingClientRect().bottom;
   await vi.waitFor(() => expect(distanceFromEnd()).toBeLessThanOrEqual(1));
 
-  // Sent: the command's run starts and the command waits in the panel above the composer.
+  // Sent: the command's run starts and the command waits in the panel.
   await act(() =>
     screen.rerender(
       <Timeline
         thread={{
           entries: settled,
           runId: COMMANDS_RUN,
-          composerInset: 160,
+          composerInset: 100,
           serverUserMessages,
           shellCommandPanel: true,
         }}
