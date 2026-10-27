@@ -343,6 +343,8 @@ function ShellCommandMenu(props: {
   readonly command: string;
   readonly shellActions: CodeBlockShellActions;
   readonly label?: string;
+  /** The button that opens it, where a block's doesn't fit. */
+  readonly trigger?: React.ReactElement;
 }) {
   const { command, shellActions } = props;
   const [canCopyToTerminal, setCanCopyToTerminal] = useState(false);
@@ -363,12 +365,14 @@ function ShellCommandMenu(props: {
     >
       <MenuTrigger
         render={
-          <Button
-            type="button"
-            variant="ghost-muted"
-            size="icon-xs"
-            aria-label={props.label ?? "More command actions"}
-          />
+          props.trigger ?? (
+            <Button
+              type="button"
+              variant="ghost-muted"
+              size="icon-xs"
+              aria-label={props.label ?? "More command actions"}
+            />
+          )
         }
       >
         <EllipsisIcon className="size-3" />
@@ -399,9 +403,9 @@ function ShellCommandMenu(props: {
 }
 
 /**
- * An untagged block of `! cmd` lines, or a lone inline `` `! cmd` ``: each command on its own row
- * with its own actions, so one failing never runs the rest. `commands` are what the rows run,
- * without their `!`; Copy copies the block as written.
+ * An untagged block of `! cmd` lines: each command on its own row with its own actions, so one
+ * failing never runs the rest. `commands` are what the rows run, without their `!`; Copy copies
+ * the block as written.
  */
 export function ShellCommandsCodeBlock(props: {
   readonly code: string;
@@ -485,6 +489,66 @@ export function ShellCommandsCodeBlock(props: {
         ))}
       </div>
     </MarkdownCodeBlockFrame>
+  );
+}
+
+/**
+ * An inline `` `! cmd` `` in prose, with Run and the block's other actions. They stay on the line
+ * of the command's last word, so a wrapping command never leaves them alone on the next line.
+ */
+export function ShellCommandInline(props: {
+  readonly command: string;
+  readonly shellActions: CodeBlockShellActions;
+}) {
+  const { command, shellActions } = props;
+  const { runCommand } = shellActions;
+  const lastWordStart = command.lastIndexOf(" ") + 1;
+  return (
+    <span className="shell-command-inline font-mono">
+      <span className="shell-command-prefix">!</span>
+      <span className="shell-command-gap"> </span>
+      {command.slice(0, lastWordStart)}
+      <span className="whitespace-nowrap">
+        {command.slice(lastWordStart)}
+        <span
+          {...THREAD_FIND_IGNORE_PROPS}
+          className="shell-command-inline-actions"
+          role="toolbar"
+          aria-label="Command actions"
+        >
+          {runCommand === undefined ? null : (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    className="shell-command-inline-action"
+                    aria-label={`Run ${command}`}
+                    onClick={() => runCommand(command)}
+                  />
+                }
+              >
+                <PlayIcon />
+              </TooltipTrigger>
+              <TooltipPopup side="top">
+                Runs in the thread's workspace and sends the result to the agent
+              </TooltipPopup>
+            </Tooltip>
+          )}
+          <ShellCommandMenu
+            command={command}
+            shellActions={shellActions}
+            trigger={
+              <button
+                type="button"
+                className="shell-command-inline-action"
+                aria-label={`More actions for ${command}`}
+              />
+            }
+          />
+        </span>
+      </span>
+    </span>
   );
 }
 
