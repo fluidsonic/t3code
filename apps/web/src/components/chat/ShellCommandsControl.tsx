@@ -7,6 +7,7 @@ import {
   userShellCommandModeNote,
   userShellCommandOutcomeLine,
   userShellCommandPresentation,
+  userShellCommandRunningText,
   userShellCommandStatusText,
 } from "@t3tools/client-runtime/user-shell-command";
 import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
@@ -26,6 +27,7 @@ import { useEnvironmentScope } from "../../state/session";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { ChatMessage } from "../../types";
+import { tickTextContent } from "~/lib/tickTextContent";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
@@ -245,7 +247,16 @@ function ShellCommandRow(props: {
           <CircleCheckIcon aria-hidden className="size-3.5 text-success-foreground" />
         )}
       </StatusIconSlot>
-      <span>{userShellCommandStatusText(presentation)}</span>
+      {presentation.status === "running" ? (
+        <span
+          ref={tickTextContent(
+            (nowMs) => userShellCommandRunningText(item.startedAt, nowMs),
+            item.startedAt !== null,
+          )}
+        />
+      ) : (
+        <span>{userShellCommandStatusText(presentation)}</span>
+      )}
     </>
   );
 
