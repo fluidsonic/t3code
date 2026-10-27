@@ -541,6 +541,17 @@ describe("liveUserShellCommands", () => {
     });
     expect(userShellCommandPresentation(preparing[0]!).status).toBe("waiting");
 
+    // A starting run's message can arrive before its item; the command still shows.
+    const arriving = liveUserShellCommands({
+      thread: shellThread,
+      turnItems: [],
+      runs: [run("run-first", "starting", messageId)],
+      messages,
+    });
+    expect(arriving.map((command) => [command.id, command.awaitsWorkspace])).toEqual([
+      [userShellCommandItemId(messageId), undefined],
+    ]);
+
     // Once the workspace is ready the command's own item takes its place, under the same id.
     const started = item(userShellCommandItemId(messageId), 3, {
       status: "running",
