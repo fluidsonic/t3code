@@ -315,7 +315,11 @@ import {
   shouldShowThreadErrorBanner,
 } from "./chat/ThreadErrorBanner";
 import { QueuedRunsControl, type QueuedRunsControlHandle } from "./chat/QueuedRunsControl";
-import { ShellCommandsControl } from "./chat/ShellCommandsControl";
+import {
+  ShellCommandsAnnouncer,
+  ShellCommandsControl,
+  shellCommandRows,
+} from "./chat/ShellCommandsControl";
 import { useStoppedShellCommands } from "./chat/useStoppedShellCommands";
 import { shellCommandsUnavailableReason } from "./chat/useComposerShellMode";
 import { useThreadLinkedPullRequest } from "./pullRequest/useThreadLinkedPullRequest";
@@ -1555,7 +1559,7 @@ export default function ChatView(props: ChatViewProps) {
     ...timelineEntriesInput,
     visibleTurnItems: serverTimelineRows,
   });
-  // A command waits above the composer until its result reaches the agent.
+  // A command waits at the end of the timeline until its result reaches the agent.
   const draftTimelineEntries = optimisticUserMessages.flatMap((message) =>
     message.shellCommand === true
       ? []
@@ -2159,6 +2163,8 @@ export default function ChatView(props: ChatViewProps) {
     return result;
   };
 
+  const shellCommands = shellCommandRows(serverProjection, optimisticUserMessages);
+  const shellCommandCount = shellCommands.commands.length + shellCommands.sending.length;
   const {
     showScrollToBottom,
     timelineLiveFollowEnabled,
@@ -2186,6 +2192,7 @@ export default function ChatView(props: ChatViewProps) {
     timelineEntries,
     timelineAnchorMessageId,
     setTimelineAnchor,
+    shellCommandCount,
   });
 
   useFocusComposerOnThreadOpen(
@@ -3151,9 +3158,8 @@ export default function ChatView(props: ChatViewProps) {
     <>
       <ShellCommandsControl
         environmentId={activeThread.environmentId}
-        threadDetailRef={routeThreadDetailRef}
+        rows={shellCommands}
         composerDraftTarget={composerDraftTarget}
-        optimisticMessages={optimisticUserMessages}
         onStoppedRunningCommand={returnStoppedShellCommandStable}
       />
       {isServerThread ? (
@@ -3251,7 +3257,8 @@ export default function ChatView(props: ChatViewProps) {
     !hasThreadNow &&
     threadStatusLine === null &&
     pendingGuestMessageCount === 0 &&
-    !hasQueuedTurns ? null : (
+    !hasQueuedTurns &&
+    shellCommandCount === 0 ? null : (
       <>
         {pendingHandoff === null ? null : (
           <div className="chat-content-lane">
@@ -3278,7 +3285,7 @@ export default function ChatView(props: ChatViewProps) {
             onFileOpen={openFileAttachmentStable}
           />
         ) : null}
-        {hasQueuedTurns ? queuedRunsControl : null}
+        {hasQueuedTurns || shellCommandCount > 0 ? queuedRunsControl : null}
       </>
     );
 
@@ -3643,6 +3650,7 @@ export default function ChatView(props: ChatViewProps) {
               )}
             </div>
 
+            {activeThread ? <ShellCommandsAnnouncer commands={shellCommands.commands} /> : null}
             <div
               {...composerArea}
               ref={(overlay: HTMLDivElement | null) => {
