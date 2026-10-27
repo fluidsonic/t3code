@@ -1424,7 +1424,7 @@ export function deriveMessagesTimelineRows(input: {
   /** See `deriveUserShellCommandOwnsWorkingSlot`. */
   userShellCommandOwnsWorkingSlot?: boolean;
 }): MessagesTimelineRow[] {
-  // A `! cmd` working for the person shows above the composer, and no agent response is live.
+  // A `! cmd` working for the person shows in the footer, and no agent response is live.
   const isWorking = input.isWorking && input.userShellCommandOwnsWorkingSlot !== true;
   const timelineEntries = timelineRowEntries(input.timelineEntries);
   const isPendingApproval = (entry: WorkLogEntry) => {
