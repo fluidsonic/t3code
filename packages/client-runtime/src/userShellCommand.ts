@@ -216,6 +216,29 @@ export function liveUserShellCommands(projection: {
 }
 
 /**
+ * Whether `command` is already on its way in the thread: waiting, running or queued. A code block's
+ * Run clicked again meanwhile is a repeated click, not a second run.
+ */
+export function userShellCommandIsPending(
+  projection: Parameters<typeof liveUserShellCommands>[0],
+  command: string,
+): boolean {
+  return (
+    liveUserShellCommands(projection).some((item) => item.input === command) ||
+    projection.runs.some(
+      (run) =>
+        run.status === "queued" &&
+        projection.messages.some(
+          (message) =>
+            message.id === run.userMessageId &&
+            message.shellCommand === true &&
+            shellCommandFromMessageText(message.text) === command,
+        ),
+    )
+  );
+}
+
+/**
  * Whether a person's `! cmd` work is all the thread is doing, from send until its result reaches
  * the agent, with no agent turn running. The timeline then shows no working row for it. A command
  * steered into a running turn leaves the slot to the agent until the agent pauses for it.
@@ -406,24 +429,12 @@ export function shellCommandsFromUntaggedCodeBlock(code: string): ReadonlyArray<
   return command === null ? null : [command];
 }
 
-// One single-backtick span and nothing else; a paragraph can't hold a blank line.
-const INLINE_CODE_PARAGRAPH = /^ {0,3}`([^`]+)`[ \t]*$/;
-// A soft wrap with the next line's indentation and, inside a blockquote, its markers.
-const SOFT_WRAP = /[ \t]*(?:\r\n|\r|\n)[ \t>]*/g;
-
 /**
- * Agents sometimes give a command as a paragraph of one inline `! cmd` span. That paragraph
- * stands for an untagged `! cmd` block: this is the block's code, on one line as markdown renders
- * the span, and the command `userShellCommandFromCodeBlock` runs for it. Null for any other
- * paragraph. `paragraph` is the paragraph's markdown source.
+ * The command of an inline `` `! cmd` `` span in prose, or null. Only a `!` and a space make one,
+ * so code such as `!isReady`, `!=` or `!important` stays code. Whitespace runs in `code` count as
+ * one space, as markdown renders a soft-wrapped span.
  */
-export function shellCommandBlockFromInlineCodeParagraph(
-  paragraph: string,
-): { readonly code: string; readonly command: string } | null {
-  const span = INLINE_CODE_PARAGRAPH.exec(paragraph.replace(/\s+$/, ""))?.[1];
-  if (span === undefined) return null;
-  const code = span.replace(SOFT_WRAP, " ").trim();
-  if (!code.startsWith("!")) return null;
-  const command = userShellCommandFromCodeBlock(code, null);
-  return command === null ? null : { code, command };
+export function shellCommandFromInlineCode(code: string): string | null {
+  const text = code.replace(/\s+/g, " ").trim();
+  return text.startsWith("! ") ? userShellCommandFromCodeBlock(text, null) : null;
 }
