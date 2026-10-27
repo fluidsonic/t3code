@@ -229,6 +229,13 @@ function updateMainCheckout() {
 }
 
 function check() {
+  // A React Compiler bailout still builds but can crash the app (an unmemoized ChatView loops), and
+  // check-changed only runs this test when it sits beside a change.
+  const compiled = spawnSync("vp", ["test", "run", "src/reactCompilerCoverage.test.ts"], { cwd: join(REPO, "apps/web"), env, encoding: "utf8" });
+  if (compiled.status !== 0) {
+    process.stdout.write(compiled.stdout ?? "");
+    fail("the React Compiler skips a web file; see the reactCompilerCoverage test output above");
+  }
   const result = spawnSync("node", ["scripts/check-changed.ts", "upstream/main"], { cwd: REPO, env, encoding: "utf8" });
   process.stdout.write(result.stdout ?? "");
   process.stderr.write(result.stderr ?? "");
