@@ -10,6 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
+import { normalizeShellCommandMessageText } from "@t3tools/shared/shellCommand";
 
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
@@ -32,7 +33,10 @@ function queueEntry(
   const run = projection.runs.find((run) => run.id === runId && run.status === "queued");
   const message = projection.messages.find((message) => message.id === run?.userMessageId);
   if (run === undefined || message === undefined) return undefined;
-  const characters = Array.from(message.text);
+  // Read like the thread does: a person's shell command is its `!` line.
+  const characters = Array.from(
+    message.shellCommand === true ? normalizeShellCommandMessageText(message.text) : message.text,
+  );
   return {
     queuedRunId: run.id,
     text: characters.slice(0, limit).join(""),

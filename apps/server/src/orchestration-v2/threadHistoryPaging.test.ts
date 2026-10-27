@@ -440,6 +440,32 @@ describe("threadHistoryPaging", () => {
     expect(computeLatestLocalTurnOrdinal(full.turnItems)).toBe(40);
   });
 
+  it("keeps undelivered `! cmd` commands for the composer, outside the timeline window", () => {
+    const shell = (index: number, status: "running" | "interrupted") => ({
+      ...makeRow(index).item,
+      id: TurnItemId.make(`shell-${index}`),
+      status,
+      userShellMessageId: MessageId.make(`message-shell-${index}`),
+    });
+    const full = makeProjection(Array.from({ length: 10 }, (_, index) => makeRow(index)));
+    const running = shell(1, "running");
+    const bounded = buildBoundedThreadProjection({
+      projection: {
+        ...full,
+        thread: { ...full.thread, hasShellCommands: true },
+        turnItems: [running, shell(2, "interrupted"), ...full.turnItems],
+      },
+      snapshotSequence: 3,
+      policy: { maxItems: 2, maxEncodedBytes: 10_000_000 },
+    });
+    expect(bounded.projection.turnItems).toContainEqual(running);
+    expect(bounded.projection.turnItems.map((item) => String(item.id))).not.toContain("shell-2");
+    expect(bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId))).toEqual([
+      "item-8",
+      "item-9",
+    ]);
+  });
+
   it("carries a full-projection watermark when the bounded window is inherited-only", () => {
     const localOlder = makeRow(0);
     const localMid = makeRow(1);

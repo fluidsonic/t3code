@@ -83,25 +83,32 @@ export function appendPendingThreadMessages(
     }),
     ...queuedMessages
       .filter((message) => !deliveredIds.has(message.messageId))
-      .map((pendingMessage): PendingThreadFeedEntry => ({
-        type: "message",
-        id: pendingMessage.messageId,
-        createdAt: pendingMessage.createdAt,
-        pendingMessage,
-        message: {
-          id: pendingMessage.messageId,
-          role: "user",
-          text: pendingMessage.text,
-          attachments: [],
-          context: pendingMessage.context,
+      .flatMap((pendingMessage) =>
+        // A code block's Run all waits as one entry; each of its commands shows as sent.
+        [
+          { messageId: pendingMessage.messageId, text: pendingMessage.text },
+          ...(pendingMessage.followingShellCommands ?? []),
+        ].map((sent): PendingThreadFeedEntry => ({
+          type: "message",
+          id: sent.messageId,
           createdAt: pendingMessage.createdAt,
-          updatedAt: pendingMessage.createdAt,
-          runId: null,
-          streaming: false,
-          visibility: "local",
-          sourceThreadId: pendingMessage.threadId,
-        },
-      })),
+          pendingMessage,
+          message: {
+            id: sent.messageId,
+            role: "user",
+            text: sent.text,
+            ...(pendingMessage.shellCommand === true ? { shellCommand: true as const } : {}),
+            attachments: [],
+            context: pendingMessage.context,
+            createdAt: pendingMessage.createdAt,
+            updatedAt: pendingMessage.createdAt,
+            runId: null,
+            streaming: false,
+            visibility: "local",
+            sourceThreadId: pendingMessage.threadId,
+          },
+        })),
+      ),
   ];
 }
 

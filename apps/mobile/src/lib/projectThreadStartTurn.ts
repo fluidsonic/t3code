@@ -24,6 +24,8 @@ export interface ProjectThreadStartTurnSpec {
   readonly messageId: string;
   readonly createdAt: string;
   readonly text: string;
+  /** `text` is a shell command in its stored `! cmd` form. */
+  readonly shellCommand?: boolean;
   readonly titleText?: string;
   readonly context?: OrchestrationMessageContext;
   readonly uploadedAttachments: ReadonlyArray<UploadedMobileAttachment | ChatAttachment>;
@@ -51,6 +53,7 @@ export function buildProjectThreadStartTurnInput(spec: ProjectThreadStartTurnSpe
       messageId: MessageId.make(spec.messageId),
       role: "user" as const,
       text: spec.text,
+      ...(spec.shellCommand === true ? { shellCommand: true } : {}),
       ...(spec.context ? { context: spec.context } : {}),
       attachments: spec.uploadedAttachments,
     },
