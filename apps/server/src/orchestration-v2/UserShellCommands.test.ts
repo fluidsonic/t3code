@@ -805,7 +805,7 @@ describe("user shell commands", () => {
     ),
   );
 
-  it.effect("sends a failed command with the next message and holds the rest", () =>
+  it.effect("sends a failed command with the next message and skips the commands waiting", () =>
     scenario("failure", (input) =>
       Effect.gen(function* () {
         yield* send("build", "make build", { shellCommand: true });
@@ -816,12 +816,14 @@ describe("user shell commands", () => {
         const current = yield* projection;
         assert.equal(commandItem(current.turnItems, "build")?.status, "failed");
         assert.equal(runOf(current.runs, "why")?.status, "cancelled");
-        assert.equal(runOf(current.runs, "again")?.status, "queued");
-        assert.isTrue(runOf(current.runs, "again")?.queueHeld === true);
-        assert.isUndefined(commandItem(current.turnItems, "again"));
+        assert.equal(runOf(current.runs, "again")?.status, "cancelled");
+        const skipped = commandItem(current.turnItems, "again");
+        assert.isTrue(skipped?.type === "command_execution" && skipped.userShellSkipped === true);
+        assert.deepEqual(input.shellStarts, [itemFor("build")]);
         const text = input.started.at(-1)!.message.text;
         assert.include(text, "Exit code: 2");
         assert.include(text, "error: missing target");
+        assert.include(text, "did not run because an earlier one failed: ! make build");
         assert.isTrue(text.trimEnd().endsWith("why did it fail?"));
       }),
     ),
@@ -902,7 +904,7 @@ describe("user shell commands", () => {
         assert.equal(commandItem(current.turnItems, "two")?.status, "interrupted");
         assert.deepEqual(input.shellStops, [itemFor("two")]);
         assert.equal(runOf(current.runs, "next")?.status, "queued");
-        assert.isTrue(runOf(current.runs, "next")?.queueHeld === true);
+        assert.notEqual(runOf(current.runs, "next")?.queueHeld, true);
         const text = input.started.at(-1)!.message.text;
         assert.include(text, "echo one");
         assert.notInclude(text, "sleep 100");
@@ -913,27 +915,30 @@ describe("user shell commands", () => {
     ),
   );
 
-  it.effect("stopping the first command ends the run without an agent turn", () =>
-    scenario("stop-first", (input) =>
-      Effect.gen(function* () {
-        yield* send("slow", "sleep 100", { shellCommand: true });
-        yield* send("next", "anything else?", { mode: "queue_after_active" });
-        yield* drain;
-        yield* stopCommand("slow");
-        yield* drain;
-        const current = yield* projection;
-        assert.equal(runOf(current.runs, "slow")?.status, "interrupted");
-        assert.equal(runOf(current.runs, "next")?.status, "queued");
-        assert.isTrue(runOf(current.runs, "next")?.queueHeld === true);
-        assert.equal(input.started.length, 0);
-        // A late result from the killed process records its output but changes nothing else.
-        yield* finish("slow", 143, "partial\n");
-        const after = yield* projection;
-        assert.equal(commandItem(after.turnItems, "slow")?.status, "interrupted");
-        assert.equal(input.started.length, 0);
-        assert.deepEqual(transcript(after), []);
-      }),
-    ),
+  it.effect(
+    "stopping the first command ends its run without an agent turn; the queue goes on",
+    () =>
+      scenario("stop-first", (input) =>
+        Effect.gen(function* () {
+          yield* send("slow", "sleep 100", { shellCommand: true });
+          yield* send("next", "anything else?", { mode: "queue_after_active" });
+          yield* drain;
+          yield* stopCommand("slow");
+          yield* drain;
+          const current = yield* projection;
+          assert.equal(runOf(current.runs, "slow")?.status, "interrupted");
+          assert.deepEqual(
+            input.started.map((started) => started.message.text),
+            ["anything else?"],
+          );
+          // A late result from the killed process records its output but changes nothing else.
+          yield* finish("slow", 143, "partial\n");
+          const after = yield* projection;
+          assert.equal(commandItem(after.turnItems, "slow")?.status, "interrupted");
+          assert.equal(input.started.length, 1);
+          assert.deepEqual(transcript(after), ["next"]);
+        }),
+      ),
   );
 
   it.effect("thread Stop sends nothing, not even finished commands", () =>
@@ -1246,35 +1251,8 @@ describe("user shell commands", () => {
     ),
   );
 
-  it.effect("a failed steered command of a group skips the group's steers still waiting", () =>
-    scenario(
-      "pause-group",
-      (input) =>
-        Effect.gen(function* () {
-          yield* startAgentTurn(input, "work");
-          yield* send("a", "false", {
-            shellCommand: true,
-            deliveryIntent: "steer",
-            following: [["b", "echo b"]],
-          });
-          yield* drain;
-          assert.deepEqual(queuedSteers(yield* projection), ["a", "b"]);
-          yield* answerPause(yield* Queue.take(input.pauses), "paused");
-          yield* finish("a", 1, "");
-          yield* drain;
-          const current = yield* projection;
-          assert.equal(runOf(current.runs, "b")?.status, "cancelled");
-          assert.deepEqual(input.shellStarts, [itemFor("a")]);
-          assert.equal(input.released.length, 1);
-          assert.include(input.released[0]!, "did not run because an earlier one failed: ! echo b");
-          assert.deepEqual(transcript(current), ["work", "a", "a:result", "b", "b:result"]);
-        }),
-      { pause: true },
-    ),
-  );
-
   it.effect(
-    "a failed steered command sends its result and the waiting messages, not the rest",
+    "a failed steered command sends its result and the waiting messages, and skips the rest",
     () =>
       scenario(
         "pause-failure",
@@ -1293,10 +1271,17 @@ describe("user shell commands", () => {
             const text = input.released[0]!;
             assert.include(text, "Exit code: 2");
             assert.include(text, "why did it fail?");
-            assert.notInclude(text, "make test");
+            assert.include(text, "did not run because an earlier one failed: ! make test");
             const current = yield* projection;
-            assert.deepEqual(queuedSteers(current), ["b"]);
-            assert.isTrue(runOf(current.runs, "b")?.queueHeld === true);
+            assert.equal(runOf(current.runs, "b")?.status, "cancelled");
+            assert.deepEqual(transcript(current), [
+              "work",
+              "a",
+              "a:result",
+              "b",
+              "b:result",
+              "why",
+            ]);
             assert.equal(runOf(current.runs, "work")?.status, "running");
           }),
         { pause: true },
