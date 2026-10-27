@@ -276,8 +276,9 @@ commands on), are interrupted instead, and their next turn starts with the
 results. Until then, steered commands and messages wait at the
 front of the queue.
 
-Until the agent receives its result, a command waits or runs above the
-composer, where queued messages wait, with its status and output. It joins the
+Until the agent receives its result, a command waits or runs at the end of the
+thread, where queued messages wait (above the composer on mobile), with its
+status and output. It joins the
 conversation, with its result, once it reaches the agent. Stop it there to keep
 it from the agent: nothing of it is sent, and its output is discarded. A
 stopped command that had started running comes back into the composer if the
