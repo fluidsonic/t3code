@@ -20,6 +20,7 @@ import {
   AuthTerminalOperateScope,
   DEFAULT_MODEL,
   type EnvironmentId,
+  type MessageId,
   type ModelSelection,
   type PreviewAnnotationPayload,
   type ThreadId,
@@ -84,7 +85,7 @@ import {
   previewAnnotationContextReference,
 } from "../../lib/composerContextRecords";
 import { environmentServerConfigsAtom } from "../../state/server";
-import { threadEnvironment } from "../../state/threads";
+import { environmentThreadDetails, threadEnvironment } from "../../state/threads";
 import { runMobileComposerTransition } from "./draftHeroTransition";
 import { useClientSettingsHydrated, useEnvironmentSettings } from "../../hooks/useSettings";
 import { environmentPresentations } from "../../state/presentation";
@@ -97,6 +98,7 @@ import {
 import { usePlanFollowUpSend } from "./useProposedPlanSend";
 import { useMultipleModelSend } from "./useMultipleModelSend";
 import { type ComposerDispatchMode } from "@t3tools/client-runtime/state/composer-dispatch";
+import { userShellCommandIsPending } from "@t3tools/client-runtime/user-shell-command";
 import {
   awaitAttachmentUploads,
   getUploadedAttachments,
@@ -385,7 +387,8 @@ export function useComposerSend(input: ComposerSendInput) {
   const { sendInFlight: sendInFlightRef } = draftSendState(routeThreadKey);
   const composerSendGenerationRef = useRef(0);
   const environmentUnavailableSendToastSlotRef = useRef(0);
-  const shellCommandsInFlightRef = useRef(new Set<string>());
+  // The message ids of a Run's commands, until the thread's projection has them.
+  const shellCommandsInFlightRef = useRef(new Map<string, ReadonlyArray<MessageId>>());
   const shownThreadIdRef = useRef(activeThread?.id);
   // A send awaits uploads before it declines, so it reads the approvals pending by then.
   const pendingApprovalsRef = useRef(pendingApprovals);
@@ -1532,10 +1535,29 @@ export function useComposerSend(input: ComposerSendInput) {
       return;
     }
     const threadId = activeThread.id;
-    // A double click must not run the block twice; the first run's message is already on its way.
-    const inFlightKey = `${scopedThreadKey(scopeThreadRef(environmentId, threadId))}\n${JSON.stringify(commands)}`;
-    if (shellCommandsInFlightRef.current.has(inFlightKey)) return;
-    shellCommandsInFlightRef.current.add(inFlightKey);
+    // Clicking Run again before the command's result reaches the agent sends nothing more: until
+    // the projection has the first click's messages, by their ids; then, by the projection.
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    const inFlightKey = `${scopedThreadKey(threadRef)}\n${JSON.stringify(commands)}`;
+    const projection =
+      appAtomRegistry.get(environmentThreadDetails.quietThreadAtom(threadRef))?.projection ?? null;
+    const inFlight = shellCommandsInFlightRef.current.get(inFlightKey);
+    if (
+      (inFlight !== undefined &&
+        !inFlight.some((id) => projection?.messages.some((message) => message.id === id))) ||
+      (projection !== null &&
+        commands.some((command) => userShellCommandIsPending(projection, command)))
+    ) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "info",
+          title: commands.length === 1 ? "Already running" : "Already running some of these",
+          description: "It runs once; Run again after its result reaches the agent.",
+        }),
+      );
+      return;
+    }
+    shellCommandsInFlightRef.current.set(inFlightKey, []);
     const dispatchMode = sendQueuesBehindSetup
       ? "queue"
       : (composerRef.current?.defaultDispatchMode() ?? "auto");
@@ -1545,11 +1567,14 @@ export function useComposerSend(input: ComposerSendInput) {
       shellCommandsInFlightRef.current.delete(inFlightKey);
       return;
     }
+    // As after a send: left on the Run button, focus would run the command again on the next Space.
+    composerRef.current?.focusAtEnd();
     const sent = commands.map((text) => ({
       messageId: newMessageId(),
       text: shellCommandMessageText(text),
     }));
     const messageIds = new Set(sent.map((message) => message.messageId));
+    shellCommandsInFlightRef.current.set(inFlightKey, [...messageIds]);
     const createdAt = new Date().toISOString();
     // Optimistic copies belong to the thread on screen.
     if (shownThreadIdRef.current === threadId) {
@@ -1593,8 +1618,8 @@ export function useComposerSend(input: ComposerSendInput) {
         createdAt,
       },
     });
-    shellCommandsInFlightRef.current.delete(inFlightKey);
     if (result._tag === "Success") return;
+    shellCommandsInFlightRef.current.delete(inFlightKey);
     setOptimisticUserMessages((existing) =>
       existing.filter((message) => !messageIds.has(message.id)),
     );

@@ -64,7 +64,7 @@ import {
 } from "@t3tools/client-runtime/markdown-images";
 import { mediaUrlReference } from "@t3tools/client-runtime/media-reference";
 import {
-  shellCommandBlockFromInlineCodeParagraph,
+  shellCommandFromInlineCode,
   shellCommandsFromUntaggedCodeBlock,
 } from "@t3tools/client-runtime/user-shell-command";
 import { mediaKindFromPath, mediaMimeTypeFromExtension } from "@t3tools/shared/mediaPreview";
@@ -192,6 +192,7 @@ import { resolveLinkTarget } from "../browser/browserLinkTarget";
 import { PullRequestLinkPreview } from "./pullRequest/PullRequestLinkPreview";
 import {
   MarkdownCodeBlock,
+  ShellCommandInline,
   ShellCommandsCodeBlock,
   SuspenseShikiCodeBlock,
 } from "./chat/MarkdownCodeBlock";
@@ -987,14 +988,6 @@ function HighlightedMarkdownCode({
   );
 }
 
-/** Whether a paragraph is one inline code span, which may be a `! cmd`; checked before the source. */
-function isInlineCodeParagraph(node: ReactMarkdownExtraProps["node"]): boolean {
-  const only = node?.children.length === 1 ? node.children[0] : undefined;
-  return (
-    only?.type === "element" && only.tagName === "code" && only.properties.dataInlineCode != null
-  );
-}
-
 const CHAT_MARKDOWN_COMPONENTS = {
   h1: markdownHeadingRenderer(1),
   h2: markdownHeadingRenderer(2),
@@ -1012,33 +1005,8 @@ const CHAT_MARKDOWN_COMPONENTS = {
     }
     return <div {...props}>{children}</div>;
   },
-  p: function MarkdownParagraph({ node, children, ...props }) {
-    const { skills, threadRef, codeBlockShellActions, isStreaming, resolvedTheme } = use(
-      ChatMarkdownRendererContext,
-    );
-    // Agents sometimes give a command as a paragraph of one inline `! cmd` span. Where code
-    // blocks offer commands, it renders as the untagged block it stands for, so it can run. Only
-    // such a paragraph reads the source; its soft wraps are gone from the rendered text.
-    if (
-      codeBlockShellActions?.runCommand !== undefined &&
-      !isStreaming &&
-      isInlineCodeParagraph(node)
-    ) {
-      const text = use(ChatMarkdownTextContext);
-      const commandBlock = shellCommandBlockFromInlineCodeParagraph(
-        text.slice(node?.position?.start.offset ?? 0, node?.position?.end.offset ?? 0),
-      );
-      if (commandBlock !== null) {
-        return (
-          <ShellCommandsCodeBlock
-            code={commandBlock.code}
-            commands={[commandBlock.command]}
-            theme={resolvedTheme}
-            shellActions={codeBlockShellActions}
-          />
-        );
-      }
-    }
+  p: function MarkdownParagraph({ node: _node, children, ...props }) {
+    const { skills, threadRef } = use(ChatMarkdownRendererContext);
     return <p {...props}>{renderSkillInlineMarkdownChildren(children, skills, threadRef)}</p>;
   },
   blockquote: function MarkdownBlockquote({ node: _node, children, ...props }) {
@@ -1386,8 +1354,17 @@ const CHAT_MARKDOWN_COMPONENTS = {
     );
   },
   code: function MarkdownCode({ node, children, className, ...props }) {
-    const { cwd, imageBaseDir, inlineCodeFileLinkMetaByText, fileLinkChip, mathEnabled, inline } =
-      use(ChatMarkdownRendererContext);
+    const {
+      cwd,
+      imageBaseDir,
+      inlineCodeFileLinkMetaByText,
+      fileLinkChip,
+      mathEnabled,
+      inline,
+      codeBlockShellActions,
+      isStreaming,
+    } = use(ChatMarkdownRendererContext);
+    const inLink = use(MarkdownLinkContext);
     const math = mathEnabled ? mathKind(className) : null;
     if (math) {
       return (
@@ -1400,6 +1377,14 @@ const CHAT_MARKDOWN_COMPONENTS = {
     }
     if (node?.properties?.dataInlineCode != null) {
       const codeText = nodeToPlainText(children);
+      // A link's text can't hold buttons of its own.
+      const command =
+        codeBlockShellActions?.runCommand !== undefined && !isStreaming && !inLink
+          ? shellCommandFromInlineCode(codeText)
+          : null;
+      if (command !== null && codeBlockShellActions !== undefined) {
+        return <ShellCommandInline command={command} shellActions={codeBlockShellActions} />;
+      }
       const fileLinkMeta =
         inlineCodeFileLinkMetaByText.get(codeText.trim()) ??
         resolveInlineCodeFileLinkMeta(codeText, cwd, imageBaseDir ?? cwd);
