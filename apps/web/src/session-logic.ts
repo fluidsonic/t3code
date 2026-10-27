@@ -783,7 +783,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
   }
 
   for (const message of input.optimisticMessages) {
-    // A queued message waits in the queue and a `! cmd` above the composer, not in the transcript.
+    // A queued message and a `! cmd` wait at the end of the timeline, not in the transcript.
     if (
       message.inputIntent !== "queued_turn" &&
       message.shellCommand !== true &&
