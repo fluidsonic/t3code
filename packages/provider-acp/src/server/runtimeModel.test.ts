@@ -432,6 +432,25 @@ describe("AcpRuntimeModel", () => {
     });
   });
 
+  it("explains a command permission with the agent's description, not its title", () => {
+    const request = parsePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "tool-1",
+        title: "Execute `rm -rf ~/probe`",
+        kind: "execute",
+        status: "pending",
+        rawInput: { command: "rm -rf ~/probe", description: "Remove the probe directory" },
+      },
+    });
+
+    expect(request).toMatchObject({
+      detail: "rm -rf ~/probe",
+      title: "Remove the probe directory",
+    });
+  });
+
   it("bounds an oversized cumulative tool_call_update content buffer to a tail window", () => {
     const hugeText = Array.from({ length: 2_000 }, (_, i) => `line ${i}: ${"x".repeat(50)}`).join(
       "\n",
