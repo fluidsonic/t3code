@@ -16,7 +16,9 @@ node fork-sync.ts serve      # serve feed/ on 127.0.0.1:47825 (the LaunchAgent r
 
 Each sync builds a newer `<version>-marc.<UTC minute>` and publishes it to `feed/`. The app checks that
 feed every few minutes and offers to restart into the update, like the official app does. When the app
-isn't running, the sync installs the build directly. Load the feed server once:
+isn't running, the sync installs the build directly. Each build also gets a `fluidsonic/t3code` GitHub
+release listing the upstream commits and changed fork topics since the previous release; the app shows
+them as the update's release notes. Load the feed server once:
 
 ```sh
 cp com.fluidsonic.t3marc.updates.plist ~/Library/LaunchAgents/

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Rebuilds `fluidsonic/main` from upstream main plus every `fork/<order>-<name>` branch on origin,
-// then builds "T3 Code (Marc).app" and publishes it to a local update feed the app updates from.
+// then builds "T3 Code (Marc).app", publishes it to a local update feed the app updates from, and
+// releases it on the fork with upstream and fork changes as notes.
 //
 //   node fork-sync.ts              sync, check, push, build, publish to the feed
 //   node fork-sync.ts --dry-run    sync and check only; push and build nothing
@@ -189,7 +190,11 @@ function sync() {
     else if (entry.newTip !== entry.oldTip) report.push(`update ${entry.branch}`);
   }
   report.push(`${INTEGRATION} = upstream ${upstreamMain.slice(0, 10)} + ${entries.filter((e) => !e.dropped).length} branches`);
-  if (dryRun) return;
+  const notes = releaseNotes(entries);
+  if (dryRun) {
+    console.log(`\nrelease notes:\n${notes}`);
+    return;
+  }
 
   pushed = true;
   for (const entry of entries) {
@@ -199,10 +204,62 @@ function sync() {
   }
   git("push", "--quiet", "--force", "origin", INTEGRATION);
 
-  publish(build());
+  const { version } = publish(build(), notes);
+  const release = exec("gh", [
+    "release", "create", `v${version}`, "-R", FORK_REPO, "--target", git("rev-parse", INTEGRATION),
+    "--title", `${PRODUCT_NAME} ${version}`, "--notes", notes,
+  ]);
+  report.push(release.ok ? `released v${version} on ${FORK_REPO}` : `couldn't create the v${version} release: ${release.err}`);
   if (isRunning(APP_ID)) report.push(`${PRODUCT_NAME} offers the update to restart into within a few minutes`);
   else copyApp(newestFeedZip());
 }
+
+/** The upstream commit a build starts from and the merge commit of each topic in it. */
+function buildParts(build: string) {
+  const base = git("rev-list", "--first-parent", "--invert-grep", "--grep=^fork: merge fork/", "-n1", build);
+  const merges = new Map(
+    lines(git("log", "--first-parent", "--format=%H %s", `${base}..${build}`)).map(
+      (line) => [line.slice(41).replace("fork: merge ", ""), line.slice(0, 40)] as const,
+    ),
+  );
+  return { base, merges };
+}
+
+/**
+ * Upstream commits since the last release, then the topic commits that are new or changed (by
+ * patch-id, so rebases don't count). The updater lists the last lines first, so fork changes lead.
+ */
+function releaseNotes(entries: Entry[]): string {
+  const latest = exec("gh", ["release", "view", "-R", FORK_REPO, "--json", "tagName", "-q", ".tagName"]);
+  if (latest.ok) git("fetch", "--quiet", "origin", "tag", latest.out);
+  // Before the first release, compare with the last pushed build.
+  const before = buildParts(latest.ok ? `${latest.out}^{commit}` : `origin/${INTEGRATION}`);
+  const after = buildParts(INTEGRATION);
+  const upstream = lines(git("log", "--reverse", "--first-parent", "--format=- %s", `${before.base}..${after.base}`));
+  const fork: string[] = [];
+  for (const [branch, merge] of after.merges) {
+    const old = before.merges.get(branch);
+    const subjects = old
+      ? lines(git("cherry", "-v", `${old}^2`, `${merge}^2`, `${merge}^1`)).filter((line) => line.startsWith("+")).map((line) => line.slice(43))
+      : lines(git("log", "--reverse", "--no-merges", "--format=%s", `${merge}^1..${merge}^2`));
+    for (const subject of subjects) fork.push(`- ${branch}${old ? "" : " (new)"}: ${subject}`);
+  }
+  for (const branch of before.merges.keys())
+    if (!after.merges.has(branch))
+      fork.push(`- ${branch} dropped: ${entries.find((entry) => entry.branch === branch)?.dropped ?? "branch deleted"}`);
+  return [
+    ...(upstream.length === 0
+      ? ["## Upstream", "- No new commits"]
+      : [`## Upstream (${upstream.length})`, ...upstream, "", `Compare: https://github.com/${UPSTREAM_REPO}/compare/${before.base.slice(0, 12)}...${after.base.slice(0, 12)}`]),
+    "",
+    "## Fork",
+    ...(fork.length === 0 ? ["- No topic changes"] : fork),
+  ]
+    .join("\n")
+    .replace(/(^|[\s(])@([\w-]+(?:\/[\w.-]+)?)/g, "$1`@$2`"); // a bare @name in a release notifies that user
+}
+
+const lines = (output: string) => output.split("\n").filter(Boolean);
 
 function stripNotes(branch: string, base: string) {
   for (;;) {
@@ -262,7 +319,8 @@ function build(): { app: string; version: string } {
   const result = spawnSync("node", ["scripts/build-desktop-artifact.ts", "--platform", "mac", "--target", "zip"], {
     cwd: REPO,
     stdio: "inherit",
-    env: { ...env, T3CODE_DESKTOP_APP_ID: APP_ID, T3CODE_DESKTOP_PRODUCT_NAME: PRODUCT_NAME, T3CODE_DESKTOP_VERSION: version },
+    // The update repository points the app's release-notes links at this fork's releases.
+    env: { ...env, T3CODE_DESKTOP_APP_ID: APP_ID, T3CODE_DESKTOP_PRODUCT_NAME: PRODUCT_NAME, T3CODE_DESKTOP_VERSION: version, T3CODE_DESKTOP_UPDATE_REPOSITORY: FORK_REPO },
   });
   if (result.status !== 0) fail("desktop build failed");
   // The build keeps only the zip; unpack it to add the feed and sign.
@@ -310,7 +368,7 @@ function signingIdentity(): string {
 }
 
 /** Zips the app into the feed and points latest-mac.yml at it, keeping the previous build. */
-function publish({ app, version }: { app: string; version: string }) {
+function publish({ app, version }: { app: string; version: string }, notes: string) {
   mkdirSync(FEED_DIR, { recursive: true });
   const zipName = `T3-Code-Marc-${version}-${process.arch}.zip`;
   const zip = join(FEED_DIR, zipName);
@@ -319,10 +377,12 @@ function publish({ app, version }: { app: string; version: string }) {
   const size = statSync(zip).size;
   writeFileSync(
     join(FEED_DIR, "latest-mac.yml"),
-    `version: ${version}\nfiles:\n  - url: ${zipName}\n    sha512: ${sha512}\n    size: ${size}\npath: ${zipName}\nsha512: ${sha512}\nreleaseDate: '${new Date().toISOString()}'\n`,
+    // A JSON string is a valid YAML scalar.
+    `version: ${version}\nfiles:\n  - url: ${zipName}\n    sha512: ${sha512}\n    size: ${size}\npath: ${zipName}\nsha512: ${sha512}\nreleaseDate: '${new Date().toISOString()}'\nreleaseNotes: ${JSON.stringify(notes)}\n`,
   );
   for (const old of feedZips().slice(2)) rmSync(join(FEED_DIR, old));
   report.push(`published ${version} to ${zip}`);
+  return { version };
 }
 
 const feedZips = () =>
