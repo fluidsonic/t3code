@@ -2,7 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   codeBlockRunnableCommand,
-  markdownMayHaveShellCodeBlock,
+  linkInlineShellCommands,
+  markdownMayHaveShellCommand,
+  shellCommandFromLink,
   splitShellCommandMarkdown,
 } from "./threadShellCommandPresentation";
 
@@ -37,17 +39,17 @@ describe("code block commands", () => {
     expect(command("npm test\n", "> ```bash\n> npm test\n> ```")).toBe("npm test");
   });
 
-  it("arms block taps only on markdown that may hold a runnable fence", () => {
-    expect(markdownMayHaveShellCodeBlock("Try:\n\n```\n! npm test\n```")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("~~~\n\n  !ls\n~~~")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("```\n# clean\n! pnpm build\n```")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("> ```\n> ! npm i\n> ```")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("```bash\nnpm test\n```")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("  ~~~ Zsh\nls\n~~~")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("```fish\n! npm test\n```")).toBe(false);
-    expect(markdownMayHaveShellCodeBlock("```ts\nconst x = 1;\n```\nDone!")).toBe(false);
-    expect(markdownMayHaveShellCodeBlock("Push:\n\n`! git push`")).toBe(true);
-    expect(markdownMayHaveShellCodeBlock("Run `! git push` now.")).toBe(false);
+  it("arms taps only on markdown that may hold a command", () => {
+    expect(markdownMayHaveShellCommand("Try:\n\n```\n! npm test\n```")).toBe(true);
+    expect(markdownMayHaveShellCommand("~~~\n\n  !ls\n~~~")).toBe(true);
+    expect(markdownMayHaveShellCommand("```\n# clean\n! pnpm build\n```")).toBe(true);
+    expect(markdownMayHaveShellCommand("> ```\n> ! npm i\n> ```")).toBe(true);
+    expect(markdownMayHaveShellCommand("```bash\nnpm test\n```")).toBe(true);
+    expect(markdownMayHaveShellCommand("  ~~~ Zsh\nls\n~~~")).toBe(true);
+    expect(markdownMayHaveShellCommand("```fish\n! npm test\n```")).toBe(false);
+    expect(markdownMayHaveShellCommand("```ts\nconst x = 1;\n```\nDone!")).toBe(false);
+    expect(markdownMayHaveShellCommand("Run `! git push` now.")).toBe(true);
+    expect(markdownMayHaveShellCommand("Unless `!isReady`, wait.")).toBe(false);
   });
 
   it("takes a block of `! cmd` lines out as one command block, a command per line", () => {
@@ -79,37 +81,24 @@ describe("code block commands", () => {
     }
   });
 
-  it("takes a paragraph of one inline `! cmd` span out as the command block it stands for", () => {
+  it("links inline `! cmd` spans outside code blocks to their command", () => {
     expect(
-      splitShellCommandMarkdown(
-        "Push it:\n\n`! git -C /repo push origin\n  a:production b:staging`\n\nDone.",
+      linkInlineShellCommands(
+        "Run `! npm test`, then `! git push origin (main)`, unless `!isReady`.\n\n```\n`! npm test`\n```",
       ),
-    ).toEqual([
-      { kind: "markdown", markdown: "Push it:\n" },
-      {
-        kind: "commands",
-        code: "! git -C /repo push origin a:production b:staging",
-        commands: ["git -C /repo push origin a:production b:staging"],
-      },
-      { kind: "markdown", markdown: "\nDone." },
-    ]);
-    for (const markdown of [
-      "Run:\n`! npm test`",
-      "`! npm test` now",
-      "`npm test`",
-      "- `! npm test`",
-      "> `! npm test`",
-      "```\n`! npm test`\n```",
-      "~~~\n```\n\n`! npm test`\n~~~",
-    ]) {
-      expect(splitShellCommandMarkdown(markdown)).toEqual([{ kind: "markdown", markdown }]);
+    ).toBe(
+      "Run [`! npm test`](t3-shell-command://v1/npm%20test), then [`! git push origin (main)`](t3-shell-command://v1/git%20push%20origin%20%28main%29), unless `!isReady`.\n\n```\n`! npm test`\n```",
+    );
+    expect(shellCommandFromLink("t3-shell-command://v1/git%20push%20origin%20%28main%29")).toBe(
+      "git push origin (main)",
+    );
+    expect(shellCommandFromLink("https://example.com")).toBeNull();
+    for (const unchanged of ["[`! npm test`](https://x.dev)", "``! npm test``", "\\`! npm test`"]) {
+      expect(linkInlineShellCommands(unchanged)).toBe(unchanged);
     }
-    const tapped = codeBlockRunnableCommand({
-      code: "! npm test\n",
-      language: "",
-      streaming: false,
-      markdown: "`! npm test`",
-    });
-    expect(tapped).toBe("npm test");
+    // A lone inline command stays in its paragraph rather than becoming a block.
+    expect(splitShellCommandMarkdown("Push it:\n\n`! git push`")).toEqual([
+      { kind: "markdown", markdown: "Push it:\n\n`! git push`" },
+    ]);
   });
 });
