@@ -10,12 +10,16 @@ import {
   EventId,
   GuestMessageId,
   MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2Command,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2TurnItem,
   type UserInputAttachments,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -32,8 +36,10 @@ import {
   OrchestratorCommandPreviouslyRejectedError,
   OrchestratorDispatchError,
 } from "./Orchestrator.ts";
+import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
-import { dispatchCommand } from "./ThreadMessageIntake.ts";
+import { dispatchCommand, launchThread } from "./ThreadMessageIntake.ts";
+import { userShellCommandItemId } from "@t3tools/shared/shellCommand";
 
 const layerIntakeTest = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-question-intake-",
@@ -424,5 +430,208 @@ it.effect("sends a guest message with the guest's files, never ones the client n
     expect(command.attachments).toHaveLength(1);
     // The guest's file, which is already the thread's.
     expect(command.attachments).toEqual([guestFile]);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+const layerAcceptingDispatch = (
+  captured: OrchestrationV2ServerCommand[],
+  receipts: ReadonlySet<string> = new Set(),
+  ranCommands: ReadonlyArray<OrchestrationV2TurnItem> = [],
+) =>
+  Layer.mock(ThreadManagementService.ThreadManagementService)({
+    hasReceipt: (commandId) => Effect.succeed(receipts.has(commandId)),
+    getTurnItem: ({ itemId }) =>
+      Effect.succeed({ item: ranCommands.find((item) => item.id === itemId) ?? null }),
+    dispatch: (command) => {
+      captured.push(command);
+      return Effect.succeed({ sequence: 1, storedEvents: [] });
+    },
+  });
+
+const shellSend = (id: string, shellCommand = true): OrchestrationV2Command => ({
+  type: "message.dispatch",
+  commandId: CommandId.make(`shell-${id}`),
+  threadId: ThreadId.make("thread-shell"),
+  messageId: MessageId.make(`message-${id}`),
+  text: "npm test",
+  shellCommand,
+  attachments: [],
+  dispatchMode: { type: "start_immediately" },
+  createdBy: "user",
+  creationSource: "web",
+});
+
+const shellsOn = ServerSettings.layerTest({ enableShellCommands: true });
+
+it.effect("refuses new shell commands while the environment has them turned off", () =>
+  Effect.gen(function* () {
+    const captured: OrchestrationV2ServerCommand[] = [];
+    const refused = yield* dispatchCommand(shellSend("off")).pipe(
+      Effect.provide(layerAcceptingDispatch(captured)),
+      Effect.flip,
+    );
+    expect(refused._tag).toBe("ShellCommandsDisabledError");
+    expect(refused.message).toContain("Turn on Shell commands in Settings");
+    const editRefused = yield* dispatchCommand({
+      type: "queued-run.edit",
+      commandId: CommandId.make("edit-shell"),
+      threadId: ThreadId.make("thread-shell"),
+      runId: RunId.make("run-queued"),
+      text: "npm run lint",
+      shellCommand: true,
+    }).pipe(Effect.provide(layerAcceptingDispatch(captured)), Effect.flip);
+    expect(editRefused._tag).toBe("ShellCommandsDisabledError");
+    expect(captured).toHaveLength(0);
+
+    // A plain message, and a stop for a command already running, are not shell sends.
+    yield* dispatchCommand(shellSend("plain", false)).pipe(
+      Effect.provide(layerAcceptingDispatch(captured)),
+    );
+    yield* dispatchCommand({
+      type: "user-shell-command.stop",
+      commandId: CommandId.make("stop-shell"),
+      threadId: ThreadId.make("thread-shell"),
+      turnItemId: TurnItemId.make("turn-item:user-shell:message-running"),
+    }).pipe(Effect.provide(layerAcceptingDispatch(captured)));
+    expect(captured.map((command) => command.type)).toEqual([
+      "message.dispatch",
+      "user-shell-command.stop",
+    ]);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("accepts shell commands once the environment turns them on", () =>
+  Effect.gen(function* () {
+    const captured: OrchestrationV2ServerCommand[] = [];
+    yield* dispatchCommand(shellSend("on")).pipe(
+      Effect.provide(Layer.mergeAll(layerAcceptingDispatch(captured), shellsOn)),
+    );
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toMatchObject({ type: "message.dispatch", shellCommand: true });
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("replays an accepted shell command after the setting is turned off", () =>
+  Effect.gen(function* () {
+    const captured: OrchestrationV2ServerCommand[] = [];
+    yield* dispatchCommand(shellSend("retry")).pipe(
+      Effect.provide(layerAcceptingDispatch(captured, new Set(["shell-retry"]))),
+    );
+    expect(captured).toHaveLength(1);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("refuses a client resend of a command that already ran", () =>
+  Effect.gen(function* () {
+    const captured: OrchestrationV2ServerCommand[] = [];
+    const ran: OrchestrationV2TurnItem = {
+      id: userShellCommandItemId(MessageId.make("message-ran")),
+      threadId: ThreadId.make("thread-shell"),
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "completed",
+      title: null,
+      startedAt: NOW,
+      completedAt: NOW,
+      updatedAt: NOW,
+      type: "command_execution",
+      input: "npm test",
+      userShellMessageId: MessageId.make("message-ran"),
+    };
+    const refused = yield* dispatchCommand(shellSend("ran")).pipe(
+      Effect.provide(Layer.mergeAll(layerAcceptingDispatch(captured, new Set(), [ran]), shellsOn)),
+      Effect.flip,
+    );
+    expect(refused._tag).toBe("OrchestratorDispatchError");
+    expect(captured).toHaveLength(0);
+    // A retry of the send that ran it replays its receipt.
+    yield* dispatchCommand(shellSend("ran")).pipe(
+      Effect.provide(
+        Layer.mergeAll(layerAcceptingDispatch(captured, new Set(["shell-ran"]), [ran]), shellsOn),
+      ),
+    );
+    expect(captured).toHaveLength(1);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("refuses to launch a thread with a shell command while they are off", () =>
+  Effect.gen(function* () {
+    const launched: ThreadLaunchService.ThreadLaunchInput[] = [];
+    const layerLaunch = Layer.mergeAll(
+      layerAcceptingDispatch([]),
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+        launch: (input) => {
+          launched.push(input);
+          return Effect.die("launch result is not read here");
+        },
+      }),
+    );
+    const input: ThreadLaunchService.ThreadLaunchInput = {
+      commandId: CommandId.make("launch-shell"),
+      projectId: ProjectId.make("project-shell"),
+      title: "npm test",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root" },
+      initialMessage: { text: "npm test", shellCommand: true, attachments: [] },
+      createdBy: "user",
+      creationSource: "web",
+    };
+    const refused = yield* launchThread(input).pipe(Effect.provide(layerLaunch), Effect.flip);
+    expect(refused._tag).toBe("ShellCommandsDisabledError");
+    expect(launched).toHaveLength(0);
+
+    yield* launchThread(input).pipe(
+      Effect.provide(Layer.mergeAll(layerLaunch, shellsOn)),
+      Effect.exit,
+    );
+    expect(launched).toHaveLength(1);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("a launch retry passes the setting only once its shell command was accepted", () =>
+  Effect.gen(function* () {
+    const launched: ThreadLaunchService.ThreadLaunchInput[] = [];
+    const layerLaunch = (receipts: ReadonlySet<string>) =>
+      Layer.mergeAll(
+        layerAcceptingDispatch([], receipts),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          launch: (input) => {
+            launched.push(input);
+            return Effect.die("launch result is not read here");
+          },
+        }),
+      );
+    const input: ThreadLaunchService.ThreadLaunchInput = {
+      commandId: CommandId.make("launch-retry"),
+      projectId: ProjectId.make("project-shell"),
+      title: "npm test",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root" },
+      initialMessage: { text: "npm test", shellCommand: true, attachments: [] },
+      createdBy: "user",
+      creationSource: "web",
+    };
+    // The thread was created, but its command never was.
+    const refused = yield* launchThread(input).pipe(
+      Effect.provide(layerLaunch(new Set(["launch-retry"]))),
+      Effect.flip,
+    );
+    expect(refused._tag).toBe("ShellCommandsDisabledError");
+    expect(launched).toHaveLength(0);
+
+    yield* launchThread(input).pipe(
+      Effect.provide(layerLaunch(new Set(["launch-retry", "launch-retry:initial-message"]))),
+      Effect.exit,
+    );
+    expect(launched).toHaveLength(1);
   }).pipe(Effect.provide(layerIntakeTest)),
 );
