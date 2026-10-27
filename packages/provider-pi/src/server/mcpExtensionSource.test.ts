@@ -6,7 +6,7 @@ import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { assert, describe, it } from "@effect/vitest";
 
-import { PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
+import { PI_T3_HOLD_TITLE, PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 
 type RequestHook = (
@@ -260,6 +260,36 @@ describe("Pi MCP tool schemas", () => {
     const bridge = await loadMcpBridge({ inputSchema });
     for (const tool of bridge.tools) {
       assert.deepEqual(tool.parameters, inputSchema);
+    }
+  });
+});
+
+describe("Pi hold for steered shell commands", () => {
+  it("waits in the hold dialog before a tool call while the hold file exists, in any mode", async () => {
+    const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pi-hold-"));
+    const holdFile = NodePath.join(dir, "hold");
+    try {
+      const bridge = await loadMcpBridge({ runtimeMode: "full-access", holdFile });
+      const hook = bridge.handlers.get("tool_call") as unknown as (
+        event: { toolName: string; input: unknown },
+        ctx: { ui: { confirm: (title: string) => Promise<boolean> } },
+      ) => Promise<{ block: true; reason: string } | undefined>;
+      const confirmations: string[] = [];
+      const ctx = {
+        ui: {
+          confirm: async (title: string) => {
+            confirmations.push(title);
+            return true;
+          },
+        },
+      };
+      assert.isUndefined(await hook({ toolName: "bash", input: {} }, ctx));
+      assert.deepEqual(confirmations, []);
+      await NodeFSP.writeFile(holdFile, "");
+      assert.isUndefined(await hook({ toolName: "bash", input: {} }, ctx));
+      assert.deepEqual(confirmations, [PI_T3_HOLD_TITLE]);
+    } finally {
+      await NodeFSP.rm(dir, { recursive: true, force: true });
     }
   });
 });

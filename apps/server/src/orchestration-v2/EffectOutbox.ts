@@ -13,6 +13,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -119,6 +120,38 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     type: Schema.Literal("delegated-tasks.stop"),
     reason: Schema.optional(Schema.String),
   }),
+  /** Starts a person's `! cmd` process; the handler forks it and returns. */
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.run"),
+    turnItemId: TurnItemId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("user-shell-command.stop"),
+    turnItemIds: Schema.Array(TurnItemId),
+  }),
+  /**
+   * Holds a running turn for steered `! cmd` commands: `pause` asks the agent to wait at its next
+   * steering window and reports back with `user-shell-command.hold`; `interrupt` ends the turn,
+   * after which the queue runs the commands.
+   */
+  Schema.Struct({
+    type: Schema.Literal("provider-turn.hold"),
+    mode: Schema.Literals(["pause", "interrupt"]),
+    runId: RunId,
+    providerSessionId: ProviderSessionId,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+    attemptId: RunAttemptId,
+  }),
+  /** Lets a paused turn continue, with the delivered messages (in order) as its steered input. */
+  Schema.Struct({
+    type: Schema.Literal("provider-turn.release"),
+    runId: RunId,
+    providerSessionId: ProviderSessionId,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+    messageIds: Schema.Array(MessageId),
+  }),
 ]);
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
@@ -141,6 +174,12 @@ export const PROCESS_BOUND_EFFECT_TYPES = [
   "provider-turn.steer",
   "provider-turn.restart",
   "runtime-request.respond",
+  // A command cut off by a restart counts as stopped and never runs again.
+  "user-shell-command.run",
+  "user-shell-command.stop",
+  // A hold lives in the provider process; recovery ends its turn, and the queue runs the commands.
+  "provider-turn.hold",
+  "provider-turn.release",
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const OrchestrationEffectStatusV2 = Schema.Literals([
