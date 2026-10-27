@@ -69,6 +69,7 @@ import {
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
+import { normalizeShellCommandMessageText } from "@t3tools/shared/shellCommand";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -953,6 +954,7 @@ function turnItemText(item: OrchestrationV2TurnItem): string | null {
     case "notification":
       return [item.summary, item.detail].filter((part) => part !== undefined).join("\n");
     case "user_message":
+      return item.shellCommand === true ? normalizeShellCommandMessageText(item.text) : item.text;
     case "assistant_message":
     case "reasoning":
       return item.text;
@@ -975,6 +977,14 @@ function turnItemText(item: OrchestrationV2TurnItem): string | null {
         .filter((line): line is string => line !== undefined)
         .join("\n");
     case "command_execution":
+      if (item.userShellMessageId !== undefined) {
+        // The result of a person's `! cmd` message; that message already shows the command. Only
+        // delivered results reach the thread, so each has finished.
+        const outcome = item.exitCode === undefined ? item.status : `Exit code ${item.exitCode}`;
+        return [outcome, item.output]
+          .filter((line): line is string => line !== undefined)
+          .join("\n");
+      }
       return [`$ ${item.input}`, item.output]
         .filter((line): line is string => line !== undefined)
         .join("\n");

@@ -18,6 +18,9 @@ and modes you choose in a draft keep their permissions.
 Approve or reject requests in the conversation to let the agent continue. Permission modes do
 not prevent the agent from asking questions about the task.
 
+Permission modes apply to the agent. A [shell command you run yourself](./composer.md#run-a-shell-command)
+with `!` runs as you: it asks for no approval in **Supervised**, and Plan mode doesn't stop it.
+
 ## Provider differences
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
