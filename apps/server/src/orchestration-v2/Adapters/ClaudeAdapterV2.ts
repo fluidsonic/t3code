@@ -11080,7 +11080,9 @@ export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
     return yield* makeClaudeAdapterV2({
       instanceId,
       settings: { ...config, enabled, binaryPath },
-      environment: claudeEnvironment,
+      // Claude Code leaves its Artifact tools out of SDK sessions unless this is set, while a
+      // terminal session has them. An explicit value on the instance, including 0, still wins.
+      environment: { CLAUDE_CODE_ARTIFACT: "1", ...claudeEnvironment },
       attachmentsDir: serverConfig.attachmentsDir,
       fileSystem,
       path,
