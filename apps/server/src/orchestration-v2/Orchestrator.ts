@@ -12592,7 +12592,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: input.now,
         payload: { ...item, status: "interrupted", completedAt: input.now, updatedAt: input.now },
       });
-      yield* endWaitingUserShellGroup({ ...input, item, failed: false });
+      yield* endWaitingUserShellCommands({ ...input, item, failed: false });
     }
     const running = active.filter((item) => item.status === "running").map((item) => item.id);
     if (running.length > 0) {
@@ -12667,29 +12667,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: { ...message, runId: target.id, nodeId: rootNodeId, updatedAt: now },
     });
-  });
-
-  const holdQueuedRuns = Effect.fnUntraced(function* (input: {
-    readonly command: OrchestrationV2ServerCommand;
-    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
-    readonly now: DateTime.Utc;
-  }) {
-    const threadId = commandThreadId(input.command);
-    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
-    for (const run of projection.runs) {
-      if (run.status !== "queued" || run.queueHeld === true) continue;
-      yield* emit(
-        input.events,
-        input.command,
-      )({
-        type: "run.updated",
-        threadId,
-        runId: run.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: input.now,
-        payload: { ...run, queueHeld: true },
-      });
-    }
   });
 
   /** Ends a run whose commands reached no agent, keeping a checkpoint of what they changed. */
@@ -12923,7 +12900,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     } else {
       yield* startTurnAfterUserShellCommands({ ...input, projection: current, run: currentRun });
     }
-    if (input.outcome !== "completed") yield* holdQueuedRuns(input);
   });
 
   const isSteeredShellMessage = (
@@ -13406,7 +13382,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     } else {
       yield* queueUserShellRedelivery({ ...input, messageIds });
     }
-    if (input.outcome !== "completed") yield* holdQueuedRuns(input);
   });
 
   const dispatchUserShellCommandReleased = Effect.fn(
@@ -13549,12 +13524,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   /**
-   * One of a group's commands failed or was stopped: as with `&&`, the commands of its group
-   * still waiting never run. After a failure they join its run as skipped, so they show in the
-   * thread and the agent hears they did not run; a stop takes them out without a word, as it
-   * sends nothing itself.
+   * As with `&&`, a failed command ends every command still waiting, however it was sent: they
+   * join its run as skipped, so they show in the thread and the agent hears they did not run.
+   * A stopped one ends only the rest of its group, without a word, as a stop sends nothing.
    */
-  const endWaitingUserShellGroup = Effect.fnUntraced(function* (input: {
+  const endWaitingUserShellCommands = Effect.fnUntraced(function* (input: {
     readonly command: OrchestrationV2ServerCommand;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly item: UserShellCommandItem;
@@ -13566,7 +13540,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const group = projection.messages.find(
       (message) => message.id === input.item.userShellMessageId,
     )?.shellCommandGroup;
-    if (group === undefined) return;
+    if (group === undefined && !input.failed) return;
     const target = input.failed
       ? projection.runs.find((run) => run.id === input.item.runId)
       : undefined;
@@ -13574,9 +13548,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const message = projection.messages.find(
         (candidate) => candidate.id === queued.userMessageId,
       );
-      // A command of the group that already ran waits only to have its result delivered again.
+      // A command that already ran waits only to have its result delivered again.
       if (
-        message?.shellCommandGroup !== group ||
+        message?.shellCommand !== true ||
+        (!input.failed && message.shellCommandGroup !== group) ||
         (yield* readUserShellItem(threadId, userShellCommandItemId(message.id))) !== null
       ) {
         continue;
@@ -13692,7 +13667,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: { ...item, status: "interrupted", completedAt: now, updatedAt: now },
       });
-      yield* endWaitingUserShellGroup({ command, events, item, failed: false, now });
+      yield* endWaitingUserShellCommands({ command, events, item, failed: false, now });
       if (item.status === "running") {
         yield* Ref.update(effects, (existing) => [
           ...existing,
@@ -13804,7 +13779,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
       if (active && status !== "completed") {
-        yield* endWaitingUserShellGroup({
+        yield* endWaitingUserShellCommands({
           command,
           events,
           item,
