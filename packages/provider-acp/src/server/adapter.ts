@@ -5166,7 +5166,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             parentItemId: null,
             ordinal,
             status: "waiting",
-            title: null,
+            title: parsed.title ?? null,
             startedAt: now,
             completedAt: null,
             updatedAt: now,

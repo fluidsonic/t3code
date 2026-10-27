@@ -235,6 +235,7 @@ export type AcpPlanUpdate =
 export interface AcpPermissionRequest {
   readonly kind: string | "unknown";
   readonly detail?: string;
+  readonly title?: string;
   readonly toolCall?: AcpToolCallState;
 }
 
@@ -1201,9 +1202,25 @@ export function parsePermissionRequest(
     toolCall?.title ??
     toolCall?.detail ??
     (typeof params.sessionId === "string" ? `Session ${params.sessionId}` : undefined);
+  // Agents usually title a command call with the command itself; Grok also sends a description.
+  const rawDescription = isRecord(params.toolCall.rawInput)
+    ? params.toolCall.rawInput.description
+    : undefined;
+  const title = params.toolCall.title?.trim();
+  const explanation = !toolCall?.command
+    ? undefined
+    : typeof rawDescription === "string" && rawDescription.trim()
+      ? rawDescription.trim()
+      : title &&
+          !title.replaceAll("`", "").includes(toolCall.command) &&
+          !toolCall.command.includes(title.replaceAll("`", "")) &&
+          !["terminal", "tool call"].includes(title.toLowerCase())
+        ? title
+        : undefined;
   return {
     kind,
     ...(detail ? { detail } : {}),
+    ...(explanation ? { title: explanation } : {}),
     ...(toolCall ? { toolCall } : {}),
   };
 }
