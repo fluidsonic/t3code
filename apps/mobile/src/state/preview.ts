@@ -56,6 +56,7 @@ function applyEvent(current: ThreadPreviewTabs, event: PreviewEvent): ThreadPrev
           title: event.title,
           code: event.code,
           description: event.description,
+          ...(event.crashed ? { crashed: true as const } : {}),
         },
         updatedAt: event.createdAt,
       };

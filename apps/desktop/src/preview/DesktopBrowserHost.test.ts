@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - Stands in for an Electron debugger.
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import { DesktopBrowserEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -69,10 +70,14 @@ const makeDebuggee = (
         sendWaiters.shift()?.();
       }),
   });
+  let crashed = false;
   const webContents = Object.assign(new NodeEvents.EventEmitter(), {
     getURL: () => "http://localhost/",
     getTitle: () => "Page",
     getUserAgent: () => "Electron",
+    isDestroyed: () => false,
+    isCrashed: () => crashed,
+    reload: vi.fn(),
   });
   return {
     tab: {
@@ -80,6 +85,10 @@ const makeDebuggee = (
       debugger: debuggee as unknown as Electron.Debugger,
     },
     emit: (method: string, params: unknown) => emitter.emit("message", {}, method, params, ""),
+    setCrashed: (value: boolean) => {
+      crashed = value;
+    },
+    reload: webContents.reload,
     navigate: () => webContents.emit("did-navigate"),
     /** Ids of the commands the debugger received, in order. */
     sent,
@@ -141,6 +150,23 @@ describe("DesktopBrowserHost", () => {
 
       expect(yield* takeEvents(host, 1)).toEqual([{ type: "attached", ...key }]);
       expect(yield* takeEvents(host, 1)).toEqual([{ type: "attached", ...key }]);
+    }),
+  );
+
+  it.effect("replays a crash to a backend that starts later, and reloads the page for it", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      debuggee.setCrashed(true);
+      host.crashChanged(key, "This tab's page crashed.");
+
+      expect(yield* takeEvents(host, 2)).toEqual([
+        { type: "attached", ...key },
+        { type: "crash", ...key, message: "This tab's page crashed." },
+      ]);
+      yield* host.handleCommandLine(encodeJson({ type: "reload", ...key }));
+      expect(debuggee.reload).toHaveBeenCalledOnce();
     }),
   );
 
