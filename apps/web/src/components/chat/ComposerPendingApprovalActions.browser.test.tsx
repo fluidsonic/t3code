@@ -47,20 +47,21 @@ describe("ComposerPendingApprovalActions", () => {
         { container },
       );
       const explanation = container.querySelector<HTMLElement>(
-        '[aria-label="Command approval"] > span > span:nth-child(2)',
+        '[aria-label="Approval explanation"]',
       )!;
+      const scroller = explanation.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
       expect(explanation.textContent).toBe(title);
-      expect(explanation.clientHeight).toBeLessThanOrEqual(40);
-      expect(explanation.scrollHeight).toBeGreaterThan(explanation.clientHeight);
-      expect(explanation.scrollWidth).toBeLessThanOrEqual(explanation.clientWidth);
-      expect(container.getBoundingClientRect().height).toBeLessThan(240);
-      explanation.scrollTop = explanation.scrollHeight;
+      expect(scroller.contains(container.querySelector('[aria-label="Command"]'))).toBe(true);
+      expect(scroller.scrollHeight).toBeGreaterThan(scroller.clientHeight);
+      expect(scroller.scrollWidth).toBeLessThanOrEqual(scroller.clientWidth);
+      expect(container.getBoundingClientRect().height).toBeLessThan(window.innerHeight);
+      scroller.scrollTop = scroller.scrollHeight;
       const node = explanation.firstChild!;
       const end = document.createRange();
       end.setStart(node, title.indexOf("END_OF_EXPLANATION"));
       end.setEnd(node, title.length);
       expect(end.getBoundingClientRect().bottom).toBeLessThanOrEqual(
-        explanation.getBoundingClientRect().bottom,
+        scroller.getBoundingClientRect().bottom,
       );
       expect(rowLabels(container)).toEqual(["Decline", "Approve"]);
     }
