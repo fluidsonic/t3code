@@ -12,6 +12,7 @@ import {
   userShellCommandOutcomeLine,
   userShellCommandOutputView,
   userShellCommandPresentation,
+  userShellCommandRunningText,
   userShellCommandStatusText,
 } from "@t3tools/client-runtime/user-shell-command";
 import { canEditInTerminal } from "@t3tools/shared/projectScripts";
@@ -50,6 +51,7 @@ import { useEnvironmentScope } from "../../state/session";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useCommandOutputStreaming } from "./thread-command-output";
+import { useVisibleSecondClock } from "./use-visible-second-clock";
 import type { CodeBlockShellActions } from "./threadShellCommandPresentation";
 
 // The `!` sits in a square 1.35em wide, then a 0.65em gap, as on the web and in the composer.
@@ -430,6 +432,12 @@ export function ThreadShellCommandsPanel(props: {
   );
 }
 
+/** Ticks on its own, so only the label re-renders each second. */
+function RunningCommandText(props: { readonly startedAt: LiveUserShellCommand["startedAt"] }) {
+  const nowMs = useVisibleSecondClock(props.startedAt !== null);
+  return <>{userShellCommandRunningText(props.startedAt, nowMs)}</>;
+}
+
 function LiveShellCommandRow(props: {
   readonly environmentId: EnvironmentId;
   readonly item: LiveUserShellCommand;
@@ -510,7 +518,11 @@ function LiveShellCommandRow(props: {
           </View>
           <ShellCommandText command={item.input} numberOfLines={1} className="min-w-0 flex-1" />
           <Text className="shrink-0 text-xs tabular-nums text-foreground-muted">
-            {presentation.summary}
+            {presentation.status === "running" ? (
+              <RunningCommandText startedAt={item.startedAt} />
+            ) : (
+              presentation.summary
+            )}
           </Text>
         </Pressable>
         {active && canStop && item.awaitsWorkspace !== true ? (
