@@ -7,6 +7,7 @@ import {
   userShellCommandModeNote,
   userShellCommandOutcomeLine,
   userShellCommandPresentation,
+  userShellCommandStatusText,
 } from "@t3tools/client-runtime/user-shell-command";
 import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
 import { AuthTerminalOperateScope, type EnvironmentId, type TurnItemId } from "@t3tools/contracts";
@@ -18,7 +19,7 @@ import {
   ClockIcon,
   SquareIcon,
 } from "lucide-react";
-import { useId, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 
 import type { ComposerThreadTarget } from "../../composerDraftStore";
 import { useEnvironmentScope } from "../../state/session";
@@ -26,6 +27,7 @@ import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { ChatMessage } from "../../types";
 import { cn } from "~/lib/utils";
+import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
@@ -33,8 +35,7 @@ import {
   CommandOutputText,
   useCommandOutputStreaming,
 } from "./CommandOutputPanel";
-import { ComposerBanner } from "./ComposerBanner";
-import { ShellCommandText } from "./ShellCommandText";
+import { SHELL_COMMAND_TINT, ShellCommandText } from "./ShellCommandText";
 
 const NO_COMMANDS: ReadonlyArray<LiveUserShellCommand> = [];
 
@@ -82,42 +83,64 @@ export function ShellCommandsControl(props: {
   const count = commands.length + sending.length;
   if (count === 0) return null;
   return (
-    <ComposerBanner.Attachment>
-      <ComposerBanner.Root
-        role="region"
-        aria-label={`${count} shell command${count === 1 ? "" : "s"}`}
-        className="relative z-0"
-      >
-        <ComposerBanner.Scroll className="max-h-80">
-          <ComposerBanner.Children render={<ol />}>
-            {commands.map((item) => (
-              <ShellCommandRow
-                key={item.id}
-                environmentId={props.environmentId}
-                item={item}
-                composerDraftTarget={props.composerDraftTarget}
-                onStoppedRunningCommand={props.onStoppedRunningCommand}
-              />
-            ))}
-            {sending.map((message) => (
-              <li key={message.id} className="grid" data-user-shell-command="waiting">
-                <ComposerBanner.Row>
-                  <ComposerBanner.Icon>
-                    <ClockIcon />
-                  </ComposerBanner.Icon>
-                  <ComposerBanner.Content className="text-foreground/80">
-                    <span className="min-w-0 flex-1 truncate">
-                      <ShellCommandText command={shellCommandFromMessageText(message.text)} />
-                    </span>
-                    <span className="shrink-0 text-muted-foreground">Waiting…</span>
-                  </ComposerBanner.Content>
-                </ComposerBanner.Row>
-              </li>
-            ))}
-          </ComposerBanner.Children>
-        </ComposerBanner.Scroll>
-      </ComposerBanner.Root>
-    </ComposerBanner.Attachment>
+    <section
+      aria-label={`${count} shell command${count === 1 ? "" : "s"}`}
+      className="mx-auto flex w-full max-w-(--chat-content-max-width) flex-col pb-4"
+    >
+      <ol className="flex flex-col items-end gap-3">
+        {commands.map((item) => (
+          <ShellCommandRow
+            key={item.id}
+            environmentId={props.environmentId}
+            item={item}
+            composerDraftTarget={props.composerDraftTarget}
+            onStoppedRunningCommand={props.onStoppedRunningCommand}
+          />
+        ))}
+        {sending.map((message) => (
+          <li
+            key={message.id}
+            className="flex w-full justify-end"
+            data-user-shell-command="waiting"
+          >
+            <ShellCommandBubble command={shellCommandFromMessageText(message.text)}>
+              <div className="mt-2 flex min-w-0 items-center text-xs text-muted-foreground">
+                <StatusIconSlot>
+                  <ClockIcon aria-hidden className="size-3.5" />
+                </StatusIconSlot>
+                Waiting…
+              </div>
+            </ShellCommandBubble>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+/** A live command, drawn like the bubble it becomes in the transcript. */
+function ShellCommandBubble(props: { readonly command: string; readonly children: ReactNode }) {
+  return (
+    <div
+      className={cn(
+        SHELL_COMMAND_TINT,
+        "min-w-0 max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground",
+      )}
+    >
+      <p className="text-sm whitespace-pre-wrap wrap-break-word">
+        <ShellCommandText command={props.command} block />
+      </p>
+      {props.children}
+    </div>
+  );
+}
+
+/** Centered under the `!`, so the status lines up with the command. */
+function StatusIconSlot(props: { readonly children: ReactNode }) {
+  return (
+    <span className="me-(--shell-command-gap) inline-flex w-(--shell-command-prefix-size) shrink-0 justify-center text-sm">
+      {props.children}
+    </span>
   );
 }
 
@@ -205,52 +228,56 @@ function ShellCommandRow(props: {
     });
   };
 
+  // A skipped command never ran, so it has no output to show.
+  const hasOutput = presentation.status !== "waiting" && presentation.status !== "skipped";
+  const status = (
+    <>
+      <StatusIconSlot>
+        {presentation.status === "running" ? (
+          <Spinner size="sm" tone="muted" />
+        ) : presentation.status === "waiting" ? (
+          <ClockIcon aria-hidden className="size-3.5" />
+        ) : presentation.status === "failed" ? (
+          <CircleXIcon aria-hidden className="size-3.5 text-destructive" />
+        ) : presentation.status === "skipped" ? (
+          <CircleSlashIcon aria-hidden className="size-3.5" />
+        ) : (
+          <CircleCheckIcon aria-hidden className="size-3.5 text-success-foreground" />
+        )}
+      </StatusIconSlot>
+      <span>{userShellCommandStatusText(presentation)}</span>
+    </>
+  );
+
   return (
-    <li className="grid" data-user-shell-command={presentation.status}>
-      <ComposerBanner.Row>
-        <ComposerBanner.Icon>
-          {presentation.status === "running" ? (
-            <Spinner size="sm" tone="muted" />
-          ) : presentation.status === "waiting" ? (
-            <ClockIcon />
-          ) : presentation.status === "failed" ? (
-            <CircleXIcon className="text-destructive" />
-          ) : presentation.status === "skipped" ? (
-            <CircleSlashIcon />
-          ) : (
-            <CircleCheckIcon className="text-success-foreground" />
-          )}
-        </ComposerBanner.Icon>
-        <ComposerBanner.Content className="text-foreground/80">
-          <Tooltip>
-            <TooltipTrigger render={<span className="min-w-0 flex-1 truncate" />}>
-              <ShellCommandText command={item.input} />
-            </TooltipTrigger>
-            <TooltipPopup side="top" className="max-w-96 break-words">
-              <ShellCommandText command={item.input} />
-            </TooltipPopup>
-          </Tooltip>
-          <span className="shrink-0 text-muted-foreground tabular-nums">
-            {presentation.summary}
-          </span>
-        </ComposerBanner.Content>
-        <ComposerBanner.Actions>
-          {/* A skipped command never ran, so it has no output to show. */}
-          {presentation.status === "waiting" || presentation.status === "skipped" ? null : (
-            <ComposerBanner.Dismiss
-              aria-label={expanded ? "Hide output" : "Show output"}
+    <li className="flex w-full justify-end" data-user-shell-command={presentation.status}>
+      <ShellCommandBubble command={item.input}>
+        <div className="mt-2 flex min-w-0 items-center gap-1 text-xs text-muted-foreground tabular-nums">
+          {hasOutput ? (
+            <button
+              type="button"
               aria-expanded={expanded}
               aria-controls={outputId}
+              aria-label={`${presentation.summary}, ${expanded ? "hide" : "show"} output`}
+              className="-mx-1 flex min-w-0 flex-1 items-center rounded-md px-1 py-0.5 text-start transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               onClick={() => setExpanded((value) => !value)}
             >
-              <ChevronDownIcon className={cn("size-3.5", expanded && "rotate-180")} />
-            </ComposerBanner.Dismiss>
+              {status}
+              <ChevronDownIcon
+                aria-hidden
+                className={cn("ms-auto size-3.5 shrink-0", expanded && "rotate-180")}
+              />
+            </button>
+          ) : (
+            <span className="flex min-w-0 flex-1 items-center">{status}</span>
           )}
           {active && canStop && item.awaitsWorkspace !== true ? (
             <Tooltip>
               <TooltipTrigger
                 render={
-                  <ComposerBanner.Dismiss
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
                     aria-label="Stop command"
                     disabled={stopping}
                     onClick={stop}
@@ -266,13 +293,11 @@ function ShellCommandRow(props: {
               <TooltipPopup>Stop command; nothing is sent to the agent</TooltipPopup>
             </Tooltip>
           ) : null}
-        </ComposerBanner.Actions>
-      </ComposerBanner.Row>
-      {expanded ? (
-        <ComposerBanner.Body className="pb-1">
+        </div>
+        {expanded ? (
           <div
             id={outputId}
-            className="rounded-lg bg-background/60 p-2 font-mono text-xs whitespace-pre"
+            className="mt-2 max-w-full min-w-0 overflow-hidden rounded-lg bg-background/60 p-2 font-mono text-xs whitespace-pre"
           >
             {streamsOutput ? (
               <CommandOutputPanel
@@ -290,11 +315,11 @@ function ShellCommandRow(props: {
               <div className="mt-1 text-destructive">{outcomeLine}</div>
             )}
           </div>
-          {modeNote === null ? null : (
-            <p className="mt-1 text-2xs text-muted-foreground">{modeNote}</p>
-          )}
-        </ComposerBanner.Body>
-      ) : null}
+        ) : null}
+        {modeNote === null ? null : (
+          <p className="mt-2 text-2xs text-muted-foreground">{modeNote}</p>
+        )}
+      </ShellCommandBubble>
     </li>
   );
 }
