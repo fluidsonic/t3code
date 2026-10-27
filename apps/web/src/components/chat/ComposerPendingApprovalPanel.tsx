@@ -8,6 +8,7 @@ import { memo } from "react";
 import { type PendingApproval } from "../../session-logic";
 import { InlineButton } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+import { ComposerBanner } from "./ComposerBanner";
 import { composerFloatingLayerProps } from "./composerEventScope";
 import { cn } from "~/lib/utils";
 
@@ -72,30 +73,34 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           <span className="ml-auto shrink-0 tabular-nums">1/{pendingCount}</span>
         ) : null}
       </span>
-      <Detail
-        aria-label={detailAriaLabel}
-        className={cn(
-          "block w-full min-w-0 overflow-auto text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:w-1.5",
-          approval.requestKind === "mcp-elicitation"
-            ? "max-h-20 whitespace-pre-wrap font-sans wrap-break-word"
-            : "max-h-40 whitespace-pre-wrap font-mono wrap-anywhere",
-        )}
-        data-approval-detail="complete"
-        tabIndex={0}
-      >
-        {approval.responseCapability === "not_resumable"
-          ? "Provider process is gone. Interrupt or restart the run to respond."
-          : approval.detail
-            ? approval.requestKind === "command"
-              ? approvalCommandDisplayText(approval.detail)
+      <ComposerBanner.Scroll className="w-full">
+        <span className="flex flex-col gap-1">
+          <Detail
+            aria-label={detailAriaLabel}
+            className={cn(
+              "block w-full min-w-0 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+              approval.requestKind === "mcp-elicitation"
+                ? "whitespace-pre-wrap font-sans wrap-break-word"
+                : "whitespace-pre-wrap font-mono wrap-anywhere",
+            )}
+            data-approval-detail="complete"
+            tabIndex={0}
+          >
+            {approval.responseCapability === "not_resumable"
+              ? "Provider process is gone. Interrupt or restart the run to respond."
               : approval.detail
-            : fallbackLabel}
-      </Detail>
-      {approval.reason ? (
-        <span className="w-full min-w-0 text-2xs text-muted-foreground wrap-break-word">
-          {approval.reason}
+                ? approval.requestKind === "command"
+                  ? approvalCommandDisplayText(approval.detail)
+                  : approval.detail
+                : fallbackLabel}
+          </Detail>
+          {approval.reason ? (
+            <span className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word">
+              {approval.reason}
+            </span>
+          ) : null}
         </span>
-      ) : null}
+      </ComposerBanner.Scroll>
     </span>
   );
 });
