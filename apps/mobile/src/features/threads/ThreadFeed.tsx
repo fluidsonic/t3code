@@ -247,7 +247,9 @@ import {
 import {
   type CodeBlockShellActions,
   codeBlockRunnableCommand,
-  markdownMayHaveShellCodeBlock,
+  linkInlineShellCommands,
+  markdownMayHaveShellCommand,
+  shellCommandFromLink,
   splitShellCommandMarkdown,
 } from "./threadShellCommandPresentation";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
@@ -1210,17 +1212,22 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
 }) {
   const liveMarkdown = useLiveThreadLinkLabels(props.markdown, props.environmentId);
   const threadIcons = useThreadChipIcons(props.environmentId, liveMarkdown);
+  const { shellBlockActions = null, streaming = false } = props;
+  const onShellCommandPress = shellBlockActions?.onMore ?? null;
   const linkHandlers: MarkdownLinkHandlers = {
     ...props.linkHandlers,
+    onLinkPress: (href) => {
+      const command = shellCommandFromLink(href);
+      if (command === null) props.linkHandlers.onLinkPress?.(href);
+      else onShellCommandPress?.(command);
+    },
     linkCustomization: (href) =>
       withChipIcon(props.linkHandlers.linkCustomization?.(href), threadIcons.get(href)),
   };
-  const { shellBlockActions = null, streaming = false } = props;
-  const onShellCommandPress = shellBlockActions?.onMore ?? null;
-  // Arms block taps only on finished messages that may hold a command block.
+  // Arms block taps only on finished messages that may hold a command.
   const onCodeBlockPress = useMemo(
     () =>
-      onShellCommandPress === null || streaming || !markdownMayHaveShellCodeBlock(liveMarkdown)
+      onShellCommandPress === null || streaming || !markdownMayHaveShellCommand(liveMarkdown)
         ? undefined
         : (block: { readonly code: string; readonly language: string }) => {
             const command = codeBlockRunnableCommand({
@@ -1261,7 +1268,8 @@ function AssistantMarkdownBlocks(props: {
     | undefined;
   readonly shellBlockActions: ShellCommandBlockActions | null;
 }) {
-  // Where blocks run, `! cmd` blocks and lines render as command blocks, as on the web.
+  // Where blocks run, `! cmd` blocks render as command blocks, as on the web, and inline
+  // commands open their actions when tapped.
   const blockActions =
     props.onCodeBlockPress && props.shellBlockActions?.actions.runCommand
       ? props.shellBlockActions
@@ -1308,7 +1316,9 @@ function AssistantMarkdownBlocks(props: {
           <SelectableMarkdownText
             // oxlint-disable-next-line react/no-array-index-key -- a segment's parts never reorder
             key={`markdown:${offset}:${index}`}
-            markdown={renderCodexInlineDirectivesAsMarkdown(part.markdown)}
+            markdown={renderCodexInlineDirectivesAsMarkdown(
+              blockActions === null ? part.markdown : linkInlineShellCommands(part.markdown),
+            )}
             skills={props.skills}
             textStyle={props.markdownStyles.nativeTextStyle}
             {...props.linkHandlers}
