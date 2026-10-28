@@ -587,6 +587,7 @@ export function useTimelineFollow(input: TimelineFollowInput) {
   // position up before same-frame rows lengthen the list again. That is layout, not a scroll away.
   const shellCommandCount = input.shellCommandCount ?? 0;
   const shellCommandCountRef = useRef(shellCommandCount);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- keeps the list's DOM scroll position following the end when the shell command panel shrinks before paint
   useLayoutEffect(() => {
     const left = shellCommandCount < shellCommandCountRef.current;
     shellCommandCountRef.current = shellCommandCount;
