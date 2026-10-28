@@ -466,6 +466,7 @@ function LiveShellCommandRow(props: {
   // Announce changes seen while shown, not the state of a command already running at mount.
   const announcedStatusRef = useRef(presentation.status);
   const { status, summary } = presentation;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- announces a command's status changes to the native screen reader
   useEffect(() => {
     const announcement = userShellCommandAnnouncement(announcedStatusRef.current, {
       status,
