@@ -6,6 +6,7 @@ import { memo } from "react";
 import { type PendingApproval } from "../../session-logic";
 import { InlineButton } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+import { ComposerBanner } from "./ComposerBanner";
 import { composerFloatingLayerProps } from "./composerEventScope";
 import { cn } from "~/lib/utils";
 
@@ -50,7 +51,6 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
     >
       <span className="flex w-full min-w-0 items-center gap-2 text-2xs text-muted-foreground">
         <span className="shrink-0 font-medium text-warning">{fallbackLabel}</span>
-        {approval.appName ? <span className="min-w-0 truncate">{approval.appName}</span> : null}
         {approval.fullAccessOverride ? (
           <Popover>
             <PopoverTrigger openOnHover render={<InlineButton tone="muted" />}>
@@ -71,26 +71,38 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           <span className="ml-auto shrink-0 tabular-nums">1/{pendingCount}</span>
         ) : null}
       </span>
-      <Detail
-        aria-label={detailAriaLabel}
-        className={cn(
-          "block w-full min-w-0 overflow-auto text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5",
-          approval.requestKind === "mcp-elicitation"
-            ? "max-h-20 whitespace-pre-wrap font-sans wrap-break-word"
-            : "max-h-40 whitespace-pre-wrap font-mono wrap-anywhere",
-        )}
-        data-approval-detail="complete"
-        tabIndex={0}
-      >
-        {approval.responseCapability === "not_resumable"
-          ? "Provider process is gone. Interrupt or restart the run to respond."
-          : approval.detail || fallbackLabel}
-      </Detail>
-      {approval.reason ? (
-        <span className="w-full min-w-0 text-2xs text-muted-foreground wrap-break-word">
-          {approval.reason}
+      <ComposerBanner.Scroll className="w-full">
+        <span className="flex flex-col gap-1">
+          <Detail
+            aria-label={detailAriaLabel}
+            className={cn(
+              "block w-full min-w-0 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+              approval.requestKind === "mcp-elicitation"
+                ? "whitespace-pre-wrap font-sans wrap-break-word"
+                : "whitespace-pre-wrap font-mono wrap-anywhere",
+            )}
+            data-approval-detail="complete"
+            tabIndex={0}
+          >
+            {approval.responseCapability === "not_resumable"
+              ? "Provider process is gone. Interrupt or restart the run to respond."
+              : approval.detail || fallbackLabel}
+          </Detail>
+          {approval.appName ? (
+            <span
+              aria-label="Approval explanation"
+              className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word"
+            >
+              {approval.appName}
+            </span>
+          ) : null}
+          {approval.reason ? (
+            <span className="w-full min-w-0 text-2xs text-muted-foreground whitespace-pre-wrap wrap-break-word">
+              {approval.reason}
+            </span>
+          ) : null}
         </span>
-      ) : null}
+      </ComposerBanner.Scroll>
     </span>
   );
 });
