@@ -63,6 +63,8 @@ export function useComposerAttachmentIntake(input: {
   readonly pendingUserInputs: ReadonlyArray<PendingUserInput>;
   readonly supportsQuestionAttachments: boolean;
   readonly isLiteralPendingAnswer: boolean;
+  /** A `! cmd` shell command carries no attachments. */
+  readonly isShellMode: boolean;
   readonly isConnecting: boolean;
   readonly projectSelectionRequired: boolean;
   readonly questionAttachmentTarget: DraftId | null;
@@ -91,6 +93,7 @@ export function useComposerAttachmentIntake(input: {
     pendingUserInputs,
     supportsQuestionAttachments,
     isLiteralPendingAnswer,
+    isShellMode,
     isConnecting,
     projectSelectionRequired,
     questionAttachmentTarget,
@@ -123,6 +126,10 @@ export function useComposerAttachmentIntake(input: {
     },
   ): Promise<boolean> => {
     if (!activeThreadId || files.length === 0 || isRevertingCheckpointRef.current) return false;
+    if (isShellMode) {
+      toastManager.add({ type: "info", title: "Commands can't include attachments." });
+      return false;
+    }
     if (
       pendingUserInputs.length > 0 &&
       (!supportsQuestionAttachments ||

@@ -2101,6 +2101,9 @@ export const layerWsRpc = (
                               ? {}
                               : { messageId: input.initialMessage.messageId }),
                             text: input.initialMessage.text,
+                            ...(input.initialMessage.shellCommand === true
+                              ? { shellCommand: true }
+                              : {}),
                             attachments: input.initialMessage.attachments,
                             ...(input.initialMessage.context === undefined
                               ? {}
@@ -2157,6 +2160,13 @@ export const layerWsRpc = (
                         cause,
                       }),
                     ThreadManagementProviderInstanceDisabledError: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
+                    ShellCommandsDisabledError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,
                         projectId: input.projectId,

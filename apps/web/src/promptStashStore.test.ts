@@ -12,6 +12,7 @@ import {
   PROMPT_STASH_STORAGE_KEY,
   MAX_STASH_ENTRY_ATTACHMENT_CHARS,
   partitionStashAttachments,
+  promptAfterStashRestore,
   usePromptStashStore,
   writePromptStashStorageForTest,
   type PromptStashEntry,
@@ -272,5 +273,68 @@ describe("prompt stash context records", () => {
     );
     const taken = usePromptStashStore.getState().takeEntry("entry-records");
     expect(taken.entry?.records).toEqual(records);
+  });
+});
+
+describe("stashed shell commands", () => {
+  beforeEach(() => {
+    resetPromptStashStore();
+  });
+
+  afterEach(() => {
+    resetPromptStashStore();
+  });
+
+  it("keeps a stashed command a command across a reload", () => {
+    writePromptStashStorageForTest(
+      JSON.stringify({
+        version: 2,
+        state: {
+          entries: [{ ...makeEntry({ id: "command", prompt: "!npm test" }), shellCommand: true }],
+        },
+      }),
+    );
+    expect(usePromptStashStore.getState().takeEntry("command").entry?.shellCommand).toBe(true);
+  });
+
+  it("restores a command into an empty composer as a command", () => {
+    expect(
+      promptAfterStashRestore({
+        currentPrompt: " ",
+        currentShellMode: false,
+        restoredPrompt: "!npm test",
+        restoredShellCommand: true,
+      }),
+    ).toEqual({ prompt: "!npm test", shellMode: true });
+  });
+
+  it("never merges a command and prose", () => {
+    expect(
+      promptAfterStashRestore({
+        currentPrompt: "a draft",
+        currentShellMode: false,
+        restoredPrompt: "!npm test",
+        restoredShellCommand: true,
+      }),
+    ).toHaveProperty("refused");
+    expect(
+      promptAfterStashRestore({
+        currentPrompt: "!npm test",
+        currentShellMode: true,
+        restoredPrompt: "a stashed prompt",
+        restoredShellCommand: false,
+      }),
+    ).toHaveProperty("refused");
+  });
+
+  it("appends prose to prose after a blank line", () => {
+    expect(
+      promptAfterStashRestore({
+        currentPrompt: "first  ",
+        currentShellMode: false,
+        restoredPrompt: "!second",
+        restoredShellCommand: false,
+      }),
+    ).toEqual({ prompt: "first\n\n!second", shellMode: false });
   });
 });
