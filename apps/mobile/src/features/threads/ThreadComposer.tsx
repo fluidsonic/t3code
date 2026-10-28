@@ -510,6 +510,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
   const adjustNextSelectionRef = useRef<
     ((selection: { start: number; end: number }) => { start: number; end: number }) | null
   >(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- announces a shell mode switch to the native screen reader
   useEffect(() => {
     const announced = announcedShellModeRef.current;
     announcedShellModeRef.current = { draftKey: composerDraftKey, shellMode: isShellMode };
