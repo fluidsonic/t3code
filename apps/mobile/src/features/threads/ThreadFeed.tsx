@@ -2317,6 +2317,7 @@ export const ThreadFeed = memo(function ThreadFeed({
   // The actions are rebuilt with every thread update; the rows that render command blocks read
   // them through stable callbacks, so an update doesn't re-render every message on screen.
   const shellActionsRef = useRef(props.codeBlockShellActions);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed shell actions to the ref that command block callbacks read
   useLayoutEffect(() => {
     shellActionsRef.current = props.codeBlockShellActions;
   });
