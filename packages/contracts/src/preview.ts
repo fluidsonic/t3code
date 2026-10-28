@@ -117,6 +117,16 @@ export const DEFAULT_PREVIEW_APPEARANCE: PreviewAppearancePreference = "system";
 
 const PreviewFileDownload = Schema.Struct({ id: Schema.String, fileName: Schema.String });
 
+/**
+ * Set on a failure because the page's renderer died, not because it could not load. Reloading or
+ * navigating the tab revives it. Older clients ignore it and show the description as a failure.
+ */
+const PreviewPageCrashed = Schema.optional(Schema.Literal(true));
+
+/** People and agents read the same sentence, so it says how to resume. */
+export const describePreviewCrash = (cause?: string) =>
+  `This tab's page crashed${cause ? ` because ${cause}` : ""}. Reload or navigate the tab to resume.`;
+
 export const PreviewNavStatus = Schema.Union([
   Schema.TaggedStruct("Idle", {}),
   Schema.TaggedStruct("Loading", {
@@ -133,6 +143,7 @@ export const PreviewNavStatus = Schema.Union([
     code: Schema.Int,
     description: Schema.String,
     download: Schema.optional(PreviewFileDownload),
+    crashed: PreviewPageCrashed,
   }),
 ]);
 export type PreviewNavStatus = typeof PreviewNavStatus.Type;
@@ -298,6 +309,7 @@ const PreviewFailedEvent = Schema.Struct({
   code: Schema.Int,
   description: Schema.String,
   download: Schema.optional(PreviewFileDownload),
+  crashed: PreviewPageCrashed,
 });
 
 const PreviewClosedEvent = Schema.Struct({

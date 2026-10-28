@@ -294,6 +294,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
                 ...(input.navStatus.download === undefined
                   ? {}
                   : { download: input.navStatus.download }),
+                ...(input.navStatus.crashed ? { crashed: true as const } : {}),
               }
             : {
                 type: "navigated",
