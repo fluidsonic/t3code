@@ -139,6 +139,20 @@ it("loads a host image through the page's own route when there is no environment
   );
 });
 
+/** The Run buttons, whether named for the block or, in a block of several, for their command. */
+function runButtons(container: HTMLElement) {
+  return [...container.querySelectorAll<HTMLButtonElement>("button")].filter(
+    (button) => button.textContent === "Run",
+  );
+}
+
+/** The actions menu triggers, named for the block or for their command. */
+function menuButtons(container: HTMLElement) {
+  return [...container.querySelectorAll<HTMLButtonElement>("button")].filter((button) =>
+    /^More (command actions|actions for )/.test(button.getAttribute("aria-label") ?? ""),
+  );
+}
+
 describe("ChatMarkdown favicon privacy", () => {
   it("suppresses private link images while preserving public links across updates", async () => {
     setup();
@@ -169,7 +183,7 @@ describe("ChatMarkdown streaming", () => {
         cwd="/tmp/project"
         text={text}
         isStreaming={isStreaming}
-        onRunShellCommand={onRunShellCommand}
+        codeBlockShellActions={{ runInTerminal: onRunShellCommand }}
       />
     );
     await using screen = await render(message("```bash\necho hello\n```", true));
@@ -180,6 +194,15 @@ describe("ChatMarkdown streaming", () => {
     await rerender(message("```bash\necho hello\n```"));
     await act(async () => runButtons()[0]!.click());
     expect(onRunShellCommand).toHaveBeenCalledExactlyOnceWith("echo hello");
+    // Without shell commands the toolbar is the one from before them: the terminal's play button
+    // after the wrap toggle, and no command actions, even on a `! cmd` block.
+    const toolbarLabels = () =>
+      [...container.querySelectorAll<HTMLButtonElement>('[role="toolbar"] button')].map((button) =>
+        button.getAttribute("aria-label"),
+      );
+    expect(toolbarLabels().slice(1)).toEqual(["Run in terminal", "Copy code"]);
+    await rerender(message("```\n! npm test\n```"));
+    expect(toolbarLabels().slice(1)).toEqual(["Copy code"]);
 
     for (const text of [
       "~~~bash\necho tilde\n~~~",
@@ -206,6 +229,184 @@ describe("ChatMarkdown streaming", () => {
     ]) {
       await rerender(message(text));
       expect(runButtons()).toHaveLength(0);
+    }
+  });
+
+  it("offers the command actions on untagged `! cmd` blocks and shell blocks only", async () => {
+    setup();
+    const actions = {
+      runCommand: vi.fn(),
+      editCommand: vi.fn(),
+      runInTerminal: vi.fn(),
+      editInTerminal: vi.fn(),
+      copyToTerminal: vi.fn(),
+      canCopyToTerminal: vi.fn(() => false),
+    };
+    using copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const message = (text: string, isStreaming = false) => (
+      <ChatMarkdown
+        cwd="/tmp/project"
+        text={text}
+        isStreaming={isStreaming}
+        codeBlockShellActions={actions}
+      />
+    );
+    await using screen = await render(message("```\n! npm test\n", true));
+    const { container, rerender } = screen;
+    const runCommandButtons = () => runButtons(container);
+    expect(runCommandButtons()).toHaveLength(0);
+
+    await rerender(message("```\n! npm test\n```"));
+    expect(buttonsLabelled(container, "Run in terminal")).toHaveLength(0);
+    await act(async () => runCommandButtons()[0]!.click());
+    expect(actions.runCommand).toHaveBeenCalledExactlyOnceWith("npm test");
+
+    const menuAction = async (name: string) => {
+      await userEvent.click(menuButtons(container)[0]!);
+      await userEvent.click(page.getByRole("menuitem", { name }));
+    };
+    await menuAction("Edit in the composer");
+    expect(actions.editCommand).toHaveBeenCalledExactlyOnceWith("npm test");
+    await menuAction("Copy command");
+    expect(copy).toHaveBeenCalledExactlyOnceWith("npm test");
+    await menuAction("Edit in terminal");
+    expect(actions.editInTerminal).toHaveBeenCalledExactlyOnceWith("npm test");
+    await menuAction("Run in terminal");
+    expect(actions.runInTerminal).toHaveBeenCalledExactlyOnceWith("npm test");
+    // Copying to a terminal is offered only while one is on screen when the menu opens.
+    await userEvent.click(menuButtons(container)[0]!);
+    await expect.element(page.getByRole("menuitem", { name: "Copy command" })).toBeVisible();
+    expect(page.getByRole("menuitem", { name: "Copy to active terminal" }).query()).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    actions.canCopyToTerminal.mockReturnValue(true);
+    await menuAction("Copy to active terminal");
+    expect(actions.copyToTerminal).toHaveBeenCalledExactlyOnceWith("npm test");
+
+    // A shell block runs as written: its `!` is negation.
+    await rerender(message("```bash\n! grep -q x f && echo missing\n```"));
+    await act(async () => runCommandButtons()[0]!.click());
+    expect(actions.runCommand).toHaveBeenLastCalledWith("! grep -q x f && echo missing");
+    await menuAction("Run in terminal");
+    expect(actions.runInTerminal).toHaveBeenLastCalledWith("! grep -q x f && echo missing");
+
+    // A multi-line script would run line by line as it reached a terminal's prompt.
+    await rerender(message("```sh\ncd web\nnpm run build\n```"));
+    await act(async () => runCommandButtons()[0]!.click());
+    expect(actions.runCommand).toHaveBeenLastCalledWith("cd web\nnpm run build");
+    await userEvent.click(menuButtons(container)[0]!);
+    await expect.element(page.getByRole("menuitem", { name: "Copy command" })).toBeVisible();
+    expect(page.getByRole("menuitem", { name: "Run in terminal" }).query()).toBeNull();
+    await userEvent.keyboard("{Escape}");
+
+    for (const text of [
+      "```text\n! npm test\n```",
+      "```fish\n! npm test\n```",
+      "```powershell\nnpm test\n```",
+      "```bash\n$ npm test\nok\n```",
+      "```\n! npm test\n> ok\n```",
+      "```\nnpm test\n```",
+      "```\n!\n```",
+      "```\n! echo safe \u202e#\n```",
+      "```\n! npm test",
+    ]) {
+      await rerender(message(text));
+      expect(runCommandButtons()).toHaveLength(0);
+    }
+  });
+
+  it("offers each line of a block of `! cmd` lines as its own command", async () => {
+    setup();
+    const actions = { runCommand: vi.fn(), runCommands: vi.fn(), editCommand: vi.fn() };
+    const text =
+      "Clean up:\n\n```\n! cf dns records delete 7da2 -z 7d85\n! cf dns records delete f90f -z e060\n! pnpm redirects-worker:deploy\n```";
+    const message = (
+      markdown: string,
+      shellActions: typeof actions | null = actions,
+      isStreaming = false,
+    ) => (
+      <ChatMarkdown
+        cwd="/tmp/project"
+        text={markdown}
+        isStreaming={isStreaming}
+        codeBlockShellActions={shellActions ?? undefined}
+      />
+    );
+    await using screen = await render(message(text));
+    const { container, rerender } = screen;
+    const runCommandButtons = () => runButtons(container);
+    expect(runCommandButtons()).toHaveLength(3);
+    for (const button of runCommandButtons()) await act(async () => button.click());
+    expect(actions.runCommand.mock.calls).toEqual([
+      ["cf dns records delete 7da2 -z 7d85"],
+      ["cf dns records delete f90f -z e060"],
+      ["pnpm redirects-worker:deploy"],
+    ]);
+    await userEvent.click(menuButtons(container)[2]!);
+    await userEvent.click(page.getByRole("menuitem", { name: "Edit in the composer" }));
+    expect(actions.editCommand).toHaveBeenCalledExactlyOnceWith("pnpm redirects-worker:deploy");
+    // Still one block, which copies as written and runs all of them in order.
+    expect(buttonsLabelled(container, "Copy code")).toHaveLength(1);
+    await act(async () => buttonsLabelled(container, "Run all")[0]!.click());
+    expect(actions.runCommands).toHaveBeenCalledExactlyOnceWith([
+      "cf dns records delete 7da2 -z 7d85",
+      "cf dns records delete f90f -z e060",
+      "pnpm redirects-worker:deploy",
+    ]);
+
+    // A `!` script whose later lines go on without one is one command.
+    await rerender(message("```\n! cd web\nnpm run build\n```"));
+    expect(runCommandButtons()).toHaveLength(1);
+    expect(buttonsLabelled(container, "Run all")).toHaveLength(0);
+    // Without shell commands, or while streaming, the block stays whole.
+    for (const element of [message(text, null), message(text, actions, true)]) {
+      await rerender(element);
+      expect(runCommandButtons()).toHaveLength(0);
+      expect(buttonsLabelled(container, "Copy code")).toHaveLength(1);
+    }
+  });
+
+  it("runs an inline `! cmd` in prose from its own buttons", async () => {
+    setup();
+    const actions = { runCommand: vi.fn(), editCommand: vi.fn() };
+    const text = "Then run `! git -C /repo push origin\n  a:production` once staging is green.";
+    const message = (
+      markdown: string,
+      shellActions: typeof actions | null = actions,
+      isStreaming = false,
+    ) => (
+      <ChatMarkdown
+        cwd="/tmp/project"
+        text={markdown}
+        isStreaming={isStreaming}
+        codeBlockShellActions={shellActions ?? undefined}
+      />
+    );
+    await using screen = await render(message(text));
+    const { container, rerender } = screen;
+    const inlineRunButtons = () =>
+      [...container.querySelectorAll<HTMLButtonElement>("button")].filter((button) =>
+        button.getAttribute("aria-label")?.startsWith("Run "),
+      );
+    await act(async () => inlineRunButtons()[0]!.click());
+    expect(actions.runCommand).toHaveBeenCalledExactlyOnceWith(
+      "git -C /repo push origin a:production",
+    );
+    await userEvent.click(menuButtons(container)[0]!);
+    await userEvent.click(page.getByRole("menuitem", { name: "Edit in the composer" }));
+    expect(actions.editCommand).toHaveBeenCalledExactlyOnceWith(
+      "git -C /repo push origin a:production",
+    );
+
+    // Without shell commands, or while streaming, it stays inline code.
+    for (const element of [message(text, null), message(text, actions, true)]) {
+      await rerender(element);
+      expect(inlineRunButtons()).toHaveLength(0);
+      expect(container.querySelector("p code")?.textContent).toMatch(/^! git -C \/repo push/);
+    }
+    // Code that only starts with `!`, and a command that is a link's text, stay as written.
+    for (const markdown of ["`!isReady`", "`!=`", "[`! npm test`](https://example.com)"]) {
+      await rerender(message(markdown));
+      expect(inlineRunButtons()).toHaveLength(0);
     }
   });
 

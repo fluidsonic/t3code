@@ -67,6 +67,7 @@ import {
   makeProviderReplayGate,
   type ProviderReplayGate,
 } from "@t3tools/provider-testing/replayGate";
+import * as UserShellCommandService from "../UserShellCommandService.ts";
 
 export function makeReplayServerConfig(
   scenario: string,
@@ -271,6 +272,8 @@ export function layerWithRegistry<Error>(
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
+    /** Replaces the `! cmd` executor, so a test decides when and how each command ends. */
+    readonly userShellCommands?: UserShellCommandService.UserShellCommandServiceShape;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -299,6 +302,8 @@ export function layerWithRegistry<Error>(
   );
   const layerServerSettings = ServerSettings.layerTest({
     responseStreamingMode: "turn",
+    // A test that runs `! cmd` commands has the environment's setting on, as a person would.
+    ...(options.userShellCommands === undefined ? {} : { enableShellCommands: true }),
     ...(options.continueThreadsAfterServerUpdate === undefined
       ? {}
       : { continueThreadsAfterServerUpdate: options.continueThreadsAfterServerUpdate }),
@@ -408,7 +413,9 @@ export function layerWithRegistry<Error>(
     ),
   );
   const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
-    Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
+    Layer.provide(
+      Layer.mergeAll(layerStores, layerProviderSessionManagerProvided, layerServerConfig),
+    ),
   );
   const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
     Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
@@ -494,6 +501,12 @@ export function layerWithRegistry<Error>(
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.provide(
       Layer.mergeAll(
+        options.userShellCommands === undefined
+          ? Layer.empty
+          : Layer.succeed(
+              UserShellCommandService.UserShellCommandService,
+              options.userShellCommands,
+            ),
         layerRunFinalizationServiceProvided,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,

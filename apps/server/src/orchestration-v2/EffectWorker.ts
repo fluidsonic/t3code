@@ -26,6 +26,7 @@ import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as UserShellCommandService from "./UserShellCommandService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 
@@ -94,6 +95,8 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const userShellCommands = yield* UserShellCommandService.UserShellCommandService;
+    const workerScope = yield* Effect.scope;
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
@@ -271,6 +274,7 @@ export const layerExecutor: Layer.Layer<
                         threadId: effect.threadId,
                         messageId: message.id,
                         text: message.text,
+                        ...(message.shellCommand === true ? { shellCommand: true } : {}),
                         ...(message.context ? { context: message.context } : {}),
                         attachments: message.attachments,
                         ...(message.delegatedCompletion === undefined
@@ -490,7 +494,9 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           case "terminal.cleanup":
-            return resourceCleanup.cleanupTerminals(effect.threadId).pipe(
+            // Archive and delete clean up terminals; a running `! cmd` ends with them.
+            return userShellCommands.stopThread(effect.threadId).pipe(
+              Effect.andThen(resourceCleanup.cleanupTerminals(effect.threadId)),
               Effect.mapError(
                 (cause) =>
                   new OrchestrationEffectExecutionError({
@@ -539,6 +545,126 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+          case "provider-turn.hold": {
+            const request = effect.request;
+            const target = {
+              threadId: effect.threadId,
+              providerSessionId: request.providerSessionId,
+              providerThreadId: request.providerThreadId,
+              providerTurnId: request.providerTurnId,
+            };
+            if (request.mode === "interrupt") {
+              // Once the turn ends, the queue runs the steered commands.
+              return providerTurnControl
+                .interruptAndAwaitTerminal({ ...target, interruptedAttemptId: request.attemptId })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationEffectExecutionError({
+                        effectId: effect.id,
+                        effectType: request.type,
+                        cause,
+                      }),
+                  ),
+                );
+            }
+            // The agent reaches its steering window whenever its current step ends, so the wait
+            // runs beside the outbox, which would otherwise hold this thread's other effects.
+            const report = (outcome: "paused" | "unavailable") =>
+              threads.dispatch({
+                type: "user-shell-command.hold",
+                commandId: CommandId.make(`${effect.id}:${outcome}`),
+                threadId: effect.threadId,
+                runId: request.runId,
+                providerTurnId: request.providerTurnId,
+                outcome,
+              });
+            return providerTurnControl.pause(target).pipe(
+              Effect.flatMap((outcome) =>
+                outcome === "turn_ended"
+                  ? Effect.void
+                  : report(outcome === "paused" ? "paused" : "unavailable").pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("orchestration-v2.user-shell-hold-report-failed", {
+                          effectId: effect.id,
+                          cause: Cause.pretty(cause),
+                        }).pipe(
+                          // Nothing will release an agent nobody knows is waiting.
+                          Effect.andThen(
+                            outcome === "paused"
+                              ? providerTurnControl.release({
+                                  ...target,
+                                  runId: request.runId,
+                                  messageIds: [],
+                                })
+                              : Effect.void,
+                          ),
+                        ),
+                      ),
+                    ),
+              ),
+              Effect.forkIn(workerScope),
+              Effect.asVoid,
+            );
+          }
+          case "provider-turn.release": {
+            const request = effect.request;
+            return providerTurnControl
+              .release({
+                threadId: effect.threadId,
+                runId: request.runId,
+                providerSessionId: request.providerSessionId,
+                providerThreadId: request.providerThreadId,
+                providerTurnId: request.providerTurnId,
+                messageIds: request.messageIds,
+              })
+              .pipe(
+                // The results join the transcript where the agent got them: in this turn, or as
+                // the next one when it could not take them. A fixed command id makes an outbox
+                // retry replay the report instead of delivering twice.
+                Effect.flatMap((delivered) =>
+                  request.messageIds.length === 0
+                    ? Effect.void
+                    : threads
+                        .dispatch({
+                          type: "user-shell-command.released",
+                          commandId: CommandId.make(`${effect.id}:released`),
+                          threadId: effect.threadId,
+                          runId: request.runId,
+                          messageIds: request.messageIds,
+                          delivered,
+                        })
+                        .pipe(
+                          Effect.asVoid,
+                          // Retrying would release the turn again and send the results twice.
+                          Effect.catchCause((cause) =>
+                            Effect.logWarning("orchestration-v2.user-shell-release-report-failed", {
+                              effectId: effect.id,
+                              cause: Cause.pretty(cause),
+                            }),
+                          ),
+                        ),
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: request.type,
+                      cause,
+                    }),
+                ),
+              );
+          }
+          case "user-shell-command.run":
+            return userShellCommands.start({
+              threadId: effect.threadId,
+              turnItemId: effect.request.turnItemId,
+            });
+          case "user-shell-command.stop":
+            return userShellCommands.stop({
+              threadId: effect.threadId,
+              turnItemIds: effect.request.turnItemIds,
+            });
           case "delegated-tasks.stop":
             return threads
               .stopDelegatedTasks({

@@ -211,6 +211,38 @@ describe("thread workflows", () => {
     }
   });
 
+  it("marks a queued `! cmd` so its row and edit keep it a command", () => {
+    const state = deriveThreadQueueWorkflowState({
+      thread: { id: "thread", activeProviderThreadId: null },
+      runs: [
+        { id: "command", status: "queued", userMessageId: "command", ordinal: 1 },
+        { id: "prose", status: "queued", userMessageId: "prose", ordinal: 2 },
+        { id: "ran", status: "queued", userMessageId: "ran", ordinal: 3 },
+      ],
+      messages: [
+        { id: "command", text: "npm test", shellCommand: true },
+        { id: "prose", text: "!important" },
+        { id: "ran", text: "ls", shellCommand: true },
+      ],
+      // A usage limit sent this run back to the queue after its command ran.
+      turnItems: [{ type: "command_execution", userShellMessageId: "ran", status: "completed" }],
+      providerThreads: [],
+      providerTurns: [],
+      providerSessions: [],
+    } as never);
+    expect(
+      state.queuedRuns.map(({ text, shellCommand, shellCommandRan }) => [
+        text,
+        shellCommand,
+        shellCommandRan,
+      ]),
+    ).toEqual([
+      ["npm test", true, undefined],
+      ["!important", undefined, undefined],
+      ["ls", true, true],
+    ]);
+  });
+
   it("hides automatic completion delivery from the visible queue", () => {
     const state = deriveThreadQueueWorkflowState({
       thread: { id: "thread", activeProviderThreadId: null },

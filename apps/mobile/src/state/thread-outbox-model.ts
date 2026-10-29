@@ -52,6 +52,10 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   messageId: MessageId,
   commandId: CommandId,
   text: Schema.String,
+  shellCommand: Schema.optional(Schema.Boolean),
+  followingShellCommands: Schema.optional(
+    Schema.Array(Schema.Struct({ messageId: MessageId, text: Schema.String })),
+  ),
   context: Schema.optional(OrchestrationMessageContext),
   attachments: Schema.Array(DraftComposerAttachmentSchema),
   modelSelection: Schema.optional(ModelSelection),
@@ -82,6 +86,16 @@ export interface QueuedThreadMessage {
   readonly messageId: MessageId;
   readonly commandId: CommandId;
   readonly text: string;
+  /**
+   * `text` is a shell command in its stored `! cmd` form. It runs whenever the message is
+   * delivered, like any queued message.
+   */
+  readonly shellCommand?: boolean;
+  /** More commands sent with it to run in order, as one group (a code block's Run all). */
+  readonly followingShellCommands?: ReadonlyArray<{
+    readonly messageId: MessageId;
+    readonly text: string;
+  }>;
   readonly context?: OrchestrationMessageContext;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly modelSelection?: ModelSelectionType;
