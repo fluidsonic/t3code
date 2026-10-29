@@ -334,6 +334,7 @@ import {
   resolveSendEnvMode,
   startNewThreadForProject,
   codexArtifactTemplatePromptToAppend,
+  isFocusTakingPressTarget,
   shouldRefocusComposerOnWindowFocus,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -2070,6 +2071,17 @@ export default function ChatView(props: ChatViewProps) {
   useEffect(() => {
     if (!activeThread?.id || terminalUiState.terminalOpen || isMobileViewport) return;
     let frame: number | null = null;
+    // Reset on blur, not focus: the press that returns to the window can arrive on either side
+    // of the window's focus event.
+    let pressedFocusTakingTarget = false;
+    // Trusted only: the press the app replays for one inside the browser page is not one here.
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.isTrusted && event.target instanceof Element)
+        pressedFocusTakingTarget = isFocusTakingPressTarget(event.target);
+    };
+    const onWindowBlur = () => {
+      pressedFocusTakingTarget = false;
+    };
     const onWindowFocus = () => {
       if (frame !== null) window.cancelAnimationFrame(frame);
       // Wait an extra frame after window focus so the composer treats focus as an expansion request.
@@ -2077,13 +2089,21 @@ export default function ChatView(props: ChatViewProps) {
         frame = window.requestAnimationFrame(() => {
           frame = null;
           if (document.querySelector("[data-mcp-app-fullscreen]") !== null) return;
-          if (shouldRefocusComposerOnWindowFocus(document.activeElement)) focusComposerStable();
+          if (
+            shouldRefocusComposerOnWindowFocus(document.activeElement, pressedFocusTakingTarget)
+          ) {
+            focusComposerStable();
+          }
         });
       });
     };
     window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("blur", onWindowBlur);
+    window.addEventListener("pointerdown", onPointerDown, true);
     return () => {
       window.removeEventListener("focus", onWindowFocus);
+      window.removeEventListener("blur", onWindowBlur);
+      window.removeEventListener("pointerdown", onPointerDown, true);
       if (frame !== null) window.cancelAnimationFrame(frame);
     };
   }, [activeThread?.id, focusComposerStable, isMobileViewport, terminalUiState.terminalOpen]);
