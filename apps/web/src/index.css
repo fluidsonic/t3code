@@ -1834,6 +1834,33 @@ code {
   }
 }
 
+/* A press in a drag region never reaches the page, so an open popup could not
+   be dismissed from the titlebar. Dragging pauses while one is open. Child
+   combinators bound the match to portals at the top or one level down (a
+   dialog's), so DOM changes elsewhere do not make Chromium re-match all of body. */
+body:has(
+    > *
+      > [data-open]:is(
+        [data-slot="menu-positioner"],
+        [data-slot="popover-positioner"],
+        [data-slot="select-positioner"],
+        [data-slot="combobox-positioner"],
+        [data-slot="autocomplete-positioner"]
+      ),
+    > *
+      > *
+      > [data-open]:is(
+        [data-slot="menu-positioner"],
+        [data-slot="popover-positioner"],
+        [data-slot="select-positioner"],
+        [data-slot="combobox-positioner"],
+        [data-slot="autocomplete-positioner"]
+      )
+  )
+  .drag-region {
+  -webkit-app-region: no-drag;
+}
+
 .drag-region button,
 .drag-region input,
 .drag-region textarea,
