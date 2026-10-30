@@ -55,6 +55,8 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
       return makeEncoderPage() as unknown as Page;
     }
     async connectDesktopPage(endpoint: string) {
+      if (desktopCrashes.has(endpoint.slice("ws://desktop/".length)))
+        throw new Error("A crashed desktop page answers nothing.");
       const context = makeContext();
       desktopConnections.push({ endpoint, context });
       return { browser: { close: async () => {} }, page: context.page as unknown as Page };
@@ -124,84 +126,101 @@ function makeSession(frame?: ReturnType<typeof makeFrame>) {
 }
 
 function makeContext(onClose?: (context: BrowserContext) => void) {
-  const events = new NodeEvents.EventEmitter();
-  const nativeFileChooser = vi.fn();
-  const setChooserFiles = vi.fn(async (_files: unknown) => {});
   const sessions: ReturnType<typeof makeSession>[] = [];
-  let url = "about:blank";
-  let viewport = { width: 1280, height: 800 };
-  let closed = false;
   let contextClosed = false;
-  const page = {
-    on: (name: string, callback: (...args: unknown[]) => void) => events.on(name, callback),
-    once: (name: string, callback: (...args: unknown[]) => void) => events.once(name, callback),
-    off: (name: string, callback: (...args: unknown[]) => void) => events.off(name, callback),
-    emit: (name: string, ...args: unknown[]) => events.emit(name, ...args),
-    nativeFileChooser,
-    setChooserFiles,
-    openFileChooser: () => {
-      if (
-        !events.emit("filechooser", {
-          isMultiple: () => false,
-          element: () => ({ getAttribute: async () => ".csv" }),
-          setFiles: setChooserFiles,
-        })
-      ) {
-        nativeFileChooser();
-      }
-    },
-    emitAsync: (name: string, ...args: unknown[]) =>
-      Promise.all(events.listeners(name).map((listener) => listener(...args))),
-    setDefaultTimeout: vi.fn(),
-    setDefaultNavigationTimeout: vi.fn(),
-    context: () => context,
-    mainFrame: () => page,
-    frames: () => [page],
-    url: () => url,
-    title: vi.fn(async () => "test page"),
-    viewportSize: () => viewport,
-    setViewportSize: vi.fn(async (size: typeof viewport) => {
-      viewport = size;
-    }),
-    goto: vi.fn(async (next: string) => {
-      url = next;
-      events.emit("load");
-      const pending = initialNavigation;
-      initialNavigation = null;
-      await pending?.();
-    }),
-    goBack: vi.fn(async () => {}),
-    goForward: vi.fn(async () => {}),
-    reload: vi.fn(async () => {}),
-    emulateMedia: vi.fn(async () => {}),
-    waitForLoadState: vi.fn(async () => {}),
-    evaluate: vi.fn(async () => ({
-      url,
-      title: "test page",
-      loading: false,
-      visibleText: "delete",
-      interactiveElements: [],
-    })),
-    ariaSnapshot: vi.fn(async () => '- button "delete" [ref=e1]'),
-    locator: vi.fn(() => {
-      throw new Error("Unexpected locator action");
-    }),
-    isClosed: () => closed,
-    close: vi.fn(async () => {
-      if (!closed) {
-        closed = true;
-        events.emit("close");
-      }
-    }),
+  const makePage = () => {
+    const events = new NodeEvents.EventEmitter();
+    const nativeFileChooser = vi.fn();
+    const setChooserFiles = vi.fn(async (_files: unknown) => {});
+    let url = "about:blank";
+    let viewport = { width: 1280, height: 800 };
+    let closed = false;
+    const page = {
+      on: (name: string, callback: (...args: unknown[]) => void) => events.on(name, callback),
+      once: (name: string, callback: (...args: unknown[]) => void) => events.once(name, callback),
+      off: (name: string, callback: (...args: unknown[]) => void) => events.off(name, callback),
+      emit: (name: string, ...args: unknown[]) => events.emit(name, ...args),
+      nativeFileChooser,
+      setChooserFiles,
+      openFileChooser: () => {
+        if (
+          !events.emit("filechooser", {
+            isMultiple: () => false,
+            element: () => ({ getAttribute: async () => ".csv" }),
+            setFiles: setChooserFiles,
+          })
+        ) {
+          nativeFileChooser();
+        }
+      },
+      emitAsync: (name: string, ...args: unknown[]) =>
+        Promise.all(events.listeners(name).map((listener) => listener(...args))),
+      setDefaultTimeout: vi.fn(),
+      setDefaultNavigationTimeout: vi.fn(),
+      context: () => context,
+      mainFrame: () => page,
+      frames: () => [page],
+      url: () => url,
+      title: vi.fn(async () => "test page"),
+      viewportSize: () => viewport,
+      setViewportSize: vi.fn(async (size: typeof viewport) => {
+        viewport = size;
+      }),
+      goto: vi.fn(async (next: string) => {
+        url = next;
+        events.emit("load");
+        const pending = initialNavigation;
+        initialNavigation = null;
+        await pending?.();
+      }),
+      goBack: vi.fn(async () => {}),
+      goForward: vi.fn(async () => {}),
+      reload: vi.fn(async () => {}),
+      emulateMedia: vi.fn(async () => {}),
+      waitForLoadState: vi.fn(async () => {}),
+      evaluate: vi.fn(async () => ({
+        url,
+        title: "test page",
+        loading: false,
+        visibleText: "delete",
+        interactiveElements: [],
+      })),
+      ariaSnapshot: vi.fn(async () => '- button "delete" [ref=e1]'),
+      locator: vi.fn(() => {
+        throw new Error("Unexpected locator action");
+      }),
+      isClosed: () => closed,
+      close: vi.fn(async () => {
+        if (!closed) {
+          closed = true;
+          events.emit("close");
+        }
+      }),
+    };
+    return page;
   };
+  const page = makePage();
+  const pages = [page];
+  let firstPage = true;
   const context = {
     page,
+    pages,
     sessions,
-    newPage: async () => page as unknown as Page,
+    newPage: async () => {
+      if (firstPage) {
+        firstPage = false;
+        return page as unknown as Page;
+      }
+      const next = makePage();
+      pages.push(next);
+      return next as unknown as Page;
+    },
     grantPermissions: vi.fn(async () => {}),
     newCDPSession: async (target: unknown) => {
       const session = makeSession(
-        target === page ? undefined : (target as ReturnType<typeof makeFrame>),
+        pages.includes(target as typeof page)
+          ? undefined
+          : (target as ReturnType<typeof makeFrame>),
       );
       sessions.push(session);
       return session;
@@ -209,7 +228,7 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     close: vi.fn(async () => {
       if (contextClosed) return;
       contextClosed = true;
-      await page.close();
+      for (const current of pages) await current.close();
       onClose?.(context as unknown as BrowserContext);
     }),
   };
@@ -279,6 +298,18 @@ const desktopRenders = (tabId: string) => {
 };
 const releasedDesktopTabs: Array<string> = [];
 const desktopTurns = new NodeEvents.EventEmitter();
+let desktopReleased = Promise.withResolvers<void>();
+// What the desktop channel remembers of each tab's unrevived crash.
+const desktopCrashes = new Map<string, string>();
+const crashDesktop = (key: { threadId: string; tabId: string }, message: string | null) => {
+  if (message === null) desktopCrashes.delete(key.tabId);
+  else desktopCrashes.set(key.tabId, message);
+  desktopDetaches.emit("crash", { key, message });
+};
+const reloadedDesktopTabs: Array<string> = [];
+// Whether a reload the server asks for revives the page, as a crashed page's normally does.
+let desktopReloadRevives = true;
+let desktopReloadRequested = Promise.withResolvers<void>();
 const desktopConnections: Array<{ endpoint: string; context: ReturnType<typeof makeContext> }> = [];
 const testThread = {
   threadId: ThreadId.make("browser-test-thread"),
@@ -336,10 +367,37 @@ const dependencies = Layer.mergeAll(
     isAttached: (key) => Effect.sync(() => desktopRenders(key.tabId)),
     endpoint: (key) =>
       Effect.acquireRelease(Effect.succeed(`ws://desktop/${key.tabId}`), () =>
-        Effect.sync(() => releasedDesktopTabs.push(key.tabId)),
+        Effect.sync(() => {
+          releasedDesktopTabs.push(key.tabId);
+          desktopReleased.resolve();
+        }),
       ),
     pointer: () => Effect.void,
     turn: (threadId, active) => Effect.sync(() => desktopTurns.emit("turn", threadId, active)),
+    // The desktop reloads the crashed page, and it comes back.
+    reload: (key) =>
+      Effect.sync(() => {
+        reloadedDesktopTabs.push(key.tabId);
+        desktopReloadRequested.resolve();
+        if (desktopReloadRevives) crashDesktop(key, null);
+      }),
+    crashOf: (key) => desktopCrashes.get(key.tabId),
+    crashes: Stream.callback<{
+      key: { threadId: string; tabId: string };
+      message: string | null;
+    }>((queue) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const onCrash = (crash: {
+            key: { threadId: string; tabId: string };
+            message: string | null;
+          }) => Queue.offerUnsafe(queue, crash);
+          desktopDetaches.on("crash", onCrash);
+          return onCrash;
+        }),
+        (onCrash) => Effect.sync(() => desktopDetaches.off("crash", onCrash)),
+      ),
+    ),
   }),
   PreviewAgentActivity.layer,
 ).pipe(
@@ -381,6 +439,11 @@ beforeEach(() => {
   desktopTabs.clear();
   desktopRendersNext = false;
   releasedDesktopTabs.length = 0;
+  desktopReleased = Promise.withResolvers<void>();
+  desktopCrashes.clear();
+  reloadedDesktopTabs.length = 0;
+  desktopReloadRevives = true;
+  desktopReloadRequested = Promise.withResolvers<void>();
   desktopConnections.length = 0;
 });
 
@@ -435,6 +498,185 @@ it.live("preview_open reports its navigation timeout instead of the request budg
       expect(error.message).toBe("Preview automation open timed out after 15000ms.");
     }),
   ).pipe(Effect.provide(layer)),
+);
+
+it.live("a crashed tab stays open and tells agents it crashed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const events = yield* manager.subscribeEvents;
+
+      contexts[0]!.page.emit("crash");
+      // Before the fix, the crash closed the tab.
+      let event = yield* PubSub.take(events);
+      while (event.type !== "failed" && event.type !== "closed") event = yield* PubSub.take(events);
+      expect(event.type).toBe("failed");
+
+      const failure = yield* broker
+        .invoke<PreviewAutomationSnapshot>({ scope, tabId, operation: "snapshot", input: {} })
+        .pipe(Effect.flip);
+      expect(failure).toMatchObject({
+        _tag: "PreviewAutomationExecutionError",
+        message: expect.stringMatching(/crash.*Reload/i),
+      });
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toMatchObject([
+        {
+          tabId,
+          navStatus: {
+            _tag: "LoadFailed",
+            crashed: true,
+            description: expect.stringMatching(/crash/i),
+          },
+        },
+      ]);
+      // The page sends no more frames, so the viewer reconnects rather than freezing on the last.
+      const output = yield* Queue.clear(viewer.output);
+      expect(output.some((item) => item._tag === "reconnect")).toBe(true);
+      expect(output.some((item) => item._tag === "gone")).toBe(false);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live.each(["reload", "agent", "hard reload"] as const)(
+  "a crashed tab revives through %s in its own browser context",
+  (recovery) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const browser = yield* ServerBrowser.ServerBrowser;
+        const broker = yield* Broker.PreviewAutomationBroker;
+        const manager = yield* Manager.PreviewManager;
+        yield* Effect.yieldNow;
+        const events = yield* manager.subscribeEvents;
+        const opened = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { url: "https://example.com/original", reuseExistingTab: false, show: false },
+        });
+        const tabId = PreviewTabId.make(opened.tabId!);
+        const context = contexts[0]!;
+        context.page.emit("crash");
+        let event = yield* PubSub.take(events);
+        while (event.type !== "failed" && event.type !== "closed")
+          event = yield* PubSub.take(events);
+        expect(event.type).toBe("failed");
+
+        const url =
+          recovery === "agent" ? "https://example.com/recovered" : "https://example.com/original";
+        if (recovery === "agent") {
+          yield* broker.invoke({ scope, tabId, operation: "navigate", input: { url } });
+        } else if (recovery === "hard reload") {
+          yield* manager.adjust({ threadId: scope.thread.threadId, tabId, hardReload: true });
+        } else {
+          // A viewer that connects to the crashed tab can still revive it.
+          const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+          yield* viewer.input({ type: "takeControl" });
+          yield* viewer.input({ type: "reload" });
+        }
+        event = yield* PubSub.take(events);
+        while (event.type !== "navigated" || event.snapshot.navStatus._tag !== "Success")
+          event = yield* PubSub.take(events);
+
+        expect(event.snapshot.navStatus).toMatchObject({ url });
+        // The new page shares the crashed one's context, so cookies and sign-ins carry over.
+        expect(contexts).toHaveLength(1);
+        expect(context.close).not.toHaveBeenCalled();
+        expect(context.pages).toHaveLength(2);
+        expect(context.page.isClosed()).toBe(true);
+        expect(context.pages[1]!.url()).toBe(url);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "a desktop crash marks the tab crashed with the desktop's message, and recovering it reloads the page there",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        desktopRendersNext = true;
+        const { broker, tabId } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const events = yield* manager.subscribeEvents;
+        const message = "This tab's page crashed because it ran out of memory.";
+        crashDesktop({ threadId: scope.thread.threadId, tabId }, message);
+        let event = yield* PubSub.take(events);
+        while (event.type !== "failed" && event.type !== "closed")
+          event = yield* PubSub.take(events);
+        expect(event).toMatchObject({ type: "failed", crashed: true, description: message });
+        const failure = yield* broker
+          .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+          .pipe(Effect.flip);
+        expect(failure.message).toContain(message);
+
+        const url = "https://example.com/recovered";
+        yield* broker.invoke({ scope, tabId, operation: "navigate", input: { url } });
+        expect(reloadedDesktopTabs).toEqual([tabId]);
+        // The server connects to the revived desktop page again and loads the URL there.
+        expect(desktopConnections).toHaveLength(2);
+        expect(desktopConnections[1]!.context.page.url()).toBe(url);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("closing a crashed desktop tab ends a recovery still waiting for the desktop", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      desktopRendersNext = true;
+      desktopReloadRevives = false;
+      const { broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+      crashDesktop({ threadId: scope.thread.threadId, tabId }, "This tab's page crashed.");
+      let event = yield* PubSub.take(events);
+      while (event.type !== "failed") event = yield* PubSub.take(events);
+
+      const navigating = yield* broker
+        .invoke({ scope, tabId, operation: "navigate", input: { url: "https://example.com/" } })
+        .pipe(Effect.asVoid, Effect.flip, Effect.forkChild({ startImmediately: true }));
+      yield* Effect.promise(() => desktopReloadRequested.promise);
+      yield* manager.close({ threadId: scope.thread.threadId, tabId });
+
+      // The desktop never answers for a closed tab, so the navigation fails now rather than
+      // timing out waiting for it.
+      const failure = yield* Fiber.join(navigating);
+      expect(failure._tag).toBe("PreviewAutomationExecutionError");
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "a desktop page that crashes while the server is disconnected from it reports the crash",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        desktopRendersNext = true;
+        const { broker, tabId } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const key = { threadId: scope.thread.threadId, tabId };
+        // Opening the page's DevTools takes its debugger from the server.
+        desktopDetaches.emit("detach", key);
+        yield* Effect.promise(() => desktopReleased.promise);
+        const events = yield* manager.subscribeEvents;
+        const message = "This tab's page crashed because it ran out of memory.";
+        crashDesktop(key, message);
+
+        // The server must not connect to the dead page, which answers nothing.
+        const failure = yield* broker
+          .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+          .pipe(Effect.flip);
+        expect(failure.message).toContain(message);
+        let event = yield* PubSub.take(events);
+        while (event.type !== "failed") event = yield* PubSub.take(events);
+        expect(event).toMatchObject({ crashed: true, description: message });
+
+        const url = "https://example.com/recovered";
+        yield* broker.invoke({ scope, tabId, operation: "navigate", input: { url } });
+        expect(reloadedDesktopTabs).toEqual([tabId]);
+        expect(desktopConnections).toHaveLength(2);
+        expect(desktopConnections[1]!.context.page.url()).toBe(url);
+      }),
+    ).pipe(Effect.provide(layer)),
 );
 
 it.live.each(["desktop" as const, undefined])(
