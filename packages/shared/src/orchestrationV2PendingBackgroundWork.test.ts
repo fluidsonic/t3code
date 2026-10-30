@@ -176,6 +176,25 @@ describe("derivePendingBackgroundWork", () => {
     expect(tasks).toEqual([{ taskId: "cmd-1", description: "npm test", kind: "command" }]);
   });
 
+  it("leaves out a person's shell command that outlived the turn it was steered into", () => {
+    const tasks = derivePendingBackgroundWork({
+      latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },
+      providerThreads: [{ id: "pt-1" as never }],
+      turnItems: [
+        {
+          id: "turn-item:user-shell:message-1" as never,
+          type: "command_execution",
+          status: "running",
+          title: null,
+          runId: "run-1" as never,
+          input: "npm test",
+          userShellMessageId: "message-1",
+        },
+      ],
+    });
+    expect(tasks).toEqual([]);
+  });
+
   it("dedupes roster entries against turn items by native task id", () => {
     const tasks = derivePendingBackgroundWork({
       latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },

@@ -149,6 +149,11 @@ describe("idleCompactionWindow", () => {
     const compacted = records(cache);
     compacted.messages = [{ ...compacted.messages[0]!, text: "/compact" }];
     expect(idleCompactionWindow(compacted, NOW_MS)).toBeNull();
+    const shellCommand = records(cache);
+    shellCommand.messages = [
+      { ...shellCommand.messages[0]!, text: "/compact", shellCommand: true },
+    ];
+    expect(idleCompactionWindow(shellCommand, NOW_MS)).not.toBeNull();
     const archived = records(cache);
     archived.thread = { ...archived.thread, archivedAt: at() };
     expect(idleCompactionWindow(archived, NOW_MS)).toBeNull();

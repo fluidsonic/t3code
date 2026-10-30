@@ -262,6 +262,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --color-placeholder: var(--contrast-placeholder);
   --color-secondary-label: var(--contrast-secondary-label);
   --color-icon-muted: var(--contrast-icon-muted);
+  /* The faint violet behind a shell command, in the composer, a sent one, or a code block row. */
+  --color-shell-command-tint: color-mix(in srgb, var(--color-violet-500) 9%, transparent);
   --color-secondary-foreground: var(--contrast-secondary-foreground);
   --color-secondary: var(--secondary);
   --color-primary-foreground: var(--primary-foreground);
@@ -1791,6 +1793,7 @@ code {
    diffs and file previews take the size through --diffs-font-size. */
 .chat-markdown .chat-markdown-shiki :is(.shiki, .diffs),
 .chat-markdown .chat-markdown-codeblock pre,
+.chat-markdown .chat-markdown-codeblock-commands,
 :is(.chat-markdown, .composer-tiptap) pre code {
   font-size: var(--font-size-code, inherit);
 }
@@ -2373,6 +2376,133 @@ body:has(
 
 .ultrathink-chroma {
   filter: saturate(1.2);
+}
+
+/* `! cmd` shell commands, in the composer and the thread. Violet marks no other surface. */
+:root {
+  --shell-command-prefix-size: 1.35em;
+  --shell-command-gap: 0.65em;
+  --shell-command-indent: calc(var(--shell-command-prefix-size) + var(--shell-command-gap));
+}
+
+/* The `!` in a small square, drawn by the composer's editor decorations too. */
+.shell-command-prefix {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--shell-command-prefix-size);
+  height: var(--shell-command-prefix-size);
+  border-radius: 0.3em;
+  background-color: color-mix(in srgb, var(--color-violet-500) 24%, transparent);
+  color: var(--color-violet-700);
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: middle;
+
+  @variant dark {
+    color: var(--color-violet-300);
+  }
+}
+
+.shell-command-gap {
+  display: inline-block;
+  width: var(--shell-command-gap);
+}
+
+/*
+ * Every line of a command starts where the first line's text does; the `!` hangs before it.
+ * Only the indent: the element's own classes decide its display, such as the resting placeholder's
+ * flex.
+ */
+.shell-command-text {
+  padding-inline-start: var(--shell-command-indent);
+}
+
+.composer-tiptap.shell-command-text {
+  padding-inline-start: calc(0.25rem + var(--shell-command-indent));
+}
+
+.shell-command-text .shell-command-prefix {
+  margin-inline-start: calc(-1 * var(--shell-command-indent));
+}
+
+/*
+ * A command shown as a block hangs its `!` in the indent, out of the text's flow: anything before
+ * the command on its first line is a place to break, so a long command that can't fit after the `!`
+ * would move whole to the next line instead of breaking where it overflows.
+ */
+.shell-command-text > .shell-command-lead {
+  position: absolute;
+  inset-inline-start: 0;
+  /* Centered on the first line, which a badge taller than the line would otherwise outgrow. */
+  display: flex;
+  align-items: center;
+  height: 1lh;
+}
+
+.shell-command-text > .shell-command-lead .shell-command-prefix {
+  margin-inline-start: 0;
+}
+
+/* An inline `! cmd` in prose. Its `!` and buttons are centered on the text, a hair above `middle`. */
+.shell-command-inline {
+  --shell-command-prefix-size: 1.25em;
+  --shell-command-gap: 0.45em;
+  border-radius: 0.4em;
+  /* Inline code's surface, tinted: the tint alone all but vanishes on a dark page. */
+  background:
+    linear-gradient(var(--color-shell-command-tint), var(--color-shell-command-tint)),
+    color-mix(in srgb, var(--contrast-foreground) 10%, transparent);
+  padding: 0.15em;
+  font-size: 0.85em;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+
+  & .shell-command-prefix {
+    position: relative;
+    top: -0.05em;
+  }
+}
+
+.shell-command-inline-actions {
+  display: inline-flex;
+  position: relative;
+  top: -0.05em;
+  gap: 0.05em;
+  margin-inline-start: 0.35em;
+  vertical-align: middle;
+}
+
+.shell-command-inline-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  height: 1.25em;
+  border-radius: 0.3em;
+  color: var(--muted-foreground);
+  cursor: pointer;
+
+  &:hover,
+  &:focus-visible,
+  &[data-popup-open] {
+    background-color: color-mix(in srgb, var(--color-violet-500) 16%, transparent);
+    color: var(--color-violet-700);
+
+    @variant dark {
+      color: var(--color-violet-300);
+    }
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
+  }
+
+  & svg {
+    width: 0.85em;
+    height: 0.85em;
+  }
 }
 
 @keyframes preview-loading-progress {

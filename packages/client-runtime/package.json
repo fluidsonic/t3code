@@ -51,6 +51,10 @@
       "types": "./src/projectFaviconCache.ts",
       "default": "./src/projectFaviconCache.ts"
     },
+    "./user-shell-command": {
+      "types": "./src/userShellCommand.ts",
+      "default": "./src/userShellCommand.ts"
+    },
     "./user-message": {
       "types": "./src/userMessage.ts",
       "default": "./src/userMessage.ts"

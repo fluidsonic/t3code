@@ -20,6 +20,7 @@ import {
   type OrchestrationV2UserInputQuestion,
   type ProviderApprovalDecision,
   type ProviderInstanceId,
+  type ProviderTurnId,
   type OrchestrationV2ProviderTurnTokenUsage,
 } from "@t3tools/contracts";
 import { PiSettings } from "../settings.ts";
@@ -70,7 +71,7 @@ import {
   materializePiT3McpExtension,
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
-import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import { PI_FILE_CHANGE_TOOLS, PI_T3_HOLD_TITLE } from "./mcpExtensionSource.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -457,6 +458,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       const extensionPath = yield* provideCacheFs(
         materializePiT3McpExtension(host.paths.providerStatusCacheDir),
       );
+      // The bridge checks for this file before each tool call; see `pauseTurn`. Only a session
+      // opened with shell commands on gets one: without it the bridge checks nothing and
+      // steered commands interrupt the turn instead of holding it.
+      const shellCommandsEnabled = yield* host.settings.get.pipe(
+        Effect.map((settings) => settings.enableShellCommands),
+        Effect.orElseSucceed(() => false),
+      );
+      const holdFile = shellCommandsEnabled
+        ? `${host.paths.providerStatusCacheDir.replace(/\\/g, "/")}/pi-hold-${String(
+            input.providerSessionId,
+          ).replace(/[^A-Za-z0-9._-]/g, "_")}`
+        : undefined;
       const resolvedLaunchArgs = resolvePiLaunchArgs(options.settings.launchArgs);
       if (!resolvedLaunchArgs.ok) {
         return yield* protocolError(resolvedLaunchArgs.message);
@@ -467,6 +480,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         mcpSession,
         extensionPath,
         runtimeMode: input.runtimePolicy.runtimeMode,
+        ...(holdFile === undefined ? {} : { holdFile }),
       });
       const scopedLaunch = yield* agentScope.wrap({
         command: options.settings.binaryPath || "pi",
@@ -529,6 +543,44 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       let lastNativeThreadId: string | null = null;
       let stopRequested = false;
       let unsolicitedActivityDetected = false;
+      // A hold for steered shell commands: asked for (the hold file exists) until the bridge's
+      // hold dialog arrives, then held until released. Parallel tool calls each raise one.
+      let turnHold:
+        | {
+            readonly phase: "armed";
+            readonly providerTurnId: ProviderTurnId;
+            readonly paused: Deferred.Deferred<"paused" | "turn_ended">;
+          }
+        | {
+            readonly phase: "held";
+            readonly providerTurnId: ProviderTurnId;
+            readonly requestIds: Array<string>;
+          }
+        | null = null;
+      const removeHoldFile =
+        holdFile === undefined
+          ? Effect.void
+          : fileSystem.remove(holdFile, { force: true }).pipe(Effect.ignore);
+      if (holdFile !== undefined) {
+        yield* removeHoldFile;
+        yield* Effect.addFinalizer(() => removeHoldFile);
+      }
+      // Lets Pi continue and clears the hold, for a release, a turn's end, or a given-up wait.
+      const endTurnHold = Effect.fnUntraced(function* (providerTurnId: ProviderTurnId) {
+        const current = turnHold;
+        if (current === null || current.providerTurnId !== providerTurnId) return;
+        turnHold = null;
+        yield* removeHoldFile;
+        if (current.phase === "armed") {
+          yield* Deferred.succeed(current.paused, "turn_ended");
+          return;
+        }
+        for (const id of current.requestIds) {
+          yield* connection
+            .send({ type: "extension_ui_response", id, confirmed: true })
+            .pipe(Effect.ignore);
+        }
+      });
       let pendingWake: PiWake | null = null;
       let rollbackBarrier: Deferred.Deferred<
         void,
@@ -1216,6 +1268,31 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const method = recordString(event, "method");
         const nativeRequestId = recordString(event, "id");
         if (method === undefined) return;
+        if (method === "confirm" && recordString(event, "title") === PI_T3_HOLD_TITLE) {
+          if (nativeRequestId === undefined) return;
+          const current = turnHold;
+          const turnId = threadState?.activeTurn?.providerTurn.id;
+          if (current === null || current.providerTurnId !== turnId) {
+            // A hold file left from an earlier hold: nothing waits on this one.
+            yield* connection.send({
+              type: "extension_ui_response",
+              id: nativeRequestId,
+              confirmed: true,
+            });
+            return;
+          }
+          if (current.phase === "held") {
+            current.requestIds.push(nativeRequestId);
+            return;
+          }
+          turnHold = {
+            phase: "held",
+            providerTurnId: current.providerTurnId,
+            requestIds: [nativeRequestId],
+          };
+          yield* Deferred.succeed(current.paused, "paused");
+          return;
+        }
         if (method === "notify") {
           const state = threadState;
           const turn = state?.activeTurn ?? null;
@@ -1463,6 +1540,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const turn = state.activeTurn;
         if (turn === null) return;
         state.activeTurn = null;
+        yield* endTurnHold(turn.providerTurn.id);
         const interrupted = turn.interrupted || turn.nativeAborted;
         const completedAt = yield* DateTime.now;
         yield* completeOpenStreamItems(turn);
@@ -2324,6 +2402,49 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return { message, images };
       });
 
+      const steerActiveTurn = Effect.fnUntraced(function* (
+        providerTurnId: ProviderTurnId,
+        text: string,
+        attachments: ReadonlyArray<ChatAttachment>,
+      ) {
+        const turn = threadState?.activeTurn ?? null;
+        if (turn === null || turn.providerTurn.id !== providerTurnId) {
+          return yield* protocolError(`Pi turn ${providerTurnId} is not active`);
+        }
+        const compactCommand = parsePiCompactCommand(text);
+        const payload =
+          compactCommand === null ? yield* resolvePromptPayload(text, attachments) : null;
+        // prompt with steer atomically queues or starts; fire-and-forget under the permit avoids dialog deadlocks.
+        // /compact uses its RPC, which aborts the agent first.
+        yield* sessionEventPermit.withPermits(1)(
+          Effect.gen(function* () {
+            if (threadState?.activeTurn !== turn) {
+              return yield* protocolError(`Pi turn ${providerTurnId} is not active`);
+            }
+            if (compactCommand !== null) {
+              turn.manualCompactInFlight = true;
+              yield* connection.send(compactRpcRecord(compactCommand));
+              pendingCompactResponses.push({
+                providerTurnId: turn.providerTurn.id,
+                kind: "steer",
+              });
+            } else if (payload !== null) {
+              yield* connection.send({
+                type: "prompt",
+                message: payload.message,
+                streamingBehavior: "steer",
+                ...(payload.images.length === 0 ? {} : { images: payload.images }),
+              });
+              pendingPromptResponses.push({
+                providerTurnId: turn.providerTurn.id,
+                kind: "steer",
+              });
+            }
+            turn.settleProbeGeneration += 1;
+          }),
+        );
+      });
+
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: PI_PROVIDER,
@@ -2565,46 +2686,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         ),
         steerTurn: Effect.fn("PiAdapter.steerTurn")(
           function* (steerInput: ProviderAdapter.ProviderAdapterV2SteerInput) {
-            const turn = threadState?.activeTurn ?? null;
-            if (turn === null || turn.providerTurn.id !== steerInput.providerTurnId) {
-              return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
-            }
-            const compactCommand = parsePiCompactCommand(steerInput.message.text);
-            const payload =
-              compactCommand === null
-                ? yield* resolvePromptPayload(
-                    steerInput.message.text,
-                    steerInput.message.attachments,
-                  )
-                : null;
-            // prompt with steer atomically queues or starts; fire-and-forget under the permit avoids dialog deadlocks.
-            // /compact uses its RPC, which aborts the agent first.
-            yield* sessionEventPermit.withPermits(1)(
-              Effect.gen(function* () {
-                if (threadState?.activeTurn !== turn) {
-                  return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
-                }
-                if (compactCommand !== null) {
-                  turn.manualCompactInFlight = true;
-                  yield* connection.send(compactRpcRecord(compactCommand));
-                  pendingCompactResponses.push({
-                    providerTurnId: turn.providerTurn.id,
-                    kind: "steer",
-                  });
-                } else if (payload !== null) {
-                  yield* connection.send({
-                    type: "prompt",
-                    message: payload.message,
-                    streamingBehavior: "steer",
-                    ...(payload.images.length === 0 ? {} : { images: payload.images }),
-                  });
-                  pendingPromptResponses.push({
-                    providerTurnId: turn.providerTurn.id,
-                    kind: "steer",
-                  });
-                }
-                turn.settleProbeGeneration += 1;
-              }),
+            yield* steerActiveTurn(
+              steerInput.providerTurnId,
+              steerInput.message.text,
+              steerInput.message.attachments,
             );
           },
           (effect, steerInput) =>
@@ -2615,6 +2700,68 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     driver: PI_PROVIDER,
                     providerThreadId: steerInput.providerThread.id,
                     providerTurnId: steerInput.providerTurnId,
+                    cause,
+                  }),
+              ),
+            ),
+        ),
+        // Pi waits in the bridge's hold dialog before its next tool call. A steer sent before
+        // answering it reaches Pi at its next steering point, after that tool.
+        pauseTurn: Effect.fn("PiAdapter.pauseTurn")(function* (
+          pauseInput: ProviderAdapter.ProviderAdapterV2PauseInput,
+        ) {
+          const providerTurnId = pauseInput.providerTurnId;
+          if (threadState?.activeTurn?.providerTurn.id !== providerTurnId) {
+            return "turn_ended" as const;
+          }
+          if (holdFile === undefined) return "unsupported" as const;
+          if (turnHold?.providerTurnId === providerTurnId && turnHold.phase === "held") {
+            return "paused" as const;
+          }
+          const paused = yield* Deferred.make<"paused" | "turn_ended">();
+          turnHold = { phase: "armed", providerTurnId, paused };
+          const asked = yield* fileSystem.writeFileString(holdFile, "").pipe(
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.logWarning("Pi hold could not be requested.", { cause }).pipe(
+                Effect.as(false),
+              ),
+            ),
+          );
+          if (!asked) {
+            turnHold = null;
+            return "unsupported" as const;
+          }
+          return yield* Deferred.await(paused).pipe(
+            Effect.onInterrupt(() => endTurnHold(providerTurnId)),
+          );
+        }),
+        releaseTurn: Effect.fn("PiAdapter.releaseTurn")(
+          function* (releaseInput: ProviderAdapter.ProviderAdapterV2ReleaseInput) {
+            const current = turnHold;
+            if (
+              current?.phase !== "held" ||
+              current.providerTurnId !== releaseInput.providerTurnId
+            ) {
+              return false;
+            }
+            // Queued as a steer before the tool call goes on, so Pi takes it at its next step.
+            // The hold ends either way: an unanswered dialog would hold Pi forever.
+            yield* (
+              releaseInput.text === undefined
+                ? Effect.void
+                : steerActiveTurn(releaseInput.providerTurnId, releaseInput.text, [])
+            ).pipe(Effect.ensuring(endTurnHold(releaseInput.providerTurnId)));
+            return true;
+          },
+          (effect, releaseInput) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterSteerRunError({
+                    driver: PI_PROVIDER,
+                    providerThreadId: releaseInput.providerThread.id,
+                    providerTurnId: releaseInput.providerTurnId,
                     cause,
                   }),
               ),

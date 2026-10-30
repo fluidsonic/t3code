@@ -1,4 +1,5 @@
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
 import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
   collectComposerContextReferences,
@@ -12,11 +13,15 @@ const TRAILING_LEGACY_CONTEXT =
 
 type ComposerPromptHistoryMessage = Parameters<typeof resolveUserMessagePresentation>[0] & {
   readonly id: string;
+  readonly shellCommand?: boolean | undefined;
+  readonly shellCommandStopped?: true | undefined;
 };
 
 interface ComposerPromptHistoryEntry {
   readonly id: string;
   readonly prompt: string;
+  /** The entry is a `! cmd` shell command and comes back in shell mode. */
+  readonly shellMode: boolean;
 }
 
 export interface ComposerPromptHistoryPosition {
@@ -36,6 +41,7 @@ function findActive(
 interface ComposerPromptHistoryStep {
   readonly position: ComposerPromptHistoryPosition | null;
   readonly prompt: string;
+  readonly shellMode: boolean;
 }
 
 function stripTrailingReviewComments(prompt: string): string {
@@ -117,22 +123,32 @@ export function recallableComposerPrompt(messageText: string): string {
   return trimmed;
 }
 
+/**
+ * `shellCommands` is whether a recalled command comes back as one. Without it, a command's
+ * message recalls as its text, `! cmd`, like any other message, except a stopped command: the
+ * agent never saw it, so it stays a command, which the composer then refuses to send.
+ */
 export function buildComposerPromptHistoryEntries(
   messages: ReadonlyArray<ComposerPromptHistoryMessage>,
+  options: { readonly shellCommands: boolean },
 ): ComposerPromptHistoryEntry[] {
   const entries: ComposerPromptHistoryEntry[] = [];
   for (const message of messages) {
     if (message.role !== "user") continue;
     // Automations and other agents send user-role messages; recall only what the user typed.
     if (resolveUserMessagePresentation(message).attribution !== null) continue;
-    const prompt = recallableComposerPrompt(message.text);
+    const { prompt, shellMode } =
+      message.shellCommand === true &&
+      (options.shellCommands || message.shellCommandStopped === true)
+        ? composerPromptForMessage({ text: message.text.trim(), shellCommand: true })
+        : { prompt: recallableComposerPrompt(message.text), shellMode: false };
     if (prompt.length === 0) continue;
     const previous = entries[entries.length - 1];
-    if (previous && previous.prompt === prompt) {
-      entries[entries.length - 1] = { id: message.id, prompt };
+    if (previous && previous.prompt === prompt && previous.shellMode === shellMode) {
+      entries[entries.length - 1] = { id: message.id, prompt, shellMode };
       continue;
     }
-    entries.push({ id: message.id, prompt });
+    entries.push({ id: message.id, prompt, shellMode });
   }
   return entries;
 }
@@ -151,11 +167,19 @@ export function stepComposerPromptHistory(input: {
     if (activeIndex < 0 && currentPrompt.length > 0) return null;
     const entry = entries[activeIndex < 0 ? entries.length - 1 : activeIndex - 1];
     if (!entry) return null;
-    return { position: { entryId: entry.id, recalled: entry.prompt }, prompt: entry.prompt };
+    return {
+      position: { entryId: entry.id, recalled: entry.prompt },
+      prompt: entry.prompt,
+      shellMode: entry.shellMode,
+    };
   }
 
   if (activeIndex < 0) return null;
   const entry = entries[activeIndex + 1];
-  if (!entry) return { position: null, prompt: "" };
-  return { position: { entryId: entry.id, recalled: entry.prompt }, prompt: entry.prompt };
+  if (!entry) return { position: null, prompt: "", shellMode: false };
+  return {
+    position: { entryId: entry.id, recalled: entry.prompt },
+    prompt: entry.prompt,
+    shellMode: entry.shellMode,
+  };
 }

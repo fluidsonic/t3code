@@ -333,7 +333,8 @@ The selected scopes replace the default permissions. The same option works with
 bearer sessions get every permission, including managing access and T3 Connect.
 A terminal or a full-access agent on the host can reach those as well, so a
 client that should not manage access also needs to go without `terminal:operate`
-and `orchestration:operate`.
+and `orchestration:operate`. Running `!` shell commands from the composer also
+needs `terminal:operate`.
 
 To change an existing client's permissions, create a fresh pairing link with the
 scopes it needs. In a browser opened directly on the environment, open that link

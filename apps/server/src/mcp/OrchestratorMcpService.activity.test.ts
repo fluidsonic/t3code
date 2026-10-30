@@ -354,6 +354,42 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             updatedAt: now,
           },
         },
+        {
+          position: 1,
+          visibility: "inherited",
+          sourceThreadId: threadId,
+          sourceItemId: "item-2",
+          item: {
+            id: "item-2",
+            type: "user_message",
+            messageId: "user-shell-1",
+            shellCommand: true,
+            status: "completed",
+            title: null,
+            text: "! npm test",
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          position: 2,
+          visibility: "inherited",
+          sourceThreadId: threadId,
+          sourceItemId: "item-3",
+          item: {
+            id: "item-3",
+            type: "command_execution",
+            userShellMessageId: "user-shell-1",
+            status: "failed",
+            title: null,
+            input: "npm test",
+            output: "1 failed",
+            exitCode: 1,
+            userShellDelivered: true,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
       ],
       runtimeRequests: [],
       messages: [],
@@ -382,7 +418,7 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           getTimelinePage: (threadId) =>
             Effect.succeed({
               items: foreignProjection(threadId).visibleTurnItems,
-              totalItems: 1,
+              totalItems: 3,
               hasMore: false,
             }),
           getProjectThreadRecords: (input) =>
@@ -433,7 +469,12 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     const foreign = yield* service.readThread(makeScope(), { threadId: foreignThreadId });
     expect(foreign.thread.threadId).toBe(foreignThreadId);
     expect(foreign.thread.projectId).toBe(foreignProjectId);
-    expect(foreign.items.map((item) => item.text)).toEqual(["Foreign thread said hello"]);
+    // A person's command reads once, without a second `!`, with its result after it.
+    expect(foreign.items.map((item) => item.text)).toEqual([
+      "Foreign thread said hello",
+      "! npm test",
+      "Exit code 1\n1 failed",
+    ]);
 
     const sent = yield* service.sendToThread(makeScope(), {
       threadId: foreignThreadId,
