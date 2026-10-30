@@ -12,7 +12,6 @@ import {
   type PreviewAnnotationPayload,
   type ScopedThreadRef,
   DEFAULT_PREVIEW_ZOOM_FACTOR,
-  PREVIEW_ZOOM_LEVELS,
   type PreviewAdjustInput,
 } from "@t3tools/contracts";
 import {
@@ -33,11 +32,7 @@ import { type ComposerImageAttachment, useComposerDraftStore } from "~/composerD
 import { capturePreviewAnnotationScreenshot } from "~/lib/previewAnnotation";
 import { ensureLocalApi } from "~/localApi";
 import { getClientSettings } from "~/hooks/useSettings";
-import {
-  rememberPreviewUrl,
-  updatePreviewServerSnapshot,
-  useThreadPreviewState,
-} from "~/previewStateStore";
+import { rememberPreviewUrl, useThreadPreviewState } from "~/previewStateStore";
 import { resolveDiscoveredServerUrl } from "~/browser/browserTargetResolver";
 import { useEnvironmentSupportsServerBrowser } from "~/state/entities";
 import {
@@ -61,6 +56,7 @@ import { subscribePreviewAction } from "./previewActionBus";
 import { closePreviewSession } from "./closePreviewSession";
 import { openPreviewSession } from "./openPreviewSession";
 import { showPreviewPopup } from "./showPreviewPopup";
+import { adjustServerPreviewTab, zoomPreviewTab } from "./previewTabZoom";
 import { PreviewChromeRow } from "./PreviewChromeRow";
 import { PreviewEmptyState } from "./PreviewEmptyState";
 import { PreviewMoreMenu, type PreviewMoreMenuActions } from "./PreviewMoreMenu";
@@ -168,7 +164,6 @@ export function PreviewView({
   const environmentLabel = useEnvironment(threadRef.environmentId)?.label ?? "the environment";
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const serverBrowser = useEnvironmentSupportsServerBrowser(threadRef.environmentId);
-  const adjust = useAtomCommand(previewEnvironment.adjust, "preview appearance or zoom");
 
   usePreviewSession(threadRef);
 
@@ -280,52 +275,25 @@ export function PreviewView({
   };
 
   const adjustServerTab = async (change: Omit<PreviewAdjustInput, "threadId" | "tabId">) => {
-    if (!tabId) return;
-    const result = await adjust({
-      environmentId: threadRef.environmentId,
-      input: { threadId: threadRef.threadId, tabId, ...change },
-    });
-    if (result._tag === "Failure") {
-      const error = squashAtomCommandFailure(result);
-      toastManager.add({
-        type: "error",
-        title: "Unable to change the browser tab",
-        description: error instanceof Error ? error.message : "An error occurred.",
-      });
-      return;
-    }
-    updatePreviewServerSnapshot(threadRef, result.value);
+    if (tabId) await adjustServerPreviewTab(threadRef, tabId, change);
   };
 
   const serverZoomFactor = snapshot?.zoomFactor ?? DEFAULT_PREVIEW_ZOOM_FACTOR;
-  const stepServerZoom = (direction: -1 | 0 | 1) => {
-    const index = PREVIEW_ZOOM_LEVELS.indexOf(serverZoomFactor);
-    const next =
-      direction === 0
-        ? DEFAULT_PREVIEW_ZOOM_FACTOR
-        : PREVIEW_ZOOM_LEVELS[
-            Math.min(
-              Math.max((index < 0 ? 7 : index) + direction, 0),
-              PREVIEW_ZOOM_LEVELS.length - 1,
-            )
-          ]!;
-    if (next !== serverZoomFactor) void adjustServerTab({ zoomFactor: next });
+  const zoom = (direction: -1 | 0 | 1) => {
+    if (!tabId || !runtimeTabId) return;
+    zoomPreviewTab(
+      {
+        threadRef,
+        tabId,
+        runtimeTabId,
+        serverZoomFactor: serverOwnsRendering ? serverZoomFactor : null,
+      },
+      direction,
+    );
   };
-
-  const handleZoomIn = () => {
-    if (serverOwnsRendering) stepServerZoom(1);
-    else if (previewBridge && runtimeTabId) void previewBridge.zoomIn(runtimeTabId);
-  };
-
-  const handleZoomOut = () => {
-    if (serverOwnsRendering) stepServerZoom(-1);
-    else if (previewBridge && runtimeTabId) void previewBridge.zoomOut(runtimeTabId);
-  };
-
-  const handleResetZoom = () => {
-    if (serverOwnsRendering) stepServerZoom(0);
-    else if (previewBridge && runtimeTabId) void previewBridge.resetZoom(runtimeTabId);
-  };
+  const handleZoomIn = () => zoom(1);
+  const handleZoomOut = () => zoom(-1);
+  const handleResetZoom = () => zoom(0);
 
   const handleToggleDeviceToolbar = () => {
     if (!runtimeTabId || !tabId) return;
