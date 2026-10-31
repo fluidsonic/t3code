@@ -2770,9 +2770,16 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
 ) {
+  // Lets a personal build install next to the official app; both share the same T3 home.
+  const identity = yield* Config.all({
+    appId: Config.String("T3CODE_DESKTOP_APP_ID").pipe(Config.withDefault(DESKTOP_APP_ID)),
+    productName: Config.String("T3CODE_DESKTOP_PRODUCT_NAME").pipe(
+      Config.withDefault(resolveDesktopProductName(version)),
+    ),
+  });
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
-    productName: resolveDesktopProductName(version),
+    appId: identity.appId,
+    productName: identity.productName,
     artifactName: "T3-Code-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
     files: [
