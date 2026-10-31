@@ -6,12 +6,15 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Build
 import android.text.Editable
 import android.text.InputType
 import android.text.InputFilter
 import android.text.Spanned
+import android.text.TextPaint
 import android.text.TextUtils
 import android.text.TextWatcher
 import android.text.style.ReplacementSpan
@@ -77,7 +80,16 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
   }
   private var autoCorrect = true
   private var spellCheck = true
+  private var shellMode = false
+  private var shellPrefixFill: Int? = null
+  private var shellPrefixText: Int? = null
   private var nativeEventCount = 0
+  // In shell mode, the text as of the last change event or applied document. A selection change
+  // that arrives mid-edit, before the edit's change event, is not reported: JS would apply it to
+  // the old text, and leaving shell mode with Backspace would lose the `!` it restores. The change
+  // event carries the caret anyway. Outside shell mode it is not tracked and selection events flow
+  // as before.
+  private var reportedValue = ""
 
   init {
     editor.setBackgroundColor(Color.TRANSPARENT)
@@ -98,7 +110,7 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
       }
     )
     editor.selectionListener = { start, end ->
-      if (!applyingNativeValue) {
+      if (!applyingNativeValue && (!shellMode || TextUtils.equals(editor.text, reportedValue))) {
         emitSelectionChange(start, end)
       }
     }
@@ -177,8 +189,10 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
         override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) = Unit
 
         override fun afterTextChanged(editable: Editable?) {
+          applyShellPrefixSpan()
           if (applyingNativeValue) return
           val nextValue = editable.toString()
+          if (shellMode) reportedValue = nextValue
           val selection = currentSelectionPayload()
           nativeEventCount += 1
           onComposerChange(
@@ -226,10 +240,12 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
     try {
       if (valueChanged) {
         editor.setText(value)
+        if (shellMode) reportedValue = value
       }
       tokensJson = nextTokensJson
       tokens = nextTokens
       applyTokenSpans()
+      applyShellPrefixSpan()
       if (requestedSelection != null) {
         applySelection(
           requestedSelection.optInt("start", previousSelectionStart),
@@ -249,6 +265,9 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
       val theme = JSONObject(themeJson)
       editor.setTextColor(parseColor(theme.optString("text"), Color.BLACK))
       editor.setHintTextColor(parseColor(theme.optString("placeholder"), Color.GRAY))
+      shellPrefixFill = theme.optColor("shellPrefixFill")
+      shellPrefixText = theme.optColor("shellPrefixText")
+      applyShellPrefixSpan()
       if (theme.isNull("selection")) {
         resetSelectionTheme()
       } else {
@@ -278,6 +297,8 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
 
   fun setFontSize(fontSize: Float) {
     editor.textSize = fontSize
+    // The shell `!`'s indent scales with the text.
+    if (editor.shellPrefix != null) applyEditorPadding()
     applyLineHeight()
     applyTokenSpans()
     editor.applyPlaceholder()
@@ -299,7 +320,11 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
   fun setContentInsetVertical(contentInsetVertical: Int) {
     this.contentInsetVertical =
       max(0, (contentInsetVertical * resources.displayMetrics.density).toInt())
-    editor.setPadding(0, this.contentInsetVertical, 0, this.contentInsetVertical)
+    if (editor.shellPrefix == null) {
+      editor.setPadding(0, this.contentInsetVertical, 0, this.contentInsetVertical)
+    } else {
+      applyEditorPadding()
+    }
     emitContentSizeIfNeeded()
   }
 
@@ -333,6 +358,16 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
   fun setSpellCheck(spellCheck: Boolean) {
     this.spellCheck = spellCheck
     updateInputFlags()
+  }
+
+  /** A shell command is typed as written: no suggestions, corrections, or capitals. */
+  fun setShellMode(shellMode: Boolean) {
+    if (this.shellMode == shellMode) return
+    this.shellMode = shellMode
+    // Not tracked outside shell mode; JS has seen the editor's current text when it switches.
+    if (shellMode) reportedValue = editor.text?.toString() ?: ""
+    updateInputFlags()
+    applyShellPrefixSpan()
   }
 
   fun setTextPasteThresholdBytes(threshold: Int) {
@@ -370,6 +405,14 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
   }
 
   private fun updateInputFlags() {
+    if (shellMode) {
+      val flags =
+        InputType.TYPE_CLASS_TEXT or
+          InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+          InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+      if (editor.inputType != flags) editor.inputType = flags
+      return
+    }
     var flags =
       InputType.TYPE_CLASS_TEXT or
         InputType.TYPE_TEXT_FLAG_MULTI_LINE or
@@ -380,6 +423,47 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
       flags or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
     }
     editor.inputType = flags
+  }
+
+  /**
+   * Draws a leading `!` in shell mode in its square, with every line of the command indented past
+   * it, and drops the span once an edit moves the `!` off the first character.
+   */
+  private fun applyShellPrefixSpan() {
+    // Outside shell mode there is no span to drop, so ordinary edits skip the span scan.
+    if (!shellMode && editor.shellPrefix == null) return
+    val editable = editor.text ?: return
+    val active = shellMode && editable.isNotEmpty() && editable[0] == '!'
+    val spans = editable.getSpans(0, editable.length, ShellPrefixSpan::class.java)
+    val kept = spans.firstOrNull {
+      active && editable.getSpanStart(it) == 0 && editable.getSpanEnd(it) == 1
+    }
+    spans.filter { it !== kept }.forEach(editable::removeSpan)
+    if (active && kept == null) {
+      editable.setSpan(ShellPrefixSpan(), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    }
+    editor.shellPrefix = if (active) {
+      ShellPrefixColors(
+        fill = shellPrefixFill ?: editor.currentTextColor.withAlpha(0x3D),
+        text = shellPrefixText ?: editor.currentTextColor,
+      )
+    } else {
+      null
+    }
+    applyEditorPadding()
+  }
+
+  /** The shell `!` hangs in the left padding, so wrapped and empty lines all start after it. */
+  private fun applyEditorPadding() {
+    val left = if (editor.shellPrefix == null) 0 else editor.shellPrefixIndent().toInt()
+    if (editor.paddingLeft == left &&
+      editor.paddingTop == contentInsetVertical &&
+      editor.paddingBottom == contentInsetVertical
+    ) {
+      return
+    }
+    editor.setPadding(left, contentInsetVertical, 0, contentInsetVertical)
+    editor.applyPlaceholder()
   }
 
   private fun applyLineHeight() {
@@ -433,7 +517,11 @@ class T3ComposerEditorView(context: Context, appContext: AppContext) : ExpoView(
     // wrapping it, so getLineMax leaves it out.
     val layout = editor.layout
     val contentHeight = layout?.height ?: editor.measuredHeight
-    val contentWidth = if (layout?.lineCount == 1) layout.getLineMax(0).toInt() else 0
+    val contentWidth = if (layout?.lineCount == 1) {
+      layout.getLineMax(0).toInt() + (if (editor.shellPrefix == null) 0 else editor.paddingLeft)
+    } else {
+      0
+    }
     if (contentHeight == lastContentHeight && contentWidth == lastContentWidth) return
     lastContentHeight = contentHeight
     lastContentWidth = contentWidth
@@ -500,6 +588,45 @@ private fun Int.withAlpha(alpha: Int): Int = (this and 0x00FFFFFF) or (alpha shl
 private fun Context.resolveThemeColor(attribute: Int, fallback: Int): Int {
   val value = TypedValue()
   return if (theme.resolveAttribute(attribute, value, true)) value.data else fallback
+}
+
+private fun JSONObject.optColor(name: String): Int? =
+  if (isNull(name)) {
+    null
+  } else {
+    try {
+      Color.parseColor(optString(name))
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+internal data class ShellPrefixColors(val fill: Int, val text: Int)
+
+/** Hides the shell command's `!` in the text; the editor draws it in its square instead. */
+private class ShellPrefixSpan : ReplacementSpan() {
+  override fun getSize(
+    paint: Paint,
+    text: CharSequence,
+    start: Int,
+    end: Int,
+    fontMetrics: Paint.FontMetricsInt?
+  ): Int {
+    fontMetrics?.let { paint.getFontMetricsInt(it) }
+    return 0
+  }
+
+  override fun draw(
+    canvas: Canvas,
+    text: CharSequence,
+    start: Int,
+    end: Int,
+    x: Float,
+    top: Int,
+    y: Int,
+    bottom: Int,
+    paint: Paint
+  ) = Unit
 }
 
 private data class ComposerToken(
@@ -575,6 +702,70 @@ private fun parseTokens(value: String): List<ComposerToken> = try {
 }
 
 internal class SelectionAwareEditText(context: Context) : EditText(context) {
+  /**
+   * A shell command's `!`, drawn in a rounded square in the left padding as on the web: the square
+   * is [SHELL_PREFIX_SIZE_EM] wide with a [SHELL_PREFIX_GAP_EM] gap before the command.
+   */
+  var shellPrefix: ShellPrefixColors? = null
+    set(value) {
+      if (field == value) return
+      field = value
+      invalidate()
+    }
+  private val shellSquare = RectF()
+  private val shellGlyphBounds = Rect()
+  private val shellFillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+  private val shellGlyphPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+  private val shellPlaceholderPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+  private var shellPlaceholder: CharSequence = ""
+  private var shellPlaceholderSource = ""
+  private var shellPlaceholderWidth = -1
+
+  fun shellPrefixIndent(): Float = textSize * (SHELL_PREFIX_SIZE_EM + SHELL_PREFIX_GAP_EM)
+
+  override fun onDraw(canvas: Canvas) {
+    super.onDraw(canvas)
+    val prefix = shellPrefix ?: return
+    if (layout == null || length() == 0) return
+    val baseline = getLineBounds(0, null).toFloat()
+    val size = textSize * SHELL_PREFIX_SIZE_EM
+    val left = compoundPaddingLeft - shellPrefixIndent()
+    shellGlyphPaint.set(paint)
+    shellGlyphPaint.typeface = Typeface.create(typeface, Typeface.BOLD)
+    shellGlyphPaint.color = prefix.text
+    shellGlyphPaint.textAlign = Paint.Align.CENTER
+    shellGlyphPaint.getTextBounds("!", 0, 1, shellGlyphBounds)
+    val center = baseline + (shellGlyphBounds.top + shellGlyphBounds.bottom) / 2f
+    shellSquare.set(left, center - size / 2, left + size, center + size / 2)
+    shellFillPaint.color = prefix.fill
+    val radius = textSize * SHELL_PREFIX_RADIUS_EM
+    canvas.drawRoundRect(shellSquare, radius, radius, shellFillPaint)
+    canvas.drawText("!", shellSquare.centerX(), baseline, shellGlyphPaint)
+    // A lone `!` is not content yet, so the placeholder still shows after its square.
+    if (length() == 1) {
+      val available = width - compoundPaddingLeft - compoundPaddingRight
+      if (shellPlaceholderSource != placeholder || shellPlaceholderWidth != available) {
+        shellPlaceholderSource = placeholder
+        shellPlaceholderWidth = available
+        shellPlaceholder = if (available > 0) {
+          TextUtils.ellipsize(placeholder, paint, available.toFloat(), TextUtils.TruncateAt.END)
+        } else {
+          placeholder
+        }
+      }
+      shellPlaceholderPaint.set(paint)
+      shellPlaceholderPaint.color = currentHintTextColor
+      canvas.drawText(
+        shellPlaceholder,
+        0,
+        shellPlaceholder.length,
+        compoundPaddingLeft.toFloat(),
+        baseline,
+        shellPlaceholderPaint,
+      )
+    }
+  }
+
   var readOnly = false
   var selectionListener: ((Int, Int) -> Unit)? = null
   var pasteImagesListener: ((List<String>) -> Unit)? = null
@@ -665,6 +856,12 @@ internal class SelectionAwareEditText(context: Context) : EditText(context) {
     }
   }
   override fun onSelectionChanged(selStart: Int, selEnd: Int) {
+    // The `!` takes no width of its own, so a caret before it would look like one after it and
+    // typing there would silently end shell mode. Keep the caret after it.
+    if (shellPrefix != null && selStart == 0 && selEnd == 0 && text?.getOrNull(0) == '!') {
+      setSelection(1)
+      return
+    }
     super.onSelectionChanged(selStart, selEnd)
     selectionListener?.invoke(selStart, selEnd)
   }
@@ -768,3 +965,7 @@ internal class SelectionAwareEditText(context: Context) : EditText(context) {
     return super.onKeyShortcut(keyCode, event)
   }
 }
+
+private const val SHELL_PREFIX_SIZE_EM = 1.35f
+private const val SHELL_PREFIX_GAP_EM = 0.65f
+private const val SHELL_PREFIX_RADIUS_EM = 0.3f

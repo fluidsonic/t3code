@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   NodeId,
   ProviderInstanceId,
+  DEFAULT_SERVER_SETTINGS,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -51,6 +52,7 @@ import {
   type PiAdapterV2Options,
 } from "./adapter.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
+import { PI_T3_HOLD_TITLE } from "./mcpExtensionSource.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
 
@@ -1561,6 +1563,51 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("holds a turn in the bridge's hold dialog and steers the released text first", () =>
+    Effect.gen(function* () {
+      yield* (yield* TestProviderHost.TestProviderHostSettings).set({
+        ...DEFAULT_SERVER_SETTINGS,
+        enableShellCommands: true,
+      });
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      assert.isString(fake.lastSpawn().env.T3_PI_HOLD_FILE);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const started = yield* takeEvent((event) => event.type === "provider_turn.updated");
+      if (started.type !== "provider_turn.updated") return;
+      const target = { providerThread, providerTurnId: started.providerTurn.id };
+      const holdDialog = (id: string) =>
+        fake.emit({ type: "extension_ui_request", id, method: "confirm", title: PI_T3_HOLD_TITLE });
+
+      // A hold file left from an earlier hold: the tool call goes on at once.
+      yield* holdDialog("stale");
+      const stale = yield* fake.takeRequest("extension_ui_response");
+      assert.equal(stale["id"], "stale");
+      assert.isTrue(stale["confirmed"]);
+
+      const pause = yield* runtime.pauseTurn!(target).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* holdDialog("hold");
+      assert.equal(yield* Fiber.join(pause), "paused");
+      assert.isTrue(yield* runtime.releaseTurn!({ ...target, text: "command results" }));
+      // Queued as a steer before the tool call goes on, so Pi takes it at its next step.
+      const steer = yield* fake.takeRequest("prompt");
+      assert.equal(steer["message"], "command results");
+      assert.equal(steer["streamingBehavior"], "steer");
+      const released = yield* fake.takeRequest("extension_ui_response");
+      assert.equal(released["id"], "hold");
+      assert.isTrue(released["confirmed"]);
+      assert.isFalse(yield* runtime.releaseTurn!(target));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("injects the T3 MCP extension and bearer when a session exists", () =>
     Effect.gen(function* () {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
@@ -1584,6 +1631,28 @@ describe("PiAdapterV2", () => {
       assert.equal(spawn.env.T3_MCP_URL, "http://127.0.0.1:43123/mcp");
       assert.equal(spawn.env.T3_MCP_BEARER_TOKEN, "secret-pi-token");
       assert.equal(spawn.env.T3_PI_RUNTIME_MODE, "full-access");
+      // Shell commands are off, so the bridge gets no hold file and never checks for one.
+      assert.isUndefined(spawn.env.T3_PI_HOLD_FILE);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("cannot hold a turn in a session opened with shell commands off", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const started = yield* takeEvent((event) => event.type === "provider_turn.updated");
+      if (started.type !== "provider_turn.updated") return;
+      assert.equal(
+        yield* runtime.pauseTurn!({ providerThread, providerTurnId: started.providerTurn.id }),
+        "unsupported",
+      );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 

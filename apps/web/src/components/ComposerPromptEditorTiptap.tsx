@@ -14,16 +14,18 @@ import { ReactNodeViewRenderer, NodeViewWrapper, type NodeViewProps } from "@tip
 import StarterKit from "@tiptap/starter-kit";
 import { type Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { newlineInCode, splitBlockKeepMarks } from "@tiptap/pm/commands";
-import { isHistoryTransaction } from "@tiptap/pm/history";
+import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
 import {
   type EditorState,
   NodeSelection,
   Plugin,
   PluginKey,
   TextSelection,
+  type Transaction,
 } from "@tiptap/pm/state";
+import { DocAttrStep, ReplaceStep } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
-import type { NodeType, ResolvedPos } from "@tiptap/pm/model";
+import type { NodeType, ResolvedPos, Slice } from "@tiptap/pm/model";
 import type {
   AssistantCitation,
   ComposerContextClipboardFragment,
@@ -99,6 +101,7 @@ import {
   COMPOSER_UNDO_GROUP_DELAY,
   type ComposerChangeKind,
   groupUndoByChangeKind,
+  joinPreviousUndoStep,
   markAsClipboardEdit,
 } from "~/composer-undo-grouping";
 import { collectInlineContextIds } from "~/lib/composerContextReferences";
@@ -146,6 +149,14 @@ export interface ComposerPromptEditorProps {
   cursor: number;
   richTextEnabled?: boolean;
   literalText?: boolean;
+  /**
+   * Shell commands are in play for this composer: they are on, or the draft is still a command.
+   * Without it the editor is the one from before shell commands, and `shellCommand` is ignored.
+   * Toggling it remounts the editor once.
+   */
+  shellFeatureActive?: boolean;
+  /** A `! cmd` shell command: literal text with a styled leading `!`. */
+  shellCommand?: boolean;
   contextRecords: ComposerDraftContextRecords;
   buildContextClipboardFragment?:
     | ((contextIds: ReadonlyArray<string>) => string | null)
@@ -169,6 +180,11 @@ export interface ComposerPromptEditorProps {
     expandedCursor: number,
     cursorAdjacentToMention: boolean,
     contextIds: string[],
+    /**
+     * Set when undo or redo brought back the other shell mode. The owner adopts it instead of
+     * deriving the mode from the text, which cannot tell a command `!` from a prose one.
+     */
+    restoredShellCommand?: boolean,
   ) => void;
   onVisibleSelectionChange?: () => void;
   onCommandKeyDown?: (key: string, event: KeyboardEvent, isTaskItem?: boolean) => boolean;
@@ -781,9 +797,12 @@ export function ComposerPromptEditorTiptap(props: ComposerPromptEditorProps) {
   };
   // Changing text mode remounts the editor. Its collapsed cursor cannot represent
   // a caret inside unknown `$name` text, so retain the exact Markdown offset here.
+  // Shell mode is not a remount: its switch has to stay in the undo history. Whether shell
+  // commands are in play at all is, since it picks the editor's extensions.
+  const shellCommand = props.shellFeatureActive === true && props.shellCommand === true;
   return (
     <ComposerPromptEditorTiptapInner
-      key={`${props.draftKey ?? ""}:${props.literalText ? "literal" : props.richTextEnabled ? "rich" : "plain"}`}
+      key={`${props.draftKey ?? ""}:${props.literalText && !shellCommand ? "literal" : props.richTextEnabled ? "rich" : "plain"}${props.shellFeatureActive ? ":shell" : ""}`}
       {...props}
       restoreFocusRef={restoreFocusRef}
       initialExpandedCursor={
@@ -812,7 +831,7 @@ const ComposerUndoGroupingExtension = Extension.create<
 });
 
 // Module scope keeps extension identity stable; Tiptap hooks read config through this.
-function createComposerExtensions(richText: boolean) {
+function createComposerExtensions(richText: boolean, shellCommands: boolean) {
   return [
     StarterKit.configure({
       blockquote: false,
@@ -840,6 +859,7 @@ function createComposerExtensions(richText: boolean) {
     ComposerCitationExtension,
     ComposerContextReferenceExtension,
     ComposerMarkersExtension,
+    ...(shellCommands ? [ComposerShellPrefixExtension] : []),
     ...(richText
       ? [
           ComposerBoldSelectionOnlyExtension,
@@ -914,8 +934,140 @@ function createComposerExtensions(richText: boolean) {
   ];
 }
 
-const RICH_TEXT_EXTENSIONS = createComposerExtensions(true);
-const PLAIN_TEXT_EXTENSIONS = createComposerExtensions(false);
+const ShellPrefixPluginKey = new PluginKey("composer-shell-prefix");
+
+/**
+ * Shell mode lives on the document so that undo and redo carry it with the text: the mode a
+ * step was made in comes back with the step.
+ */
+const SHELL_COMMAND_ATTR = "shellCommand";
+
+function isShellCommandDoc(doc: ProseMirrorNode): boolean {
+  return doc.attrs[SHELL_COMMAND_ATTR] === true;
+}
+
+function startsWithShellPrefix(doc: ProseMirrorNode): boolean {
+  return doc.firstChild?.firstChild?.text?.startsWith("!") === true;
+}
+
+function shellPrefixGap(): HTMLElement {
+  const gap = document.createElement("span");
+  gap.className = "shell-command-gap";
+  return gap;
+}
+
+function isLiteralSlice(slice: Slice): boolean {
+  let literal = true;
+  slice.content.descendants((node) => {
+    if (node.isText ? node.marks.length > 0 : node.type.name !== "paragraph") literal = false;
+    return literal;
+  });
+  return literal;
+}
+
+/**
+ * Switches shell mode as one undo step. Entering rewrites the document as the literal lines of its
+ * text, which keeps the prompt string as it was, and undo brings back the rich document.
+ * `joinPrevious` folds the switch into the edit that caused it, so one undo reverts both.
+ */
+function shellModeTransaction(
+  state: EditorState,
+  shellCommand: boolean,
+  joinPrevious: boolean,
+): Transaction {
+  const tr = state.tr.setDocAttribute(SHELL_COMMAND_ATTR, shellCommand);
+  if (shellCommand) {
+    const map = serializeEditorDoc(state.doc);
+    const literal = state.schema.nodeFromJSON(
+      buildDocJson(map.value, () => null, { literalText: true }),
+    );
+    if (!literal.content.eq(state.doc.content)) {
+      const toMarkdown = (pos: number) => flatToMarkdown(map, pmToFlat(map, pos));
+      const anchor = toMarkdown(state.selection.anchor);
+      const head = toMarkdown(state.selection.head);
+      tr.replaceWith(0, state.doc.content.size, literal.content);
+      const literalMap = serializeEditorDoc(tr.doc);
+      const toPm = (offset: number) => flatToPm(literalMap, markdownToFlat(literalMap, offset));
+      tr.setSelection(TextSelection.create(tr.doc, toPm(anchor), toPm(head)));
+    }
+  }
+  return joinPrevious ? joinPreviousUndoStep(tr) : tr;
+}
+
+/**
+ * Shell mode: styles the leading `!` and draws the gap after it, and keeps the command literal.
+ * The gap is not text, so a typed or pasted space right after the `!` is dropped instead of
+ * doubling it. Inactive outside shell mode.
+ */
+const ComposerShellPrefixExtension = Extension.create({
+  name: "composer-shell-prefix",
+  addGlobalAttributes() {
+    return [
+      { types: ["doc"], attributes: { [SHELL_COMMAND_ATTR]: { default: false, rendered: false } } },
+    ];
+  },
+  // Adding or removing the leading `!` switches the mode. As its own undo step, undo steps back
+  // across the switch without also taking the typing before it.
+  dispatchTransaction({ transaction, next }) {
+    if (
+      transaction.docChanged &&
+      !isHistoryTransaction(transaction) &&
+      startsWithShellPrefix(transaction.before) !== startsWithShellPrefix(transaction.doc)
+    ) {
+      closeHistory(transaction);
+    }
+    next(transaction);
+  },
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: ShellPrefixPluginKey,
+        // The rich editor stays mounted in shell mode, so its marks, blocks and chips are refused
+        // here, whichever shortcut, paste rule or drop brings them. History is exempt: undo
+        // restores the document a step was made in.
+        filterTransaction(tr) {
+          if (!isShellCommandDoc(tr.doc) || isHistoryTransaction(tr)) return true;
+          if (tr.storedMarksSet && tr.storedMarks?.length) return false;
+          return tr.steps.every(
+            (step) =>
+              step instanceof DocAttrStep ||
+              (step instanceof ReplaceStep && isLiteralSlice(step.slice)),
+          );
+        },
+        appendTransaction(transactions, _oldState, state) {
+          if (!isShellCommandDoc(state.doc) || !transactions.some((tr) => tr.docChanged)) {
+            return null;
+          }
+          const first = state.doc.firstChild;
+          if (!first?.isTextblock) return null;
+          const spaces = /^!([ \t]+)/.exec(first.textContent)?.[1];
+          return spaces === undefined ? null : state.tr.delete(2, 2 + spaces.length);
+        },
+        props: {
+          decorations(state) {
+            if (!isShellCommandDoc(state.doc) || !startsWithShellPrefix(state.doc)) return null;
+            return DecorationSet.create(state.doc, [
+              Decoration.inline(1, 2, { class: "shell-command-prefix" }),
+              // Before the caret at the `!`'s end, so typing starts after the gap.
+              Decoration.widget(2, shellPrefixGap, { side: -1, key: "shell-gap" }),
+            ]);
+          },
+        },
+      }),
+    ];
+  },
+});
+
+const RICH_TEXT_EXTENSIONS = createComposerExtensions(true, false);
+const PLAIN_TEXT_EXTENSIONS = createComposerExtensions(false, false);
+const SHELL_RICH_TEXT_EXTENSIONS = createComposerExtensions(true, true);
+const SHELL_PLAIN_TEXT_EXTENSIONS = createComposerExtensions(false, true);
+
+// The `!` of a shell command stays in the text, so the placeholder also shows beside it.
+function showsPlaceholderFor(value: string, shellCommand: boolean): boolean {
+  // A queued command's edit stays a command with its `!` deleted too.
+  return value.length === 0 || (shellCommand && value === "!");
+}
 
 function ComposerPromptEditorTiptapInner(
   props: ComposerPromptEditorProps & {
@@ -927,7 +1079,7 @@ function ComposerPromptEditorTiptapInner(
     value,
     cursor,
     richTextEnabled,
-    literalText = false,
+    shellFeatureActive = false,
     contextRecords,
     buildContextClipboardFragment,
     importContextFragment,
@@ -953,7 +1105,18 @@ function ComposerPromptEditorTiptapInner(
     editorRef,
     restoreFocusRef,
   } = props;
-  const richText = !literalText && (richTextEnabled ?? false);
+  // Without shell commands in play the editor has no shell extension, documents carry no shell
+  // attribute, and every shell branch below is inert.
+  const shellCommand = shellFeatureActive && (props.shellCommand ?? false);
+  // Literal text outside shell mode is fixed for the editor's life, as the key remounts on it.
+  // Shell mode switches within the editor, and editor callbacks read it off the document, which
+  // runs ahead of these props after an undo.
+  const fixedLiteralText = (props.literalText ?? false) && !shellCommand;
+  const richTextMode = !fixedLiteralText && (richTextEnabled ?? false);
+  const literalText = fixedLiteralText || shellCommand;
+  const richText = richTextMode && !shellCommand;
+  const isLiteralState = (state: EditorState) => fixedLiteralText || isShellCommandDoc(state.doc);
+  const isRichState = (state: EditorState) => richTextMode && !isShellCommandDoc(state.doc);
   const clampEditorCursor = (text: string, position: number) =>
     literalText
       ? Math.max(
@@ -987,11 +1150,13 @@ function ComposerPromptEditorTiptapInner(
   });
   const selectionRangeRef = useRef({ start: initialExpandedCursor, end: initialExpandedCursor });
   const isApplyingControlledUpdateRef = useRef(false);
+  // Whether a shell mode switch now follows from an edit, and so undoes along with it.
+  const editedSinceRenderRef = useRef(false);
   const hasAppliedControlledSelectionRef = useRef(false);
   const citationRequestRef = useRef<ComposerCitationCommentRequest | null>(null);
   const [openCitation, setOpenCitation] = useState<OpenCitationComment | null>(null);
   const citationDraftRef = useRef<{ key: string; comment: string } | null>(null);
-  const [isEmpty, setIsEmpty] = useState(value.length === 0);
+  const [isEmpty, setIsEmpty] = useState(() => showsPlaceholderFor(value, shellCommand));
 
   const citationCommentActions = {
     openComment: openCitation,
@@ -1011,9 +1176,10 @@ function ComposerPromptEditorTiptapInner(
     onSubmitAndSend: onCitationSubmitAndSend ?? (() => {}),
   };
 
-  const handleEditorChange = (updated: TiptapEditor) => {
+  const handleEditorChange = (updated: TiptapEditor, restoredShellCommand?: boolean) => {
     const map = serializeEditorDoc(updated.state.doc);
-    const contextIds = literalText ? [] : map.contextIds;
+    const literal = isLiteralState(updated.state);
+    const contextIds = literal ? [] : map.contextIds;
     const { from, to } = updated.state.selection;
     const fromFlat = pmToFlat(map, from);
     const toFlat = pmToFlat(map, to);
@@ -1022,16 +1188,17 @@ function ComposerPromptEditorTiptapInner(
       0,
       Math.min(map.value.length, flatToMarkdown(map, fromFlat)),
     );
-    const nextCursor = collapseExpandedComposerCursor(map.value, nextExpandedCursor, literalText);
+    const nextCursor = collapseExpandedComposerCursor(map.value, nextExpandedCursor, literal);
     const nextSelectionRange = {
       start: Math.min(nextExpandedCursor, flatToMarkdown(map, toFlat)),
       end: Math.max(nextExpandedCursor, flatToMarkdown(map, toFlat)),
     };
     const previousSelectionRange = selectionRangeRef.current;
     selectionRangeRef.current = nextSelectionRange;
-    setIsEmpty(nextValue.length === 0);
+    setIsEmpty(showsPlaceholderFor(nextValue, isShellCommandDoc(updated.state.doc)));
     const previousSnapshot = snapshotRef.current;
     const snapshotChanged = !(
+      restoredShellCommand === undefined &&
       previousSnapshot.value === nextValue &&
       previousSnapshot.cursor === nextCursor &&
       previousSnapshot.expandedCursor === nextExpandedCursor &&
@@ -1047,7 +1214,11 @@ function ComposerPromptEditorTiptapInner(
     }
     // Ignore selection-only updates while a controlled rewrite is pending to avoid overwriting the new
     // prompt.
-    if (previousSnapshot.value === nextValue && nextValue !== latestValueRef.current) {
+    if (
+      restoredShellCommand === undefined &&
+      previousSnapshot.value === nextValue &&
+      nextValue !== latestValueRef.current
+    ) {
       return;
     }
     snapshotRef.current = {
@@ -1058,7 +1229,7 @@ function ComposerPromptEditorTiptapInner(
     };
     const inCodeBlock = updated.state.selection.$from.parent.type.spec.code === true;
     const suppressTrigger =
-      literalText ||
+      literal ||
       inCodeBlock ||
       [updated.state.selection.$from.nodeBefore, updated.state.selection.$from.nodeAfter].some(
         (node) => node?.isInline && node.isAtom && !node.isText && node.type.name !== "hardBreak",
@@ -1069,12 +1240,14 @@ function ComposerPromptEditorTiptapInner(
       nextExpandedCursor,
       suppressTrigger,
       contextIds,
+      restoredShellCommand,
     );
   };
 
   const editorAttributes = {
     class: cn(
       "composer-tiptap -m-1 block max-h-52 min-h-[calc(2lh+--spacing(2))] overflow-y-auto p-1 whitespace-pre-wrap wrap-break-word bg-transparent leading-relaxed text-foreground focus:outline-none",
+      shellCommand && "shell-command-text",
       className,
     ),
     "data-testid": "composer-editor",
@@ -1100,15 +1273,25 @@ function ComposerPromptEditorTiptapInner(
 
   const editor = useEditor(
     {
-      extensions: richText ? RICH_TEXT_EXTENSIONS : PLAIN_TEXT_EXTENSIONS,
-      content: buildDocJson(value, (name) => composerSkillMeta(skills, name), {
-        styling: richText,
-        literalText,
-      }),
+      extensions: shellFeatureActive
+        ? richTextMode
+          ? SHELL_RICH_TEXT_EXTENSIONS
+          : SHELL_PLAIN_TEXT_EXTENSIONS
+        : richTextMode
+          ? RICH_TEXT_EXTENSIONS
+          : PLAIN_TEXT_EXTENSIONS,
+      content: {
+        ...buildDocJson(value, (name) => composerSkillMeta(skills, name), {
+          styling: richText,
+          literalText,
+        }),
+        ...(shellFeatureActive ? { attrs: { [SHELL_COMMAND_ATTR]: shellCommand } } : {}),
+      },
       editable: !disabled,
       editorProps: {
         attributes: editorAttributes,
         handleKeyDown: (view, event) => {
+          const rich = isRichState(view.state);
           // In a right-to-left line the start is on the right.
           const backArrow = caretLineDirection(view.state) === "rtl" ? "ArrowRight" : "ArrowLeft";
           const boundary = event.metaKey
@@ -1152,7 +1335,7 @@ function ComposerPromptEditorTiptapInner(
                 );
                 // A marker has two caret stops at one document position. Keep
                 // the outer stop when native navigation reaches a boundary.
-                if (richText && tr.selection.empty) {
+                if (rich && tr.selection.empty) {
                   const { $head } = tr.selection;
                   tr.setStoredMarks((backward ? $head.nodeBefore : $head.nodeAfter)?.marks ?? []);
                 }
@@ -1252,7 +1435,7 @@ function ComposerPromptEditorTiptapInner(
           }
           if (
             event.key === "Enter" &&
-            richText &&
+            rich &&
             !event.metaKey &&
             !event.ctrlKey &&
             !event.isComposing
@@ -1277,8 +1460,8 @@ function ComposerPromptEditorTiptapInner(
           const handler = readCallbacks().onCommandKeyDown;
           if (event.key === "Enter") {
             const instance = (view.dom as TiptapEditorHTMLElement).editor;
-            const isTaskItem = richText && (instance?.isActive("taskItem") ?? false);
-            const isListItem = richText && (instance?.isActive("listItem") ?? false);
+            const isTaskItem = rich && (instance?.isActive("taskItem") ?? false);
+            const isListItem = rich && (instance?.isActive("listItem") ?? false);
             const handled = handler?.("Enter", event, isTaskItem || isListItem) ?? false;
             if (handled) {
               event.preventDefault();
@@ -1290,7 +1473,7 @@ function ComposerPromptEditorTiptapInner(
               return true;
             }
             if (
-              richText &&
+              rich &&
               instance &&
               hasAncestor(view.state.selection.$from, "blockquote") &&
               view.state.selection.$from.parent.content.size === 0 &&
@@ -1310,8 +1493,14 @@ function ComposerPromptEditorTiptapInner(
           }
           return handled;
         },
-        handleTextInput: (view, from, to, text) => {
-          if (literalText || view.composing || text.length !== 1) return false;
+        handleTextInput: (view, from, to, text, insert) => {
+          // Inserting here keeps the input rules, which would read a command as Markdown, from
+          // seeing the text.
+          if (isShellCommandDoc(view.state.doc)) {
+            view.dispatch(insert());
+            return true;
+          }
+          if (fixedLiteralText || view.composing || text.length !== 1) return false;
           const closer = SURROUND_CLOSE[text];
           const { selection } = view.state;
           // Compose preedit updates replace a range even without a user selection.
@@ -1363,12 +1552,13 @@ function ComposerPromptEditorTiptapInner(
             );
             return true;
           }
+          const literal = isLiteralState(view.state);
           const importFragment = readCallbacks().importContextFragment;
           let text =
-            !literalText && importFragment
+            !literal && importFragment
               ? importPastedComposerText(clipboardData, importFragment)
               : pastedText;
-          const tokens = literalText ? [] : collectComposerPromptInlineTokens(`${text}\n`);
+          const tokens = literal ? [] : collectComposerPromptInlineTokens(`${text}\n`);
           const isChip = (token: (typeof tokens)[number] | undefined) =>
             token?.type === "mention" ||
             (token?.type === "skill" && skillLabelFor(token.value) !== null);
@@ -1383,7 +1573,7 @@ function ComposerPromptEditorTiptapInner(
           }
           const { $from } = view.state.selection;
           const lineBefore = $from.parent.textBetween(0, $from.parentOffset, undefined, "\uFFFC");
-          const literalLength = literalText
+          const literalLength = literal
             ? 0
             : pastedPathQueryLength(lineBefore, text, readCallbacks().isPathQueryActive?.());
           const editorInstance = (view.dom as TiptapEditorHTMLElement).editor;
@@ -1395,7 +1585,12 @@ function ComposerPromptEditorTiptapInner(
             insertMarkdownParagraphs(
               text,
               skillLabelFor,
-              { styling: richText, blocks: !nested, literalText, literalLength },
+              {
+                styling: isRichState(view.state),
+                blocks: !nested,
+                literalText: literal,
+                literalLength,
+              },
               (content) => {
                 editorInstance
                   .chain()
@@ -1426,17 +1621,27 @@ function ComposerPromptEditorTiptapInner(
         },
       },
       onUpdate: ({ editor: updated, transaction }) => {
+        const history = isHistoryTransaction(transaction);
+        const shell = isShellCommandDoc(updated.state.doc);
+        const restoredShellCommand =
+          history && shell !== isShellCommandDoc(transaction.before) ? shell : undefined;
+        if (!history && transaction.getMeta("addToHistory") !== false) {
+          editedSinceRenderRef.current = true;
+        }
         // Undo can restore a chip for a skill the current provider no longer offers.
-        if (!literalText && isHistoryTransaction(transaction)) {
+        if (history && !isLiteralState(updated.state)) {
           const stale = skillChipReplacements(updated.state.doc, skillLabelFor).filter(
             ({ node }) => node.isText,
           );
           if (stale.length > 0) {
             replaceSkillChips(updated, stale);
+            if (restoredShellCommand !== undefined) {
+              handleEditorChange(updated, restoredShellCommand);
+            }
             return;
           }
         }
-        handleEditorChange(updated);
+        handleEditorChange(updated, restoredShellCommand);
       },
       onSelectionUpdate: ({ editor: updated }) => {
         handleEditorChange(updated);
@@ -1464,11 +1669,12 @@ function ComposerPromptEditorTiptapInner(
     const { from, to } = editor.state.selection;
     const fromFlat = pmToFlat(map, from);
     const expandedCursor = Math.max(0, Math.min(map.value.length, flatToMarkdown(map, fromFlat)));
+    const literal = isLiteralState(editor.state);
     const next: typeof snapshot = {
       value: map.value,
-      cursor: collapseExpandedComposerCursor(map.value, expandedCursor, literalText),
+      cursor: collapseExpandedComposerCursor(map.value, expandedCursor, literal),
       expandedCursor,
-      contextIds: literalText ? [] : map.contextIds,
+      contextIds: literal ? [] : map.contextIds,
     };
     const toFlat = pmToFlat(map, to);
     selectionRangeRef.current = {
@@ -1540,7 +1746,7 @@ function ComposerPromptEditorTiptapInner(
       start: normalizedExpandedCursor,
       end: normalizedExpandedCursor,
     };
-    setIsEmpty(value.length === 0);
+    setIsEmpty(showsPlaceholderFor(value, shellCommand));
     const rootElement = editor.view.dom;
     const isFocused = Boolean(rootElement && document.activeElement === rootElement);
     if (!initialSelection && previousSnapshot.value === value && !isFocused) return;
@@ -1550,12 +1756,21 @@ function ComposerPromptEditorTiptapInner(
       citationRequestRef.current?.value === value ? citationRequestRef.current : null;
     if (previousSnapshot.value !== value) {
       saveCitationDraft(editor, previousSnapshot.value);
-      editor.commands.setContent(
-        buildDocJson(value, skillLabelFor, { styling: richText, literalText }),
-        {
-          emitUpdate: false,
-        },
-      );
+      const content = buildDocJson(value, skillLabelFor, { styling: richText, literalText });
+      if (isShellCommandDoc(editor.state.doc) === shellCommand) {
+        editor.commands.setContent(content, { emitUpdate: false });
+      } else {
+        editor
+          .chain()
+          .setContent(content, { emitUpdate: false })
+          .command(({ tr }) => {
+            // One step with the new text, so undo brings back the old text in its own mode.
+            tr.setDocAttribute(SHELL_COMMAND_ATTR, shellCommand);
+            if (editedSinceRenderRef.current) joinPreviousUndoStep(tr);
+            return true;
+          })
+          .run();
+      }
     }
     const map = serializeEditorDoc(editor.state.doc);
     const flat = markdownToFlat(map, normalizedExpandedCursor);
@@ -1592,19 +1807,38 @@ function ComposerPromptEditorTiptapInner(
     initialExpandedCursor,
     literalText,
     richText,
+    shellCommand,
     skillLabelFor,
     value,
   ]);
 
-  // Reconcile loaded or switched provider skills without rebuilding citation node views.
+  // The store decides shell mode from the editor's changes, so the switch lands a render after the
+  // edit that caused it. A switch that comes with a new value rides on its rewrite above instead.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- switches the Tiptap document in or out of shell mode after the store decides it
+  useLayoutEffect(() => {
+    if (!shellFeatureActive) return;
+    if (
+      editor &&
+      isShellCommandDoc(editor.state.doc) !== shellCommand &&
+      snapshotRef.current.value === value
+    ) {
+      editor.view.dispatch(
+        shellModeTransaction(editor.state, shellCommand, editedSinceRenderRef.current),
+      );
+    }
+    editedSinceRenderRef.current = false;
+  });
+
+  // Reconcile loaded or switched provider skills without rebuilding citation node views. Not on
+  // leaving shell mode, which keeps the command's text as typed.
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- replaces skill chip nodes in the Tiptap document when the provider skill list loads or changes
   useEffect(() => {
-    if (!editor || literalText) return;
+    if (!editor || fixedLiteralText || isShellCommandDoc(editor.state.doc)) return;
     const replacements = skillChipReplacements(editor.state.doc, (name) =>
       composerSkillMeta(skills, name),
     );
     if (replacements.length > 0) replaceSkillChips(editor, replacements);
-  }, [editor, literalText, skills]);
+  }, [editor, fixedLiteralText, skills]);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- restores ProseMirror focus and caret scroll when the keyed editor remounts, capturing focus on teardown
   useLayoutEffect(() => {
@@ -1817,6 +2051,7 @@ function ComposerPromptEditorTiptapInner(
               <div
                 className={cn(
                   "pointer-events-none absolute inset-0 leading-relaxed text-placeholder",
+                  shellCommand && "shell-command-text",
                   placeholderClassName,
                 )}
               >

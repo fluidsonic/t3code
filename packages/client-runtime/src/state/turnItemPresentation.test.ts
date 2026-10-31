@@ -1,4 +1,5 @@
 import {
+  MessageId,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   RunId,
   ThreadId,
@@ -75,6 +76,16 @@ describe("turnItemIsWorkspacePreparation", () => {
     expect(turnItemIsWorkspacePreparation(preparationFailure("failed"))).toBe(false);
     expect(turnItemIsWorkspacePreparation(preparationFailure("cancelled"))).toBe(true);
     expect(turnItemIsWorkspacePreparation(preparationFailure("cancelled", null))).toBe(false);
+  });
+
+  it("never mistakes a person's shell command for workspace preparation", () => {
+    expect(turnItemIsWorkspacePreparation(command("Preparing workspace"))).toBe(true);
+    expect(
+      turnItemIsWorkspacePreparation({
+        ...command("Preparing workspace"),
+        userShellMessageId: MessageId.make("message-1"),
+      } as OrchestrationV2TurnItem),
+    ).toBe(false);
   });
 });
 
