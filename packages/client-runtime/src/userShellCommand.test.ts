@@ -29,6 +29,7 @@ import {
   userShellCommandOutputView,
   userShellCommandOwnsWorkingSlot,
   userShellCommandPresentation,
+  userShellCommandRunningText,
   userShellCommandStatusText,
 } from "./userShellCommand.ts";
 
@@ -170,6 +171,16 @@ describe("userShellCommandPresentation", () => {
     const failed = commandItem({ status: "completed", exitCode: 128 });
     expect(text(failed)).toBe("2.3s");
     expect(userShellCommandPresentation(failed).summary).toBe("Exited 128 in 2.3s");
+  });
+
+  it("counts a running command's time in whole seconds past the first minute", () => {
+    const startedAt = DateTime.makeUnsafe("2026-10-23T10:00:00.000Z");
+    const at = (elapsedMs: number) =>
+      userShellCommandRunningText(startedAt, DateTime.toEpochMillis(startedAt) + elapsedMs);
+    expect(at(12_900)).toBe("Running for 12s");
+    expect(at(72_400)).toBe("Running for 1m 12s");
+    expect(at(3_725_000)).toBe("Running for 1h 2m 5s");
+    expect(userShellCommandRunningText(null, 0)).toBe("Running…");
   });
 
   it("notes a failing exit code under the output", () => {
