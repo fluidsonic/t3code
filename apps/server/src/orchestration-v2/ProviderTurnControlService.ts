@@ -2,10 +2,12 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import {
   MessageId,
   type NodeId,
+  type OrchestrationV2TurnItem,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
+  type RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -17,8 +19,11 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ServerConfig from "../config.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { userShellCommandItemId } from "@t3tools/shared/shellCommand";
+import { composeUserShellPrompt } from "./UserShellCommands.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -46,6 +51,13 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
 
+/**
+ * How long a steered `! cmd` waits for the agent to reach a steering window before its turn is
+ * interrupted instead. Long enough for a slow tool call to finish; a provider whose hooks never
+ * fire (managed settings turned them off) costs at most this.
+ */
+const USER_SHELL_PAUSE_TIMEOUT = "5 minutes";
+
 export interface ProviderTurnControlServiceV2Shape {
   readonly interrupt: (input: {
     readonly subagent?: {
@@ -68,6 +80,30 @@ export interface ProviderTurnControlServiceV2Shape {
     readonly providerTurnId: ProviderTurnId;
     readonly messageId: MessageId;
   }) => Effect.Effect<void, ProviderTurnControlError>;
+  /**
+   * Holds the running turn at its next steering window for steered `! cmd` commands. Anything
+   * short of `paused` (no live session, a provider that cannot hold, the timeout) means the
+   * caller interrupts the turn instead.
+   */
+  readonly pause: (input: {
+    readonly threadId: ThreadId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly providerTurnId: ProviderTurnId;
+  }) => Effect.Effect<ProviderAdapter.ProviderAdapterV2PauseOutcome>;
+  /**
+   * Lets a paused turn continue with these delivered messages, composed as one steered input.
+   * `false` when they could not reach the turn (it ended, its session is gone, the provider
+   * refused); the caller sends them again so the results still reach the agent.
+   */
+  readonly release: (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly providerTurnId: ProviderTurnId;
+    readonly messageIds: ReadonlyArray<MessageId>;
+  }) => Effect.Effect<boolean>;
   readonly interruptAndAwaitTerminal: (input: {
     readonly threadId: ThreadId;
     readonly providerSessionId: ProviderSessionId;
@@ -86,11 +122,14 @@ export class ProviderTurnControlServiceV2 extends Context.Service<
 export const layer: Layer.Layer<
   ProviderTurnControlServiceV2,
   never,
-  ProjectionStore.ProjectionStoreV2 | ProviderSessionManager.ProviderSessionManagerV2
+  | ProjectionStore.ProjectionStoreV2
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | ServerConfig.ServerConfig
 > = Layer.effect(
   ProviderTurnControlServiceV2,
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const serverConfig = yield* ServerConfig.ServerConfig;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
@@ -336,6 +375,127 @@ export const layer: Layer.Layer<
             ),
           ),
       ),
+      pause: Effect.fn("ProviderTurnControlService.pause")(
+        function* (input) {
+          const { providerThread, providerTurn } = yield* projections.getProviderControlContext(
+            input.threadId,
+            input,
+          );
+          if (providerThread === undefined || providerTurn?.status !== "running") {
+            return "turn_ended" as const;
+          }
+          const session = yield* sessions.get(input.providerSessionId);
+          const pauseTurn = Option.isSome(session) ? session.value.pauseTurn : undefined;
+          if (pauseTurn === undefined) return "unsupported" as const;
+          const outcome = yield* pauseTurn({
+            providerThread,
+            providerTurnId: providerTurn.id,
+          }).pipe(Effect.timeoutOption(USER_SHELL_PAUSE_TIMEOUT));
+          return Option.getOrElse(outcome, () => "unsupported" as const);
+        },
+        (effect, input) =>
+          effect.pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("orchestration-v2.user-shell-pause-failed", {
+                threadId: input.threadId,
+                providerTurnId: input.providerTurnId,
+                cause,
+              }).pipe(Effect.as("unsupported" as const)),
+            ),
+          ),
+      ),
+      release: Effect.fn("ProviderTurnControlService.release")(
+        function* (input) {
+          const { providerThread } = yield* projections.getProviderControlContext(
+            input.threadId,
+            input,
+          );
+          const session = yield* sessions.get(input.providerSessionId);
+          if (providerThread === undefined || Option.isNone(session)) {
+            return input.messageIds.length === 0;
+          }
+          const records =
+            input.messageIds.length === 0
+              ? { messages: [] }
+              : yield* projections.getThreadRecords(input.threadId, ["messages"], {
+                  messageIds: [...input.messageIds],
+                });
+          const entries = input.messageIds.flatMap((id) => {
+            const message = records.messages.find((candidate) => candidate.id === id);
+            return message === undefined ? [] : [{ ...message, messageId: message.id }];
+          });
+          const commandItems = new Map<MessageId, OrchestrationV2TurnItem>();
+          for (const entry of entries) {
+            if (entry.shellCommand !== true) continue;
+            const item = yield* projections.getTurnItem({
+              threadId: input.threadId,
+              itemId: userShellCommandItemId(entry.messageId),
+            });
+            if (item !== null) commandItems.set(entry.messageId, item);
+          }
+          const first = entries[0];
+          const prompt =
+            first === undefined
+              ? undefined
+              : composeUserShellPrompt({
+                  driver: providerThread.driver,
+                  entries,
+                  commandItem: (messageId) => commandItems.get(messageId),
+                  attachmentsDir: serverConfig.attachmentsDir,
+                });
+          const message =
+            first === undefined || prompt === undefined
+              ? undefined
+              : {
+                  messageId: first.id,
+                  text: prompt.text,
+                  attachments: prompt.attachments,
+                  createdBy: first.createdBy,
+                  creationSource: first.creationSource,
+                };
+          // A hold continues with text; attachments, from a steered message, follow as a steer.
+          const withText = message !== undefined && message.attachments.length === 0;
+          const released =
+            session.value.releaseTurn === undefined
+              ? false
+              : yield* session.value
+                  .releaseTurn({
+                    providerThread,
+                    providerTurnId: input.providerTurnId,
+                    ...(withText ? { text: message.text } : {}),
+                  })
+                  .pipe(
+                    Effect.catch((cause) =>
+                      Effect.logWarning("orchestration-v2.user-shell-release-turn-failed", {
+                        threadId: input.threadId,
+                        providerTurnId: input.providerTurnId,
+                        cause,
+                      }).pipe(Effect.as(false)),
+                    ),
+                  );
+          // Or the hold gave out first (its timeout, a recovered process): steer the input then.
+          if (message !== undefined && (!released || !withText)) {
+            yield* session.value.steerTurn({
+              threadId: input.threadId,
+              runId: input.runId,
+              providerThread,
+              providerTurnId: input.providerTurnId,
+              message,
+            });
+          }
+          return true;
+        },
+        (effect, input) =>
+          effect.pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("orchestration-v2.user-shell-release-failed", {
+                threadId: input.threadId,
+                providerTurnId: input.providerTurnId,
+                cause,
+              }).pipe(Effect.as(input.messageIds.length === 0)),
+            ),
+          ),
+      ),
       steer: Effect.fn("ProviderTurnControlService.steer")(
         function* (input) {
           const context = yield* projections.getProviderControlContext(input.threadId, input);
@@ -366,6 +526,23 @@ export const layer: Layer.Layer<
               cause: "The persisted steering message or target run is missing.",
             });
           }
+          // A steered `! cmd` steers with its result once it finished.
+          const commandItem =
+            message.shellCommand === true
+              ? yield* projections.getTurnItem({
+                  threadId: input.threadId,
+                  itemId: userShellCommandItemId(message.id),
+                })
+              : null;
+          const shellPrompt =
+            message.shellCommand === true
+              ? composeUserShellPrompt({
+                  driver: loaded.providerThread.driver,
+                  entries: [{ ...message, messageId: message.id }],
+                  commandItem: () => commandItem ?? undefined,
+                  attachmentsDir: serverConfig.attachmentsDir,
+                })
+              : undefined;
           yield* loaded.session.value
             .steerTurn({
               threadId: input.threadId,
@@ -374,11 +551,13 @@ export const layer: Layer.Layer<
               providerTurnId: loaded.providerTurn.id,
               message: {
                 messageId: message.id,
-                text: projectComposerContextForProvider({
-                  text: message.text,
-                  records: message.context?.records ?? [],
-                }),
-                attachments: message.attachments,
+                text:
+                  shellPrompt?.text ??
+                  projectComposerContextForProvider({
+                    text: message.text,
+                    records: message.context?.records ?? [],
+                  }),
+                attachments: shellPrompt?.attachments ?? message.attachments,
                 createdBy: message.createdBy,
                 creationSource: message.creationSource,
                 ...(message.scheduledTaskId === undefined

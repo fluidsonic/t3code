@@ -9,12 +9,30 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
+import {
+  type UserShellCommandStatus,
+  userShellCommandIsActive,
+  userShellCommandModeNote,
+  userShellCommandOutcomeLine,
+  userShellCommandOutputView,
+  userShellCommandPresentation,
+  userShellCommandStatusText,
+} from "@t3tools/client-runtime/user-shell-command";
+import { CommandOutputText, useCommandOutputStreaming } from "./CommandOutputPanel";
+import { orchestrationEnvironment } from "../../state/orchestration";
+import { Spinner } from "../ui/spinner";
+import { SHELL_COMMAND_TINT, ShellCommandText } from "./ShellCommandText";
 import { Link } from "@tanstack/react-router";
 import { useQuietThreadShell } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
+import { observeResize } from "../../lib/observeResize";
 import { serverEnvironment } from "../../state/server";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
-import { memo, use, useState, type ReactNode } from "react";
+import {
+  isPartialShellCommandOutput,
+  shellCommandFromMessageText,
+} from "@t3tools/shared/shellCommand";
+import { memo, use, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   createMessageAttachmentPreviewProjector,
   selectMessageImageResources,
@@ -29,6 +47,9 @@ import ChatMarkdown from "../ChatMarkdown";
 import {
   CalendarClockIcon,
   ChevronDownIcon,
+  CircleCheckIcon,
+  CircleSlashIcon,
+  CircleXIcon,
   DownloadIcon,
   EyeIcon,
   type LucideIcon,
@@ -247,6 +268,8 @@ export function UserMessageRow({ row }: { row: Extract<TimelineRow, { kind: "mes
       environmentId={ctx.activeThreadEnvironmentId}
       onOpenThread={(threadId) => ctx.onOpenThread(ThreadId.make(threadId))}
     />
+  ) : row.message.shellCommand === true ? (
+    <ShellCommandMessageRow row={row} />
   ) : resolveUserMessagePresentation(row.message).attribution === "automation" ? (
     <AutomationMessageRow row={row} />
   ) : (
@@ -339,6 +362,269 @@ function AutomationMessageRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         </div>
       ) : null}
     </div>
+  );
+}
+
+type FinishedShellStatus = Exclude<UserShellCommandStatus, "waiting" | "running">;
+
+const SHELL_STATUS_ICON: Record<FinishedShellStatus, LucideIcon> = {
+  completed: CircleCheckIcon,
+  failed: CircleXIcon,
+  skipped: CircleSlashIcon,
+};
+
+const RESIZE_DURATION_MS = 180;
+const RESIZE_EASING = "cubic-bezier(0.32, 0.72, 0, 1)";
+
+/**
+ * Eases an element's width from before `key` changed to after, instead of snapping, like the
+ * composer's context labels. Height changes at once, so the timeline can hold the row in place;
+ * `onChange` runs in that same layout pass to tell it. Descendants marked `data-resize-pin` keep
+ * their final width meanwhile, so the element reveals them instead of re-wrapping them.
+ */
+function useWidthTransition<T extends HTMLElement>(key: boolean, onChange: () => void) {
+  const ref = useRef<T>(null);
+  const keyRef = useRef(key);
+  // The width as of the last frame. A resize observer keeps it, so a change can start from it
+  // without measuring the element on every render.
+  const widthRef = useRef<number | null>(null);
+  const animationRef = useRef<Animation | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- observes the element's DOM size so a width change can start from it
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element === null) return;
+    return observeResize(element, (entries) => {
+      // Mid-animation widths are not where the next change starts from.
+      if (animationRef.current !== null) return;
+      const width = entries.at(-1)?.borderBoxSize?.[0]?.inlineSize;
+      if (width !== undefined) widthRef.current = width;
+    });
+  }, []);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- animates the DOM element's width between layouts with the Web Animations API
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element === null || keyRef.current === key) return;
+    keyRef.current = key;
+    onChange();
+    const previous = widthRef.current;
+    animationRef.current?.cancel();
+    animationRef.current = null;
+    const width = element.getBoundingClientRect().width;
+    widthRef.current = width;
+    if (
+      previous === null ||
+      Math.abs(previous - width) < 0.5 ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+    const pinned = Array.from(element.querySelectorAll<HTMLElement>("[data-resize-pin]"));
+    for (const pin of pinned) pin.style.minWidth = `${pin.getBoundingClientRect().width}px`;
+    const animation = element.animate(
+      [
+        { width: `${previous}px`, overflow: "hidden" },
+        { width: `${width}px`, overflow: "hidden" },
+      ],
+      { duration: RESIZE_DURATION_MS, easing: RESIZE_EASING },
+    );
+    const settle = () => {
+      for (const pin of pinned) pin.style.removeProperty("min-width");
+      if (animationRef.current === animation) animationRef.current = null;
+    };
+    animation.addEventListener("finish", settle);
+    animation.addEventListener("cancel", settle);
+    animationRef.current = animation;
+  }, [key, onChange]);
+  return ref;
+}
+
+/**
+ * A person's `! cmd` once its result reached the agent: the command, then its exit code and
+ * duration, with the output folded behind that line. Until then it waits at the timeline's end.
+ */
+function ShellCommandMessageRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const ctx = use(TimelineRowCtx);
+  const environmentId = ctx.activeThreadEnvironmentId;
+  const command = shellCommandFromMessageText(row.message.text);
+  const result = row.message.shellCommandResult ?? null;
+  const presentation = result === null ? null : userShellCommandPresentation(result);
+  const streamsOutput = useCommandOutputStreaming(environmentId);
+  // Kept with the timeline's other disclosures: a virtualized row remounts as it scrolls back.
+  const outputDisclosureId = `shell-command-output:${row.id}`;
+  const [wantsOutput, setWantsOutput] = useState(() =>
+    ctx.workGroupViewState.expandedEntries.has(outputDisclosureId),
+  );
+  const toggleOutput = () => {
+    const open = !wantsOutput;
+    if (open) ctx.workGroupViewState.expandedEntries.add(outputDisclosureId);
+    else ctx.workGroupViewState.expandedEntries.delete(outputDisclosureId);
+    setWantsOutput(open);
+  };
+  const outputPanelId = useId();
+  // The thread omits command output, so it loads before opening: one resize, not one for a
+  // loading state and another for the output.
+  const fetchedOutput = useEnvironmentQuery(
+    result !== null && streamsOutput && wantsOutput
+      ? orchestrationEnvironment.v2.commandOutput({
+          environmentId,
+          input: { threadId: result.threadId, itemId: result.id },
+        })
+      : null,
+  );
+  const outputText = fetchedOutput.data?.output.text ?? result?.output ?? "";
+  const view = userShellCommandOutputView({
+    running: false,
+    wantsOutput,
+    fetchesOutput: streamsOutput,
+    outputSettled: fetchedOutput.data !== null || fetchedOutput.error !== null,
+    hasOutput: outputText.length > 0,
+  });
+  const fullOutput = (row.message.attachments ?? []).find(isFileAttachment) ?? null;
+  const showOutput = result !== null && view.showOutput;
+  // Opening keeps the bubble where it is; other changes follow the thread as usual.
+  const bubbleRef = useWidthTransition<HTMLDivElement>(showOutput, () =>
+    ctx.onToggleWorkEntry(row.id, !showOutput, showOutput && wantsOutput),
+  );
+  const outcomeLine = presentation === null ? null : userShellCommandOutcomeLine(presentation);
+  const copyableOutput = outputText.length > 0;
+  const modeNote = result === null ? null : userShellCommandModeNote(result);
+
+  return (
+    <div
+      className="group flex flex-col items-end gap-1"
+      data-user-shell-command={presentation?.status ?? "sent"}
+    >
+      {row.message.inputIntent === "steer" ||
+      row.message.inputIntent === "promoted_queued_to_steer" ? (
+        <UserMessageIntentMarker intent={row.message.inputIntent} />
+      ) : null}
+      <div
+        ref={bubbleRef}
+        className={cn(
+          SHELL_COMMAND_TINT,
+          "min-w-0 max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground",
+        )}
+      >
+        <MessageAuthorHeading>
+          {presentation?.status === "skipped" ? "Not run" : "You ran"}
+        </MessageAuthorHeading>
+        <p className="text-sm whitespace-pre-wrap wrap-break-word" data-thread-find-text="true">
+          <ShellCommandText command={command} block />
+        </p>
+        {presentation?.status === "skipped" ? (
+          // It never ran, so there is no output to open.
+          <div className="mt-2 flex min-w-0 items-center text-xs text-muted-foreground">
+            <span className="me-(--shell-command-gap) inline-flex w-(--shell-command-prefix-size) shrink-0 justify-center text-sm">
+              <ShellStatusIcon status="skipped" />
+            </span>
+            <span>{presentation.summary}</span>
+          </div>
+        ) : presentation !== null && !userShellCommandIsActive(presentation.status) ? (
+          <div className="mt-2 flex min-w-0 items-center text-xs text-muted-foreground tabular-nums">
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-expanded={view.expanded}
+                    aria-controls={outputPanelId}
+                    aria-busy={view.loading}
+                    aria-label={`${presentation.summary}, ${view.expanded ? "hide" : "show"} output`}
+                    data-scroll-anchor-ignore
+                    className="-mx-1 flex min-w-0 flex-1 items-center rounded-md px-1 py-0.5 text-start transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    onClick={toggleOutput}
+                  />
+                }
+              >
+                {/* Centered under the `!`, so what follows lines up with the command. */}
+                <span className="me-(--shell-command-gap) inline-flex w-(--shell-command-prefix-size) shrink-0 justify-center text-sm">
+                  <ShellStatusIcon status={presentation.status} />
+                </span>
+                <span>{userShellCommandStatusText(presentation)}</span>
+                {view.loading ? (
+                  <Spinner size="sm" tone="muted" aria-hidden className="ms-auto shrink-0" />
+                ) : (
+                  <ChevronDownIcon
+                    aria-hidden="true"
+                    className={cn("ms-auto size-3.5 shrink-0", view.expanded && "rotate-180")}
+                  />
+                )}
+              </TooltipTrigger>
+              <TooltipPopup>{presentation.summary}</TooltipPopup>
+            </Tooltip>
+          </div>
+        ) : null}
+        {showOutput && result !== null ? (
+          <div
+            id={outputPanelId}
+            data-resize-pin
+            className="relative mt-2 max-w-full min-w-0 overflow-hidden rounded-lg bg-background/60 p-2 font-mono text-xs whitespace-pre"
+          >
+            {copyableOutput ? (
+              <MessageCopyButton
+                text={outputText}
+                label="Copy output"
+                size="icon-xs"
+                variant="ghost"
+                className="absolute end-1 top-1"
+              />
+            ) : null}
+            <div className={cn(copyableOutput && "pe-7")}>
+              {outputText.length > 0 ? (
+                <CommandOutputText text={outputText} />
+              ) : (
+                <div className="text-muted-foreground italic">
+                  {fetchedOutput.error === null
+                    ? "No output."
+                    : `Couldn't load output: ${fetchedOutput.error}`}
+                </div>
+              )}
+              {outcomeLine === null ? null : (
+                <div className="mt-1 text-destructive">{outcomeLine}</div>
+              )}
+            </div>
+          </div>
+        ) : null}
+        {showOutput && fullOutput !== null ? (
+          <div className="mt-1 text-xs">
+            <InlineButton tone="muted" onClick={() => ctx.onFileOpen(fullOutput)}>
+              {isPartialShellCommandOutput(fullOutput)
+                ? "Open saved output (first 50 MB)"
+                : "Open full output"}
+            </InlineButton>
+          </div>
+        ) : null}
+        {modeNote !== null ? (
+          <p className="mt-2 text-2xs text-muted-foreground">{modeNote}</p>
+        ) : null}
+      </div>
+      <UserMessageProjectedStatus row={row} />
+      <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100">
+        <div className="flex shrink-0 items-center gap-2">
+          <TimelineRowTimestamp
+            createdAt={row.message.createdAt}
+            timestampFormat={ctx.timestampFormat}
+            alwaysVisible
+          />
+          <MessageCopyButton text={command} label="Copy command" variant="ghost" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ShellStatusIcon(props: { readonly status: FinishedShellStatus }) {
+  const Icon = SHELL_STATUS_ICON[props.status];
+  return (
+    <Icon
+      aria-hidden="true"
+      className={cn(
+        "size-3.5",
+        props.status === "failed" && "text-destructive",
+        props.status === "completed" && "text-success-foreground",
+        props.status === "skipped" && "text-muted-foreground",
+      )}
+    />
   );
 }
 

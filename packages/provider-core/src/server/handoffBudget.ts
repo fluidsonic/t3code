@@ -11,6 +11,8 @@ import type {
 
 import * as Config from "effect/Config";
 
+import { isUserShellCommandItem, userShellCommandHistoryText } from "./userShellCommand.ts";
+
 export const DEFAULT_HANDOFF_TOKEN_CAP = 16_000;
 const HANDOFF_BYTE_CAP = 64_000;
 export const handoffTokenCapConfig = Config.Int("T3CODE_CONTEXT_HANDOFF_TOKEN_CAP").pipe(
@@ -128,12 +130,25 @@ export function historicalMessage(
   item: OrchestrationV2TurnItem,
 ): OrchestrationV2HistoricalMessage | null {
   let text: string;
+  let role: OrchestrationV2HistoricalMessage["role"] = "assistant";
   switch (item.type) {
     case "user_message":
+      // A `! cmd` message is carried by its result item, which also says how it went.
+      if (item.shellCommand === true) return null;
+      text = item.text;
+      role = "user";
+      break;
     case "assistant_message":
       text = item.text;
       break;
     case "command_execution":
+      if (isUserShellCommandItem(item)) {
+        // History holds what the agent was told: a waiting, running or stopped command is not.
+        if (item.userShellDelivered !== true) return null;
+        text = userShellCommandHistoryText(item);
+        role = "user";
+        break;
+      }
       text = [
         `Command: ${item.input}`,
         `Exit code: ${item.exitCode ?? "unknown"}`,
@@ -156,7 +171,7 @@ export function historicalMessage(
       return null;
   }
   return {
-    role: item.type === "user_message" ? "user" : "assistant",
+    role,
     text,
     threadId: item.threadId,
     runId: item.runId,

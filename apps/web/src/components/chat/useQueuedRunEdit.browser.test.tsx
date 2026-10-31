@@ -154,6 +154,7 @@ async function beginChangedEdit(hook: { current: HookResult | null }) {
       runId: RUN,
       messageId: MessageId.make("message-1"),
       text: "original",
+      shellCommand: false,
       attachments: [],
     }),
   );
@@ -197,6 +198,7 @@ describe("useQueuedRunEdit", () => {
         runId: RUN,
         messageId: MessageId.make("message-1"),
         text: prefix + ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+        shellCommand: false,
         attachments,
       };
       await act(() => requireHook(hook).beginEdit(request));
@@ -241,6 +243,7 @@ describe("useQueuedRunEdit", () => {
         runId: RUN,
         messageId: MessageId.make("message-1"),
         text: `Ultrathink:\n${ATTACHMENT_ONLY_BOOTSTRAP_PROMPT}`,
+        shellCommand: false,
         attachments: [
           {
             type: "image",
