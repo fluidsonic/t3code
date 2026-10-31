@@ -262,6 +262,25 @@ function BrowserMiniPlayer({ threadRef, tabId, miniPlayer }: Props & { readonly 
     snapshot.navStatus._tag === "Success"
       ? previewPdfAssetUrl(snapshot.navStatus.url, httpBaseUrl)
       : null;
+  const crashed = snapshot.navStatus._tag === "LoadFailed" && snapshot.navStatus.crashed === true;
+  // A desktop-only tab seen from another client has no way to reload.
+  const canReloadCrashed = serverTab || Boolean(previewBridge && desktopOverlay);
+  const reloadCrashed = () => {
+    if (serverTab) serverSurfaceRef.current?.reload();
+    else void previewBridge?.refresh(runtimeTabId);
+  };
+  const crashOverlay = crashed ? (
+    <div className="pointer-events-auto absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-[inherit] bg-muted p-3 text-center text-xs text-muted-foreground">
+      This page crashed.
+      {canReloadCrashed ? (
+        <Button size="sm" onClick={reloadCrashed}>
+          Reload
+        </Button>
+      ) : (
+        "Reload it in the desktop app."
+      )}
+    </div>
+  ) : null;
   const poppedOut = serverTab ? serverPictureInPicture : Boolean(desktopOverlay?.pictureInPicture);
   const canPopOut = serverTab
     ? poppedOut || (pdfUrl === null && supportsServerPictureInPicture())
@@ -330,12 +349,13 @@ function BrowserMiniPlayer({ threadRef, tabId, miniPlayer }: Props & { readonly 
               onPopup={(popupTabId) => showPreviewPopup(threadRef, popupTabId, "floating")}
               className="size-full"
             />
+            {crashOverlay}
           </div>
         ) : (
           <>
             <BrowserSurfaceSlot
               tabId={runtimeTabId}
-              visible={Boolean(desktopOverlay?.hasWebContents)}
+              visible={Boolean(desktopOverlay?.hasWebContents) && !crashed}
               cornerRadius={PREVIEW_MINI_PLAYER_CORNER_RADIUS}
               zIndex={PREVIEW_MINI_PLAYER_WEBVIEW_Z_INDEX}
               fitSourceContent
@@ -347,6 +367,14 @@ function BrowserMiniPlayer({ threadRef, tabId, miniPlayer }: Props & { readonly 
                 Reconnecting preview…
               </div>
             ) : null}
+            {crashOverlay && (
+              <div
+                className="absolute inset-0 rounded-[inherit]"
+                style={{ zIndex: PREVIEW_MINI_PLAYER_WEBVIEW_Z_INDEX }}
+              >
+                {crashOverlay}
+              </div>
+            )}
           </>
         )
       }
