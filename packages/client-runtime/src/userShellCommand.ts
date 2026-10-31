@@ -15,7 +15,7 @@ import {
 } from "@t3tools/shared/shellCommand";
 import * as DateTime from "effect/DateTime";
 
-import { formatWorkingDurationLabel, type ThreadStructureTurnItem } from "./state/models.ts";
+import type { ThreadStructureTurnItem } from "./state/models.ts";
 
 /** The result item of a person's `! cmd` message. */
 export type UserShellCommandItem = Extract<OrchestrationV2TurnItem, { type: "command_execution" }>;
@@ -324,9 +324,9 @@ export function userShellCommandRunningText(
   startedAt: UserShellCommandItem["startedAt"],
   nowMs: number,
 ): string {
-  return startedAt === null
-    ? "Running…"
-    : `Running for ${formatWorkingDurationLabel(nowMs - DateTime.toEpochMillis(startedAt))}`;
+  if (startedAt === null) return "Running…";
+  const seconds = Math.max(0, Math.floor((nowMs - DateTime.toEpochMillis(startedAt)) / 1000));
+  return `Running for ${seconds < 60 ? `${seconds}s` : formatDuration(seconds * 1000)}`;
 }
 
 /** The line under a finished command's output when it did not succeed. */
