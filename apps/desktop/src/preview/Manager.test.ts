@@ -592,6 +592,48 @@ describe("PreviewManager", () => {
       ),
   );
 
+  effectIt.effect("sends a zoom chord from a focused page to that tab, not the app menu", () =>
+    withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          const preview = makeFaviconWebContents();
+          const send = vi.fn();
+          Object.assign(preview.webContents, {
+            hostWebContents: { isDestroyed: () => false, send },
+          });
+          fromId.mockReturnValue(preview.webContents);
+          const zoomShortcuts: Array<unknown> = [];
+          yield* manager.subscribeTabShortcuts((event) =>
+            Effect.sync(() => zoomShortcuts.push(event)),
+          );
+          yield* manager.createTab("tab_zoom");
+          yield* manager.registerWebview("tab_zoom", 42);
+          yield* manager.setForwardedShortcuts([
+            { command: "preview.zoomIn", shortcut: parseKeybindingShortcut("mod+=")! },
+          ]);
+          const preventDefault = vi.fn();
+          preview.listeners.get("before-input-event")!(
+            { preventDefault } as never,
+            {
+              type: "keyDown",
+              key: "=",
+              code: "Equal",
+              meta: true,
+              control: false,
+              shift: false,
+              alt: false,
+            } as never,
+          );
+          yield* Effect.yieldNow;
+
+          expect(preventDefault).toHaveBeenCalledOnce();
+          expect(send).not.toHaveBeenCalled();
+          expect(zoomShortcuts).toEqual([{ tabId: "tab_zoom", command: "preview.zoomIn" }]);
+        }),
+      "darwin",
+    ),
+  );
+
   effectIt.effect("keeps editing and forwarded shortcuts in whichever tab holds focus", () =>
     withManager((manager) =>
       Effect.gen(function* () {
@@ -1252,6 +1294,55 @@ describe("PreviewManager", () => {
         expect(states.length).toBe(publishedBefore);
         expect(states.at(-1)?.audible).toBe(false);
       }),
+    ),
+  );
+
+  effectIt.effect("zooms the tab, not the app, for zoom chords in its separate window", () =>
+    withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          const capturePage = vi.fn(async () => ({
+            toJPEG: () => Buffer.from("frame"),
+            getSize: () => ({ width: 1280, height: 720 }),
+          }));
+          fromId.mockReturnValue(makeTestPreviewWebContents(capturePage));
+          const { pictureInPictureWindow, webContentsListeners } = makeTestPictureInPictureWindow();
+          browserWindowConstructor.mockImplementation(function () {
+            return pictureInPictureWindow;
+          });
+          const zoomShortcuts: Array<unknown> = [];
+          yield* manager.subscribeTabShortcuts((event) =>
+            Effect.sync(() => zoomShortcuts.push(event)),
+          );
+          yield* manager.createTab("tab_window_zoom");
+          yield* manager.registerWebview("tab_window_zoom", 42);
+          yield* manager.setForwardedShortcuts([
+            { command: "preview.resetZoom", shortcut: parseKeybindingShortcut("mod+0")! },
+          ]);
+          yield* manager.openPictureInPicture("tab_window_zoom");
+          const onInput = webContentsListeners.get("before-input-event") as unknown as (
+            event: { preventDefault: () => void },
+            input: Record<string, unknown>,
+          ) => void;
+          const key = { type: "keyDown", meta: true, control: false, shift: false, alt: false };
+
+          const zoomPreventDefault = vi.fn();
+          onInput({ preventDefault: zoomPreventDefault }, { ...key, key: "0", code: "Digit0" });
+          yield* Effect.yieldNow;
+
+          expect(zoomPreventDefault).toHaveBeenCalledOnce();
+          expect(zoomShortcuts).toEqual([
+            { tabId: "tab_window_zoom", command: "preview.resetZoom" },
+          ]);
+
+          // An app zoom key that zooms no tab (here unbound) still must not reach the app menu.
+          const unboundPreventDefault = vi.fn();
+          onInput({ preventDefault: unboundPreventDefault }, { ...key, key: "=", code: "Equal" });
+          yield* Effect.yieldNow;
+          expect(unboundPreventDefault).toHaveBeenCalledOnce();
+          expect(zoomShortcuts).toHaveLength(1);
+        }),
+      "darwin",
     ),
   );
 
