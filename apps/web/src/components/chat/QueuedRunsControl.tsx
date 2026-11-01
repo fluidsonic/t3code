@@ -5,6 +5,7 @@ import {
   isAttachmentOnlyBootstrapPrompt,
   replaceComposerContextReferences,
 } from "@t3tools/shared/composerContextReferences";
+import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
 import type {
   ChatAttachment as ContractChatAttachment,
   EnvironmentId,
@@ -32,6 +33,7 @@ import { useQuietThreadShell, useThreadProjection } from "../../state/entities";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { isImageAttachment, type ChatMessage } from "../../types";
 import { cn } from "~/lib/utils";
+import { ShellCommandText } from "./ShellCommandText";
 import { Button, InlineButton } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { TimestampFormat } from "@t3tools/contracts/settings";
@@ -44,6 +46,7 @@ export interface EditQueuedRunRequest {
   readonly messageId: MessageId;
   readonly text: string;
   readonly attachments: ReadonlyArray<ContractChatAttachment>;
+  readonly shellCommand: boolean;
 }
 
 interface QueuedRowThumbnail {
@@ -83,11 +86,13 @@ export function QueuedRunsControl({
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly optimisticMessages: ReadonlyArray<
-    Pick<ChatMessage, "id" | "inputIntent" | "text" | "attachments">
+    Pick<ChatMessage, "id" | "inputIntent" | "text" | "attachments" | "shellCommand">
   >;
   readonly editingRunId: RunId | null;
   /** Set while something else holds the composer, such as an open question. */
   readonly editBlockedReason: string | null;
+  /** Terminal access and the environment's shell commands setting; a queued command needs both. */
+  readonly canEditShellCommands: boolean;
   readonly onEditQueuedRun: (request: EditQueuedRunRequest) => void;
   readonly onCancelEdit: () => void;
   readonly timestampFormat: TimestampFormat;
@@ -124,25 +129,32 @@ export function QueuedRunsControl({
     (message) => message.inputIntent === "queued_turn" && !acknowledgedMessageIds.has(message.id),
   );
   const items = [
-    ...queued.map(({ run, text, attachments, context, message }, serverIndex) => ({
-      key: run.id,
-      message,
-      runId: run.id,
-      messageId: run.userMessageId,
-      serverIndex,
-      text,
-      // A guest's message keeps the guest's words; the owner can cancel it, not rewrite it.
-      editable: context?.guest === undefined,
-      attachments,
-      thumbnails: attachments
-        .filter((attachment) => attachment.type === "image")
-        .map<QueuedRowThumbnail>((attachment) => ({
-          key: attachment.id,
-          name: attachment.name,
-          url: queuedImageUrlById.get(attachment.id) ?? null,
-        })),
-      pending: false,
-    })),
+    ...queued.map(
+      (
+        { run, text, attachments, context, message, shellCommand, shellCommandRan },
+        serverIndex,
+      ) => ({
+        key: run.id,
+        message,
+        runId: run.id,
+        messageId: run.userMessageId,
+        serverIndex,
+        text,
+        // A guest's message keeps the guest's words; the owner can cancel it, not rewrite it.
+        editable: context?.guest === undefined,
+        shellCommand: shellCommand === true,
+        shellCommandRan: shellCommandRan === true,
+        attachments,
+        thumbnails: attachments
+          .filter((attachment) => attachment.type === "image")
+          .map<QueuedRowThumbnail>((attachment) => ({
+            key: attachment.id,
+            name: attachment.name,
+            url: queuedImageUrlById.get(attachment.id) ?? null,
+          })),
+        pending: false,
+      }),
+    ),
     ...optimisticQueued.map((message) => ({
       key: message.id,
       message: undefined,
@@ -151,6 +163,8 @@ export function QueuedRunsControl({
       serverIndex: null,
       text: message.text,
       editable: true,
+      shellCommand: message.shellCommand === true,
+      shellCommandRan: false,
       attachments: [] as ReadonlyArray<ContractChatAttachment>,
       thumbnails: (message.attachments ?? [])
         .filter(isImageAttachment)
@@ -195,6 +209,8 @@ export function QueuedRunsControl({
       if (
         !latest ||
         latest.context?.guest !== undefined ||
+        latest.shellCommandRan === true ||
+        (latest.shellCommand === true && !props.canEditShellCommands) ||
         props.editingRunId !== null ||
         props.editBlockedReason !== null ||
         busyRunId !== null
@@ -208,6 +224,7 @@ export function QueuedRunsControl({
           messageId: latest.run.userMessageId,
           text: latest.text,
           attachments: latest.attachments,
+          shellCommand: latest.shellCommand === true,
         });
       }
       return true;
@@ -240,13 +257,15 @@ export function QueuedRunsControl({
       </span>
       <ol className="flex flex-col items-end gap-3" id={queueListId}>
         {visibleItems.map((item, position) => {
-          const previewText = isAttachmentOnlyBootstrapPrompt(item.text)
-            ? ""
-            : assistantCitationsToPlainText(
-                replaceComposerContextReferences(item.text, (reference) =>
-                  reference.kind === "image" && item.thumbnails.length > 0 ? "" : reference.label,
-                ),
-              ).trim();
+          const previewText = item.shellCommand
+            ? shellCommandFromMessageText(item.text)
+            : isAttachmentOnlyBootstrapPrompt(item.text)
+              ? ""
+              : assistantCitationsToPlainText(
+                  replaceComposerContextReferences(item.text, (reference) =>
+                    reference.kind === "image" && item.thumbnails.length > 0 ? "" : reference.label,
+                  ),
+                ).trim();
           const isEditing = item.runId !== null && item.runId === props.editingRunId;
           return (
             <li
@@ -261,6 +280,7 @@ export function QueuedRunsControl({
                 environmentId={props.environmentId}
                 message={item.message}
                 previewText={previewText}
+                shellCommand={item.shellCommand}
                 thumbnails={item.thumbnails}
                 isEditing={isEditing}
                 timestampFormat={props.timestampFormat}
@@ -321,7 +341,9 @@ export function QueuedRunsControl({
                             item.runId === null ||
                             !item.editable ||
                             busyRunId !== null ||
-                            props.editBlockedReason !== null
+                            props.editBlockedReason !== null ||
+                            item.shellCommandRan ||
+                            (item.shellCommand && !props.canEditShellCommands)
                           }
                           onClick={() => {
                             if (item.runId !== null && item.messageId !== null) {
@@ -330,6 +352,7 @@ export function QueuedRunsControl({
                                 messageId: item.messageId,
                                 text: item.text,
                                 attachments: item.attachments,
+                                shellCommand: item.shellCommand,
                               });
                             }
                           }}
@@ -339,7 +362,11 @@ export function QueuedRunsControl({
                       </TooltipTrigger>
                       <TooltipPopup>
                         {props.editBlockedReason ??
-                          `Edit in the composer${item.serverIndex === queued.length - 1 && props.editShortcutLabel ? ` (${props.editShortcutLabel})` : ""}`}
+                          (item.shellCommandRan
+                            ? "Already ran; the agent's reply is waiting"
+                            : item.shellCommand && !props.canEditShellCommands
+                              ? "Shell commands can't be edited here"
+                              : `Edit in the composer${item.serverIndex === queued.length - 1 && props.editShortcutLabel ? ` (${props.editShortcutLabel})` : ""}`)}
                       </TooltipPopup>
                     </Tooltip>
                     <Tooltip>
@@ -399,6 +426,7 @@ function QueuedMessage(props: {
   readonly environmentId: EnvironmentId;
   readonly message: QueuedRunMessage | undefined;
   readonly previewText: string;
+  readonly shellCommand: boolean;
   readonly thumbnails: ReadonlyArray<QueuedRowThumbnail>;
   readonly isEditing: boolean;
   readonly timestampFormat: TimestampFormat;
@@ -491,7 +519,13 @@ function QueuedMessage(props: {
             ) : null}
             {/* In full, like a sent turn: a queued message is read before it is sent. */}
             {props.previewText ? (
-              <p className="whitespace-pre-wrap wrap-anywhere">{props.previewText}</p>
+              <p className="whitespace-pre-wrap wrap-anywhere">
+                {props.shellCommand ? (
+                  <ShellCommandText command={props.previewText} />
+                ) : (
+                  props.previewText
+                )}
+              </p>
             ) : null}
           </div>
         ) : null}

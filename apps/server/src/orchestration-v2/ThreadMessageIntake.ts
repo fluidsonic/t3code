@@ -1,15 +1,68 @@
 import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
 import { appendUserInputAttachmentPaths } from "../provider/userInputAttachments.ts";
-import type { ChatAttachment, OrchestrationV2Command } from "@t3tools/contracts";
+import {
+  CommandId,
+  type ChatAttachment,
+  type MessageId,
+  type OrchestrationV2Command,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 
 import * as AttachmentClaims from "./AttachmentClaims.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { userShellCommandItemId } from "@t3tools/shared/shellCommand";
+
+export class ShellCommandsDisabledError extends Schema.TaggedError<ShellCommandsDisabledError>()(
+  "ShellCommandsDisabledError",
+  { commandId: CommandId },
+) {
+  // Web and mobile put the switch on different settings pages, so this names only the setting.
+  override get message(): string {
+    return "Shell commands are turned off for this environment. Turn on Shell commands in Settings to run them.";
+  }
+}
+
+// Only new commands need the setting: a retry of an accepted one replays its receipt, and
+// commands already queued or running finish even after the setting is turned off.
+const assertShellCommandsEnabled = Effect.fn("ThreadMessageIntake.assertShellCommandsEnabled")(
+  function* (commandId: CommandId) {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    if (yield* threads.hasReceipt(commandId)) return;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const { enableShellCommands } = yield* settings.getSettings.pipe(Effect.orDie);
+    if (!enableShellCommands) return yield* new ShellCommandsDisabledError({ commandId });
+  },
+);
+
+// The server redelivers a command's result under its message id; a client reusing that id would
+// run it past the agent a second time. A retry of the send that ran it replays its receipt.
+const assertShellMessageIsNew = Effect.fn("ThreadMessageIntake.assertShellMessageIsNew")(
+  function* (input: {
+    readonly commandId: CommandId;
+    readonly threadId: ThreadId;
+    readonly messageId: MessageId;
+  }) {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    if (yield* threads.hasReceipt(input.commandId)) return;
+    const { item } = yield* threads.getTurnItem({
+      threadId: input.threadId,
+      itemId: userShellCommandItemId(input.messageId),
+    });
+    if (item === null) return;
+    return yield* new Orchestrator.OrchestratorDispatchError({
+      commandId: input.commandId,
+      commandType: "message.dispatch",
+      cause: "This shell command already ran.",
+    });
+  },
+);
 
 // These failures precede commitCommand; generic dispatch errors can follow commits and remain ambiguous.
 function dispatchWasNotAccepted(
@@ -87,6 +140,13 @@ export const dispatchCommand = Effect.fn("ThreadMessageIntake.dispatchCommand")(
   const command =
     incoming.type === "message.dispatch" ? yield* withGuestAttachments(incoming) : incoming;
   const threads = yield* ThreadManagement.ThreadManagementService;
+  if (
+    (command.type === "message.dispatch" || command.type === "queued-run.edit") &&
+    command.shellCommand === true
+  ) {
+    if (command.type === "message.dispatch") yield* assertShellMessageIsNew(command);
+    yield* assertShellCommandsEnabled(command.commandId);
+  }
   if (command.type === "runtime-request.respond" && command.attachmentsByQuestionId) {
     const config = yield* ServerConfig.ServerConfig;
     const incomingByQuestionId = command.attachmentsByQuestionId;
@@ -210,6 +270,11 @@ export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(functi
   input: ThreadLaunch.ThreadLaunchInput,
 ) {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
+  if (input.initialMessage?.shellCommand === true) {
+    // The launch receipt is written before its message is dispatched, so only the message's own
+    // receipt proves the command was accepted.
+    yield* assertShellCommandsEnabled(ThreadLaunch.initialMessageCommandId(input.commandId));
+  }
   yield* AttachmentClaims.validateAttachmentLimits(input.initialMessage?.attachments ?? []);
   if (!input.initialMessage?.attachments.some(AttachmentClaims.attachmentIsPendingUpload)) {
     return yield* launches.launch(input);
