@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Rebuilds `fluidsonic/main` from upstream main plus every `fork/<order>-<name>` branch on origin,
-// then builds "T3 Code (Marc).app", publishes it to a local update feed the app updates from, and
-// releases it on the fork with upstream and fork changes as notes.
+// then builds "T3 Code (Marc).app" and releases it on the fork as a zip, a dmg and latest-mac.yml,
+// with upstream and fork changes as notes. Installed apps on any Mac update from the latest release.
 //
-//   node fork-sync.ts              sync, check, push, build, publish to the feed
+//   node fork-sync.ts              sync, check, push, build, release
 //   node fork-sync.ts --dry-run    sync and check only; push and build nothing
-//   node fork-sync.ts install      install the newest feed build now, quitting and reopening the app
-//   node fork-sync.ts serve        serve the feed on 127.0.0.1; the LaunchAgent keeps this running
+//   node fork-sync.ts install      install the newest local build now, quitting and reopening the app
+//   node fork-sync.ts serve        serve feed/ on 127.0.0.1 for builds from before the GitHub feed
 //
 // Branch scheme (the branch list is the source of truth):
 //   fork/10-pr-20145       tracks upstream PR #20145; dropped once the PR is merged or closed
@@ -15,7 +15,7 @@
 // Orders sort numerically per segment. A topic whose commits all landed upstream is deleted.
 import { spawnSync, type SpawnSyncOptions } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -35,6 +35,7 @@ const LEGACY_INSTALL_PATHS = ["/Applications/T3 Marc.app"];
 const META = new URL(".", import.meta.url).pathname;
 const FEED_DIR = join(META, "feed");
 const FEED_PORT = 47825;
+const FEED_URL = `https://github.com/${FORK_REPO}/releases/latest/download`;
 // The app's updater (Squirrel.Mac) accepts only builds matching the running app's designated
 // requirement; ad-hoc signatures never match, so every build is signed with one local identity.
 const SIGNING_KEYCHAIN = join(META, "signing.keychain-db");
@@ -204,12 +205,13 @@ function sync() {
   }
   git("push", "--quiet", "--force", "origin", INTEGRATION);
 
-  const { version } = publish(build(), notes);
+  const { version, assets } = publish(build(), notes);
   const release = exec("gh", [
     "release", "create", `v${version}`, "-R", FORK_REPO, "--target", git("rev-parse", INTEGRATION),
-    "--title", `${PRODUCT_NAME} ${version}`, "--notes", notes,
+    "--title", `${PRODUCT_NAME} ${version}`, "--notes", notes, ...assets,
   ]);
-  report.push(release.ok ? `released v${version} on ${FORK_REPO}` : `couldn't create the v${version} release: ${release.err}`);
+  if (!release.ok) fail(`couldn't create the v${version} release: ${release.err}`);
+  report.push(`released v${version} on ${FORK_REPO}`);
   if (isRunning(APP_ID)) report.push(`${PRODUCT_NAME} offers the update to restart into within a few minutes`);
   else copyApp(newestFeedZip());
 }
@@ -332,7 +334,7 @@ function build(): { app: string; version: string } {
   if (!existsSync(app)) fail(`no ${PRODUCT_NAME}.app in ${built}`);
   writeFileSync(
     join(app, "Contents/Resources/app-update.yml"),
-    `provider: generic\nurl: http://127.0.0.1:${FEED_PORT}\nupdaterCacheDirName: t3code-marc-updater\n`,
+    `provider: generic\nurl: ${FEED_URL}\nupdaterCacheDirName: t3code-marc-updater\n`,
   );
   step("codesign", ["--force", "--deep", "--keychain", SIGNING_KEYCHAIN, "--sign", signingIdentity(), app]);
   return { app, version };
@@ -367,34 +369,53 @@ function signingIdentity(): string {
   return identity ?? fail(`no signing identity in ${SIGNING_KEYCHAIN}`);
 }
 
-/** Zips the app into the feed and points latest-mac.yml at it, keeping the previous build. */
+/**
+ * Zips the app for the updater, puts it in a dmg for first installs, and writes latest-mac.yml,
+ * keeping the previous build in feed/. The zip URL is absolute, so an updater that read the yml
+ * keeps downloading that release's zip even after a newer release becomes the latest.
+ */
 function publish({ app, version }: { app: string; version: string }, notes: string) {
   mkdirSync(FEED_DIR, { recursive: true });
-  const zipName = `T3-Code-Marc-${version}-${process.arch}.zip`;
-  const zip = join(FEED_DIR, zipName);
+  const name = `T3-Code-Marc-${version}-${process.arch}`;
+  const zip = join(FEED_DIR, `${name}.zip`);
   step("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, zip]);
+  const dmg = join(FEED_DIR, `${name}.dmg`);
+  const stage = mkdtempSync(join(tmpdir(), "t3-marc-dmg-"));
+  try {
+    step("ditto", [app, join(stage, basename(app))]);
+    symlinkSync("/Applications", join(stage, "Applications"));
+    step("hdiutil", ["create", "-volname", PRODUCT_NAME, "-srcfolder", stage, "-format", "UDZO", "-ov", dmg]);
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
   const sha512 = createHash("sha512").update(readFileSync(zip)).digest("base64");
   const size = statSync(zip).size;
+  const url = `https://github.com/${FORK_REPO}/releases/download/v${version}/${name}.zip`;
+  const yml = join(FEED_DIR, "latest-mac.yml");
   writeFileSync(
-    join(FEED_DIR, "latest-mac.yml"),
+    yml,
     // A JSON string is a valid YAML scalar.
-    `version: ${version}\nfiles:\n  - url: ${zipName}\n    sha512: ${sha512}\n    size: ${size}\npath: ${zipName}\nsha512: ${sha512}\nreleaseDate: '${new Date().toISOString()}'\nreleaseNotes: ${JSON.stringify(notes)}\n`,
+    `version: ${version}\nfiles:\n  - url: ${url}\n    sha512: ${sha512}\n    size: ${size}\npath: ${url}\nsha512: ${sha512}\nreleaseDate: '${new Date().toISOString()}'\nreleaseNotes: ${JSON.stringify(notes)}\n`,
   );
-  for (const old of feedZips().slice(2)) rmSync(join(FEED_DIR, old));
-  report.push(`published ${version} to ${zip}`);
-  return { version };
+  for (const old of feedBuilds().slice(2)) {
+    rmSync(join(FEED_DIR, `${old}.zip`), { force: true });
+    rmSync(join(FEED_DIR, `${old}.dmg`), { force: true });
+  }
+  return { version, assets: [zip, dmg, yml] };
 }
 
-const feedZips = () =>
+/** Build names in feed/, newest first. */
+const feedBuilds = () =>
   existsSync(FEED_DIR)
     ? readdirSync(FEED_DIR)
         .filter((file) => file.endsWith(".zip"))
         .sort((a, b) => statSync(join(FEED_DIR, b)).mtimeMs - statSync(join(FEED_DIR, a)).mtimeMs)
+        .map((file) => file.slice(0, -".zip".length))
     : [];
 
 function newestFeedZip(): string {
-  const zip = feedZips()[0];
-  return zip ? join(FEED_DIR, zip) : fail(`no build in ${FEED_DIR} yet`);
+  const build = feedBuilds()[0];
+  return build ? join(FEED_DIR, `${build}.zip`) : fail(`no build in ${FEED_DIR} yet`);
 }
 
 const isRunning = (bundleId: string) =>
@@ -431,7 +452,7 @@ function copyApp(zip: string) {
   }
 }
 
-/** Serves the feed's files to the app's updater; loopback only. */
+/** Serves feed/ to builds whose updater still reads 127.0.0.1; loopback only. */
 function serve() {
   createServer((request, response) => {
     const name = decodeURIComponent(new URL(request.url ?? "/", "http://localhost").pathname.slice(1));
