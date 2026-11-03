@@ -493,8 +493,8 @@ export function ShellCommandsCodeBlock(props: {
 }
 
 /**
- * An inline `` `! cmd` `` in prose, with Run and the block's other actions. They stay on the line
- * of the command's last word, so a wrapping command never leaves them alone on the next line.
+ * An inline `` `! cmd` `` in prose, with Run and the block's other actions. Only the command's last
+ * character stays on their line, so they never wrap alone and a long path still wraps.
  */
 export function ShellCommandInline(props: {
   readonly command: string;
@@ -502,14 +502,14 @@ export function ShellCommandInline(props: {
 }) {
   const { command, shellActions } = props;
   const { runCommand } = shellActions;
-  const lastWordStart = command.lastIndexOf(" ") + 1;
+  const tailStart = command.length - ([...command].at(-1)?.length ?? 0);
   return (
     <span className="shell-command-inline font-mono">
       <span className="shell-command-prefix">!</span>
       <span className="shell-command-gap"> </span>
-      {command.slice(0, lastWordStart)}
+      {command.slice(0, tailStart)}
       <span className="whitespace-nowrap">
-        {command.slice(lastWordStart)}
+        {command.slice(tailStart)}
         <span
           {...THREAD_FIND_IGNORE_PROPS}
           className="shell-command-inline-actions"
