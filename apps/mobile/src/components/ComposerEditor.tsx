@@ -69,11 +69,12 @@ export function ComposerEditor({
       text,
       draftKey ? getComposerDraftSnapshot(draftKey) : draft,
     );
-    props.onChangeText(text);
+    const stored = props.onChangeText(text);
     if (draftKey) {
       setComposerDraftContext(draftKey, restored.context);
       appendComposerDraftAttachments(draftKey, restored.attachments, { allowOverflow: true });
     }
+    return stored;
   };
   const [selected, setSelected] = useState<{ source: string; start: number; end: number } | null>(
     null,
@@ -92,6 +93,11 @@ export function ComposerEditor({
     )
       return;
     const insertion = { text: clipboard.value, ...clipboard.selection };
+    // A command can't carry context, so copied context lands as its text.
+    if (props.shellMode) {
+      insertComposerDraftText(draftKey, clipboard.text, insertion, { canRunShellCommands: true });
+      return;
+    }
     const operation = startComposerDraftOperation(draftKey);
     const { signal } = operation;
     setComposerContextImporting(draftKey, true);
@@ -202,12 +208,15 @@ export function ComposerEditor({
           setSelected(selection);
         }}
         onSelectionChange={(selection) => {
-          if (draftKey)
-            rememberComposerDraftSelection(
-              draftKey,
-              getComposerDraftSnapshot(draftKey).text,
-              selection,
-            );
+          if (draftKey) {
+            // The draft may have rewritten what the editor reported, such as a command's dropped
+            // space after its `!`, so the editor's caret can run past the stored text.
+            const text = getComposerDraftSnapshot(draftKey).text;
+            rememberComposerDraftSelection(draftKey, text, {
+              start: Math.min(selection.start, text.length),
+              end: Math.min(selection.end, text.length),
+            });
+          }
           props.onSelectionChange?.(selection);
         }}
       />
