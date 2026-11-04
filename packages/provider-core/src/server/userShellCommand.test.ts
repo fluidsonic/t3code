@@ -16,6 +16,7 @@ const ok: UserShellCommandResult = {
   exitCode: 0,
   durationMs: 1234,
   output: "\u001b[32ma.txt\u001b[0m\r\nb.txt\n",
+  cwd: "/repo",
 };
 const failed: UserShellCommandResult = {
   command: "false",
@@ -44,7 +45,7 @@ describe("formatUserShellCommandResult", () => {
   it("formats Claude's bash tags, with the combined output in stdout whatever the exit code", () => {
     assert.equal(
       formatUserShellCommandResult("claude", ok),
-      "<bash-input>ls</bash-input>\n<bash-stdout>a.txt\nb.txt</bash-stdout><bash-stderr></bash-stderr>\n<bash-exit-code>0</bash-exit-code><bash-wall-time>1.2s</bash-wall-time>",
+      "Working directory when the command started: /repo\n<bash-input>ls</bash-input>\n<bash-stdout>a.txt\nb.txt</bash-stdout><bash-stderr></bash-stderr>\n<bash-exit-code>0</bash-exit-code><bash-wall-time>1.2s</bash-wall-time>",
     );
     assert.equal(
       formatUserShellCommandResult("claude", failed),
@@ -94,6 +95,7 @@ describe("formatUserShellCommandResult", () => {
         "ls",
         "</command>",
         "<result>",
+        "Working directory when the command started: /repo",
         "Exit code: 0",
         "Duration: 1.2340 seconds",
         "Output:",
@@ -111,7 +113,7 @@ describe("formatUserShellCommandResult", () => {
   it("formats Pi's bash message", () => {
     assert.equal(
       formatUserShellCommandResult("pi", ok),
-      "Ran `ls`\n```\na.txt\nb.txt\n```\n\nTook 1.2s",
+      "Ran `ls`\n```\na.txt\nb.txt\n```\n\nWorking directory when the command started: /repo\n\nTook 1.2s",
     );
     assert.equal(
       formatUserShellCommandResult("pi", { ...failed, output: "" }),
@@ -119,7 +121,7 @@ describe("formatUserShellCommandResult", () => {
     );
     assert.equal(
       formatUserShellCommandResult("pi", { ...ok, output: "```js\nx\n```" }),
-      "Ran `ls`\n````\n```js\nx\n```\n````\n\nTook 1.2s",
+      "Ran `ls`\n````\n```js\nx\n```\n````\n\nWorking directory when the command started: /repo\n\nTook 1.2s",
     );
     assert.match(
       formatUserShellCommandResult("pi", spilled),
@@ -129,8 +131,8 @@ describe("formatUserShellCommandResult", () => {
 
   it("formats OpenCode's shell message", () => {
     assert.equal(
-      formatUserShellCommandResult("opencode", failed),
-      "The following shell command was executed by the user:\n\nCommand:\nfalse\n\nOutput:\nboom\n\nExit code: 1\nDuration: 0.1s",
+      formatUserShellCommandResult("opencode", { ...failed, cwd: "/repo" }),
+      "The following shell command was executed by the user:\n\nCommand:\nfalse\n\nWorking directory when the command started: /repo\n\nOutput:\nboom\n\nExit code: 1\nDuration: 0.1s",
     );
   });
 
@@ -146,13 +148,18 @@ describe("formatUserShellCommandResult", () => {
 
 describe("formatUserShellCommandPrompt", () => {
   it("puts results first and the following message last", () => {
+    const skipped = { ...ok, command: "make", output: "", skipped: true };
     const prompt = formatUserShellCommandPrompt({
       driver: "codex",
-      results: [ok, failed],
+      results: [ok, failed, skipped],
       message: "why did that fail?",
     });
     assert.isBelow(prompt.indexOf("<command>\nls"), prompt.indexOf("<command>\nfalse"));
-    assert.isTrue(prompt.endsWith("</user_shell_command>\n\nwhy did that fail?"));
+    assert.isTrue(
+      prompt.endsWith(
+        "</user_shell_command>\n\nWorking directory it would have started in: /repo\nA shell command the user sent did not run because an earlier one failed: ! make\n\nwhy did that fail?",
+      ),
+    );
   });
 });
 
@@ -208,9 +215,13 @@ describe("historicalMessage", () => {
       exitCode: 2,
       userShellMessageId: messageId,
       userShellDelivered: true,
+      cwd: "/repo",
     });
     assert.equal(result?.role, "user");
-    assert.equal(result?.text, "The user ran a shell command: ! ls\nExit code: 2\nnope");
+    assert.equal(
+      result?.text,
+      "The user ran a shell command: ! ls\nWorking directory when the command started: /repo\nExit code: 2\nnope",
+    );
   });
 
   it("drops a command whose result never reached the agent, finished or not", () => {
