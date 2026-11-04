@@ -34,6 +34,8 @@ export interface UserShellCommandResult {
     | undefined;
   /** The command never ran: an earlier one the user sent with it failed. */
   readonly skipped?: boolean | undefined;
+  /** Where the command started, or for a skipped one would have; see the item's `cwd`. */
+  readonly cwd?: string | undefined;
 }
 
 /**
@@ -90,6 +92,10 @@ function fence(text: string): string {
 
 type SavedOutput = NonNullable<UserShellCommandResult["fullOutput"]>;
 
+// Each command starts in a fresh shell; the agent should not read this as where it ended up.
+const startedIn = (cwd: string | undefined) =>
+  cwd === undefined ? [] : [`Working directory when the command started: ${cwd}`];
+
 const truncationNote = (saved: SavedOutput) =>
   saved.partial === true
     ? `[Output truncated. Only its first ${formatBytes(saved.sizeBytes)} were saved: ${saved.path}]`
@@ -106,6 +112,7 @@ function claude(result: UserShellCommandResult, output: string): string {
   // stdout and stderr arrive as one stream, in the order a terminal shows them, so the output
   // cannot be split. It all goes in stdout, where an exit code alone does not move it.
   return [
+    ...startedIn(result.cwd),
     `<bash-input>${result.command}</bash-input>`,
     `<bash-stdout>${stream}</bash-stdout><bash-stderr></bash-stderr>`,
     `<bash-exit-code>${result.exitCode}</bash-exit-code><bash-wall-time>${seconds(result.durationMs, 1)}s</bash-wall-time>`,
@@ -122,6 +129,7 @@ function codex(result: UserShellCommandResult, output: string): string {
     result.command,
     "</command>",
     "<result>",
+    ...startedIn(result.cwd),
     `Exit code: ${result.exitCode}`,
     `Duration: ${seconds(result.durationMs, 4)} seconds`,
     "Output:",
@@ -134,6 +142,7 @@ function codex(result: UserShellCommandResult, output: string): string {
 function pi(result: UserShellCommandResult, output: string): string {
   return [
     `Ran \`${result.command}\`\n${output.length === 0 ? "(no output)" : fence(output)}`,
+    ...startedIn(result.cwd),
     ...(result.exitCode === 0 ? [] : [`Command exited with code ${result.exitCode}`]),
     `Took ${seconds(result.durationMs, 1)}s`,
     ...(result.fullOutput === undefined ? [] : [truncationNote(result.fullOutput)]),
@@ -144,6 +153,7 @@ function opencode(result: UserShellCommandResult, output: string): string {
   return [
     "The following shell command was executed by the user:",
     `Command:\n${result.command}`,
+    ...startedIn(result.cwd),
     `Output:\n${output}`,
     `Exit code: ${result.exitCode}\nDuration: ${seconds(result.durationMs, 1)}s`,
     ...(result.fullOutput === undefined ? [] : [truncationNote(result.fullOutput)]),
@@ -183,24 +193,28 @@ export function formatUserShellCommandPrompt(input: {
   return [
     ...input.results.map((result) =>
       result.skipped === true
-        ? skippedCommandNote(result.command)
+        ? skippedCommandNote(result.command, result.cwd)
         : formatUserShellCommandResult(format, result),
     ),
     ...(input.message === undefined || input.message.trim().length === 0 ? [] : [input.message]),
   ].join("\n\n");
 }
 
-function skippedCommandNote(command: string): string {
+function skippedCommandNote(command: string, cwd: string | undefined): string {
   // The command goes last, as written: in backticks, one holding a backtick or a newline would break.
-  return `A shell command the user sent did not run because an earlier one failed: ! ${command}`;
+  return [
+    ...(cwd === undefined ? [] : [`Working directory it would have started in: ${cwd}`]),
+    `A shell command the user sent did not run because an earlier one failed: ! ${command}`,
+  ].join("\n");
 }
 
 /** How a finished `! cmd` reads in history the agent did not see live, as the person's input. */
 export function userShellCommandHistoryText(item: UserShellCommandItem): string {
-  if (item.userShellSkipped === true) return skippedCommandNote(item.input);
+  if (item.userShellSkipped === true) return skippedCommandNote(item.input, item.cwd);
   const output = plainShellOutput(item.output ?? "").replace(/\n+$/, "");
   return [
     `The user ran a shell command: ! ${item.input}`,
+    ...startedIn(item.cwd),
     `Exit code: ${item.exitCode ?? "unknown"}`,
     ...(output.length === 0 ? [] : [output]),
   ].join("\n");
