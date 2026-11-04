@@ -45,7 +45,7 @@ describe("formatUserShellCommandResult", () => {
   it("formats Claude's bash tags, with the combined output in stdout whatever the exit code", () => {
     assert.equal(
       formatUserShellCommandResult("claude", ok),
-      "Working directory when the command started: /repo\n<bash-input>ls</bash-input>\n<bash-stdout>a.txt\nb.txt</bash-stdout><bash-stderr></bash-stderr>\n<bash-exit-code>0</bash-exit-code><bash-wall-time>1.2s</bash-wall-time>",
+      "<bash-initial-cwd>/repo</bash-initial-cwd>\n<bash-input>ls</bash-input>\n<bash-stdout>a.txt\nb.txt</bash-stdout><bash-stderr></bash-stderr>\n<bash-exit-code>0</bash-exit-code><bash-wall-time>1.2s</bash-wall-time>",
     );
     assert.equal(
       formatUserShellCommandResult("claude", failed),
@@ -94,8 +94,8 @@ describe("formatUserShellCommandResult", () => {
         "<command>",
         "ls",
         "</command>",
+        "<initial_cwd>/repo</initial_cwd>",
         "<result>",
-        "Working directory when the command started: /repo",
         "Exit code: 0",
         "Duration: 1.2340 seconds",
         "Output:",
