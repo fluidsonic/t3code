@@ -15098,6 +15098,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly item: UserShellCommandItem;
     readonly failed: boolean;
+    /** Where the failed command started, so the skipped ones say where they would have. */
+    readonly cwd?: string;
     readonly now: DateTime.Utc;
   }) {
     const threadId = commandThreadId(input.command);
@@ -15146,6 +15148,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         input: shellCommandFromMessageText(message.text),
         userShellMessageId: message.id,
         userShellSkipped: true,
+        ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
       };
       yield* emit(
         input.events,
@@ -15298,6 +15301,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           status,
           output: command.output,
           ...(command.exitCode === undefined ? {} : { exitCode: command.exitCode }),
+          ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
           startedAt: command.startedAt,
           completedAt: active ? command.completedAt : (item.completedAt ?? command.completedAt),
           updatedAt: now,
@@ -15349,6 +15353,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           events,
           item,
           failed: status === "failed",
+          ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
           now,
         });
       }
