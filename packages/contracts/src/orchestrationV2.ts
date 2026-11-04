@@ -1759,6 +1759,11 @@ export const OrchestrationV2TurnItem = Schema.Union([
      * relabeling past commands. Absent when it bypassed none.
      */
     bypassedModes: Schema.optional(Schema.Array(OrchestrationV2UserShellBypassedMode)),
+    /**
+     * The working directory a person's shell command started in; for a skipped one, where it
+     * would have. A `cd` inside the command does not change it. Absent when it never got one.
+     */
+    cwd: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2605,6 +2610,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     userShellDelivered: Schema.optional(Schema.Boolean),
     userShellSkipped: Schema.optional(Schema.Boolean),
     bypassedModes: Schema.optional(Schema.Array(OrchestrationV2UserShellBypassedMode)),
+    cwd: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -3711,6 +3717,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     output: Schema.String,
     /** The whole output, saved as a file when the tail could not hold it. */
     fullOutput: Schema.optional(ChatAttachment),
+    /** The working directory the process started in; absent when it never got one. */
+    cwd: Schema.optional(Schema.String),
     startedAt: Schema.DateTimeUtc,
     completedAt: Schema.DateTimeUtc,
   }),
