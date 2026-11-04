@@ -97,6 +97,7 @@ function userShellCommandResult(
     output: item.output ?? "",
     ...(fullOutput === undefined ? {} : { fullOutput }),
     ...(item.userShellSkipped === true ? { skipped: true } : {}),
+    ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
   };
 }
 
