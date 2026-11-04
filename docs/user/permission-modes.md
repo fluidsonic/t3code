@@ -24,6 +24,9 @@ Approve or reject requests in the conversation to let the agent continue. Permis
 not prevent the agent from asking questions about the task. Subagent approval requests appear in
 the parent conversation with the subagent's name, so you can respond without switching threads.
 
+Permission modes apply to the agent. A [shell command you run yourself](./composer.md#run-a-shell-command)
+with `!` runs as you: it asks for no approval in **Supervised**, and Plan mode doesn't stop it.
+
 ## Provider differences
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
