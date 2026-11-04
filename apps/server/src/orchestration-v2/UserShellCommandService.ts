@@ -485,6 +485,7 @@ const make = Effect.gen(function* () {
         stopped: result.stopped,
         output: result.output,
         ...(result.fullOutput === undefined ? {} : { fullOutput: result.fullOutput }),
+        ...(prepared?._tag === "ready" ? { cwd: prepared.cwd } : {}),
         startedAt: result.startedAt,
         completedAt: result.completedAt,
       }),
