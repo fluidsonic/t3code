@@ -110,6 +110,38 @@ export function PreviewUnreachable({ url, code, description, onReload, move }: P
   );
 }
 
+export function PreviewCrashed({
+  message,
+  onReload,
+}: {
+  message: string;
+  onReload: (() => void) | undefined;
+}) {
+  return (
+    <div className="scrollbar-gutter-both relative flex h-full min-h-0 w-full overflow-y-auto bg-background">
+      <div className="mx-auto flex w-full max-w-xl flex-1 flex-col px-8 py-12 sm:py-16">
+        <ErrorIcon className="mb-6 size-12 text-muted-foreground/70" />
+        <h1 className="mb-3 text-2xl font-semibold leading-tight text-foreground">
+          This page crashed
+        </h1>
+        <p className="text-sm leading-relaxed text-muted-foreground">{message}</p>
+        {onReload ? (
+          <div className="mt-auto flex items-center gap-2 pt-8">
+            <div className="flex-1" />
+            <Button type="button" size="sm" onClick={onReload}>
+              Reload
+            </Button>
+          </div>
+        ) : (
+          <p className="mt-4 text-sm leading-relaxed text-muted-foreground">
+            Reload it in the desktop app.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ErrorIcon({ className }: { className?: string }) {
   return (
     <svg
