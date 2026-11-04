@@ -323,7 +323,7 @@ const send = (
 
 const itemFor = (id: string) => userShellCommandItemId(MessageId.make(`message:${id}`));
 
-const finish = (id: string, exitCode: number, output: string) =>
+const finish = (id: string, exitCode: number, output: string, cwd?: string) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const now = yield* DateTime.now;
@@ -335,6 +335,7 @@ const finish = (id: string, exitCode: number, output: string) =>
       exitCode,
       stopped: false,
       output,
+      ...(cwd === undefined ? {} : { cwd }),
       startedAt: now,
       completedAt: now,
     });
@@ -811,19 +812,27 @@ describe("user shell commands", () => {
         yield* send("build", "make build", { shellCommand: true });
         yield* send("why", "why did it fail?", { mode: "queue_after_active" });
         yield* send("again", "make build", { shellCommand: true, mode: "queue_after_active" });
-        yield* finish("build", 2, "error: missing target\n");
+        yield* finish("build", 2, "error: missing target\n", "/repo/worktree");
         yield* drain;
         const current = yield* projection;
-        assert.equal(commandItem(current.turnItems, "build")?.status, "failed");
+        const failed = commandItem(current.turnItems, "build");
+        assert.equal(failed?.status, "failed");
+        assert.isTrue(failed?.type === "command_execution" && failed.cwd === "/repo/worktree");
         assert.equal(runOf(current.runs, "why")?.status, "cancelled");
         assert.equal(runOf(current.runs, "again")?.status, "cancelled");
         const skipped = commandItem(current.turnItems, "again");
         assert.isTrue(skipped?.type === "command_execution" && skipped.userShellSkipped === true);
+        // A skipped command would have started where the failed one did.
+        assert.isTrue(skipped?.type === "command_execution" && skipped.cwd === "/repo/worktree");
         assert.deepEqual(input.shellStarts, [itemFor("build")]);
         const text = input.started.at(-1)!.message.text;
+        assert.include(text, "Working directory when the command started: /repo/worktree");
         assert.include(text, "Exit code: 2");
         assert.include(text, "error: missing target");
-        assert.include(text, "did not run because an earlier one failed: ! make build");
+        assert.include(
+          text,
+          "Working directory it would have started in: /repo/worktree\nA shell command the user sent did not run because an earlier one failed: ! make build",
+        );
         assert.isTrue(text.trimEnd().endsWith("why did it fail?"));
       }),
     ),
