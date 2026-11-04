@@ -47,6 +47,9 @@
       --color-warning: #fcf4e8;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #bb4d00;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #fcebec;
       --color-danger-border: rgba(251, 44, 54, 0.32);
       --color-danger-foreground: #c10007;
@@ -210,6 +213,9 @@
       --color-warning: #312108;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #ffb900;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #301214;
       --color-danger-border: rgba(251, 65, 74, 0.32);
       --color-danger-foreground: #ff6467;
@@ -373,6 +379,9 @@
       --color-warning: #fcf0ea;
       --color-warning-border: rgba(245, 158, 11, 0.32);
       --color-warning-foreground: #b05109;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #fde4f1;
       --color-danger-border: rgba(247, 8, 108, 0.32);
       --color-danger-foreground: #9d174d;
@@ -536,6 +545,9 @@
       --color-warning: #412f20;
       --color-warning-border: rgba(245, 158, 11, 0.32);
       --color-warning-foreground: #fbbf24;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #331a2b;
       --color-danger-border: rgba(157, 23, 77, 0.32);
       --color-danger-foreground: #fbd0e8;
@@ -699,6 +711,9 @@
       --color-warning: #f4f0e1;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #b64a00;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #f4e7e5;
       --color-danger-border: rgba(251, 44, 54, 0.32);
       --color-danger-foreground: #c10007;
@@ -862,6 +877,9 @@
       --color-warning: #3f3a1c;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #ffb900;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #3f2c28;
       --color-danger-border: rgba(251, 65, 74, 0.32);
       --color-danger-foreground: #ff6668;
@@ -1025,6 +1043,9 @@
       --color-warning: #f6efe4;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #b74b00;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #f5e6e9;
       --color-danger-border: rgba(251, 44, 54, 0.32);
       --color-danger-foreground: #c10007;
@@ -1188,6 +1209,9 @@
       --color-warning: #3c3424;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #ffb900;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #3c2630;
       --color-danger-border: rgba(251, 65, 74, 0.32);
       --color-danger-foreground: #ff6467;
@@ -1351,6 +1375,9 @@
       --color-warning: #f9efe2;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #b84b00;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #f9e7e6;
       --color-danger-border: rgba(251, 44, 54, 0.32);
       --color-danger-foreground: #c10007;
@@ -1514,6 +1541,9 @@
       --color-warning: #4b3215;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #ffb900;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #4a2321;
       --color-danger-border: rgba(251, 65, 74, 0.32);
       --color-danger-foreground: #ff6467;
@@ -1677,6 +1707,9 @@
       --color-warning: #f8efe5;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #b84b00;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #7008e7;
       --color-danger: #f8e6ea;
       --color-danger-border: rgba(251, 44, 54, 0.32);
       --color-danger-foreground: #c10007;
@@ -1840,6 +1873,9 @@
       --color-warning: #412e23;
       --color-warning-border: rgba(254, 154, 0, 0.32);
       --color-warning-foreground: #ffb900;
+      --color-shell-tint: rgba(142, 81, 255, 0.09);
+      --color-shell-prefix: rgba(142, 81, 255, 0.24);
+      --color-shell-prefix-foreground: #c4b4ff;
       --color-danger: #40202e;
       --color-danger-border: rgba(251, 65, 74, 0.32);
       --color-danger-foreground: #ff6467;

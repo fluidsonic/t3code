@@ -16,6 +16,21 @@ export class TurnItemPositionStoreError extends Schema.TaggedError<TurnItemPosit
 
 const isTurnItemPositionStoreError = Schema.is(TurnItemPositionStoreError);
 
+/**
+ * The key an item's position is stored under. Positions never move, but a person's `! cmd` belongs
+ * in the conversation where its result reached the agent, not where it started running, so its
+ * delivered form takes a position of its own.
+ */
+export function turnItemPositionKey(
+  item: Pick<OrchestrationV2TurnItem, "id" | "type"> & {
+    readonly userShellDelivered?: boolean | undefined;
+  },
+): TurnItemId {
+  return item.type === "command_execution" && item.userShellDelivered === true
+    ? TurnItemId.make(`${item.id}:delivered`)
+    : item.id;
+}
+
 export interface TurnItemPositionStoreV2Shape {
   readonly allocate: (input: {
     readonly threadId: ThreadId;
@@ -107,7 +122,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
       normalize: Effect.fnUntraced(function* (item, runOrdinal) {
         return yield* allocate({
           threadId: item.threadId,
-          turnItemId: item.id,
+          turnItemId: turnItemPositionKey(item),
           runId: item.runId,
           ...(runOrdinal === undefined ? {} : { runOrdinal }),
         }).pipe(Effect.map((ordinal) => (item.ordinal === ordinal ? item : { ...item, ordinal })));
