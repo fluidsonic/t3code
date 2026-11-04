@@ -96,6 +96,10 @@ type SavedOutput = NonNullable<UserShellCommandResult["fullOutput"]>;
 const startedIn = (cwd: string | undefined) =>
   cwd === undefined ? [] : [`Working directory when the command started: ${cwd}`];
 
+/** The harness's own format has no directory, so the tag's name says it is where it started. */
+const initialCwdTag = (tag: string, cwd: string | undefined) =>
+  cwd === undefined ? [] : [`<${tag}>${cwd}</${tag}>`];
+
 const truncationNote = (saved: SavedOutput) =>
   saved.partial === true
     ? `[Output truncated. Only its first ${formatBytes(saved.sizeBytes)} were saved: ${saved.path}]`
@@ -112,7 +116,7 @@ function claude(result: UserShellCommandResult, output: string): string {
   // stdout and stderr arrive as one stream, in the order a terminal shows them, so the output
   // cannot be split. It all goes in stdout, where an exit code alone does not move it.
   return [
-    ...startedIn(result.cwd),
+    ...initialCwdTag("bash-initial-cwd", result.cwd),
     `<bash-input>${result.command}</bash-input>`,
     `<bash-stdout>${stream}</bash-stdout><bash-stderr></bash-stderr>`,
     `<bash-exit-code>${result.exitCode}</bash-exit-code><bash-wall-time>${seconds(result.durationMs, 1)}s</bash-wall-time>`,
@@ -128,8 +132,8 @@ function codex(result: UserShellCommandResult, output: string): string {
     "<command>",
     result.command,
     "</command>",
+    ...initialCwdTag("initial_cwd", result.cwd),
     "<result>",
-    ...startedIn(result.cwd),
     `Exit code: ${result.exitCode}`,
     `Duration: ${seconds(result.durationMs, 4)} seconds`,
     "Output:",

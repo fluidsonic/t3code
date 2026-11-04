@@ -826,7 +826,7 @@ describe("user shell commands", () => {
         assert.isTrue(skipped?.type === "command_execution" && skipped.cwd === "/repo/worktree");
         assert.deepEqual(input.shellStarts, [itemFor("build")]);
         const text = input.started.at(-1)!.message.text;
-        assert.include(text, "Working directory when the command started: /repo/worktree");
+        assert.include(text, "<initial_cwd>/repo/worktree</initial_cwd>");
         assert.include(text, "Exit code: 2");
         assert.include(text, "error: missing target");
         assert.include(
