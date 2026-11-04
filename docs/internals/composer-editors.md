@@ -4,7 +4,10 @@ The draft store owns Markdown, while Tiptap owns the editing document. The rich-
 setting changes the installed extensions, so toggling it remounts the editor from the
 stored draft. Plain mode must leave formatting markers literal. Rich mode preserves
 whitespace and chip sources, but canonicalizes supported delimiters (`__` to `**`,
-`_` to `*`) and checkbox case (`[X]` to `[x]`).
+`_` to `*`) and checkbox case (`[X]` to `[x]`). Shell mode does not remount: it is a
+document attribute switched in place, so undo carries it, and the store keeps a command
+as `!cmd` without the space after `!` because the editor draws that gap. Anything that
+writes or compares a command prompt uses that form (`shellCommandPrompt`).
 
 Store cursors are not ProseMirror positions: collapsed coordinates count a chip as one
 character, expanded coordinates count its source text, and ProseMirror also counts
