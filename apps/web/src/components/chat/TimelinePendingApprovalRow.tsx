@@ -66,10 +66,14 @@ export const TimelinePendingApprovalRow = memo(function TimelinePendingApprovalR
     >
       <div className="ms-7.5 flex min-w-0 flex-col gap-1 pb-1 text-xs">
         {approval.appName ? (
-          <span className="text-muted-foreground wrap-anywhere">{approval.appName}</span>
+          <span className="whitespace-pre-wrap text-muted-foreground wrap-anywhere">
+            {approval.appName}
+          </span>
         ) : null}
         {approval.reason ? (
-          <span className="text-muted-foreground select-text wrap-anywhere">{approval.reason}</span>
+          <span className="whitespace-pre-wrap text-muted-foreground select-text wrap-anywhere">
+            {approval.reason}
+          </span>
         ) : null}
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           {canRespond ? (
