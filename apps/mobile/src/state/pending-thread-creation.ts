@@ -125,6 +125,7 @@ export function pendingThreadCreationMessage(message: QueuedThreadMessage): Loca
     id: message.messageId,
     role: "user",
     text: message.text,
+    shellCommand: message.shellCommand,
     context: message.context,
     // Local draft ids cannot resolve server-side and would spin forever on rejected creation.
     streaming: false,
