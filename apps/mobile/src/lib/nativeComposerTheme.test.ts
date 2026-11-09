@@ -13,4 +13,12 @@ describe("native composer colors", () => {
     });
     expect(theme.placeholder).toBe("#616161");
   });
+
+  it("gives the native `!` square opaque violet colors in both appearances", () => {
+    for (const appearance of ["light", "dark"] as const) {
+      const theme = createNativeComposerTheme(getMobileThemeVariables("t3-code", appearance));
+      expect(theme.shellPrefixFill).toMatch(/^#[\da-f]{6}$/);
+      expect(theme.shellPrefixText).toMatch(/^#[\da-f]{6}$/);
+    }
+  });
 });
