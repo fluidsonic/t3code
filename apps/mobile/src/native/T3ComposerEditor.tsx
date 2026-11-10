@@ -21,6 +21,7 @@ export function ComposerEditor({
   readResetGeneration: _readResetGeneration,
   readOnly = false,
   onContentSizeChange,
+  shellMode = false,
   ...props
 }: ComposerEditorProps) {
   const inputRef = useRef<TextInputInstance>(null);
@@ -46,6 +47,7 @@ export function ComposerEditor({
         ref={inputRef}
         {...props}
         editable={(props.editable ?? true) && !readOnly}
+        {...(shellMode ? { autoCorrect: false, spellCheck: false, autoCapitalize: "none" } : {})}
         selection={selection}
         onSelectionChange={(event) => props.onSelectionChange?.(event.nativeEvent.selection)}
         onContentSizeChange={(event) => onContentSizeChange?.(event.nativeEvent.contentSize)}
