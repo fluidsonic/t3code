@@ -4491,10 +4491,12 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   parseScopedThreadKey(toKey)?.environmentId ??
                   null)
                 : to.environmentId;
+            // The destination's mode goes with the prompt this replaces.
+            const { shellMode: _replacedShellMode, ...destinationRest } = destination;
             const { shellMode: _sourceShellMode, ...movedContent } = composerDraftContent(source);
             const nextDestination = clearStaleFileUploadMetadata(
               {
-                ...destination,
+                ...destinationRest,
                 ...movedContent,
                 ...(composerDraftIsShellCommand(source) ? { shellMode: true } : {}),
               },
