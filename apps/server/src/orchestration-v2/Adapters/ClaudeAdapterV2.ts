@@ -2168,7 +2168,7 @@ export function makeClaudeQueryOptions(input: {
       ].join("\n\n"),
     },
     ...(deviceInstructions
-      ? { hooks: { SubagentStart: [{ hooks: [subagentDeviceInstructions] }] } }
+      ? { hooks: { ...input.hooks, SubagentStart: [{ hooks: [subagentDeviceInstructions] }] } }
       : {}),
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };

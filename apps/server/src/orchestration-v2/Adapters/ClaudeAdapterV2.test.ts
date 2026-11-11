@@ -755,7 +755,11 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
 });
 
 describe("ClaudeAdapterV2 device instructions", () => {
-  const options = (input: { readonly mcp: boolean; readonly deviceToolsAvailable: boolean }) =>
+  const options = (input: {
+    readonly mcp: boolean;
+    readonly deviceToolsAvailable: boolean;
+    readonly hooks?: ClaudeSdk.Options["hooks"];
+  }) =>
     ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: {
         instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -768,6 +772,7 @@ describe("ClaudeAdapterV2 device instructions", () => {
         ? { mcpServers: { "t3-code": { type: "http" as const, url: "http://127.0.0.1/mcp" } } }
         : {}),
       deviceToolsAvailable: input.deviceToolsAvailable,
+      ...(input.hooks === undefined ? {} : { hooks: input.hooks }),
       environment: {},
     });
   const append = (input: { readonly mcp: boolean; readonly deviceToolsAvailable: boolean }) =>
@@ -818,6 +823,13 @@ describe("ClaudeAdapterV2 device instructions", () => {
     ]);
     assert.deepEqual(await subagentContext({ mcp: true, deviceToolsAvailable: false }), []);
     assert.deepEqual(await subagentContext({ mcp: false, deviceToolsAvailable: true }), []);
+  });
+
+  it("keeps the session's turn-hold hooks beside the subagent device hook", () => {
+    const stop = [{ hooks: [async () => ({})] }];
+    const hooks = options({ mcp: true, deviceToolsAvailable: true, hooks: { Stop: stop } }).hooks;
+    assert.strictEqual(hooks?.Stop, stop);
+    assert.lengthOf(hooks?.SubagentStart ?? [], 1);
   });
 });
 
