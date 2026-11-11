@@ -4430,8 +4430,10 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               stripInlineContextReferences(source.prompt),
               destination.terminalContexts.map(terminalContextReference),
             );
+            // The destination's mode goes with the prompt this replaces.
+            const { shellMode: _replacedShellMode, ...destinationRest } = destination;
             const nextDestination: ComposerThreadDraftState = {
-              ...destination,
+              ...destinationRest,
               prompt: movedPrompt,
               ...(composerDraftIsShellCommand(source) ? { shellMode: true } : {}),
               images: [...destination.images, ...movedImages],

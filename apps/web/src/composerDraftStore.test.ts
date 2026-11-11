@@ -815,6 +815,18 @@ describe("composerDraftStore shell mode", () => {
     expect(composerDraftIsShellCommand(draft()!)).toBe(true);
   });
 
+  it("moves a prompt in with its own mode, not the one a cleared command left", () => {
+    const store = useComposerDraftStore.getState();
+    const edit = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("thread-shell-edit"));
+    store.setInteractionMode(threadRef, "plan");
+    store.setPrompt(threadRef, "!ls", AVAILABLE);
+    store.clearComposerContent(threadRef);
+    store.setPrompt(edit, "!important: check the config");
+    store.moveComposerPromptAndImages(edit, threadRef);
+    expect(draft()?.prompt).toBe("!important: check the config");
+    expect(composerDraftIsShellCommand(draft()!)).toBe(false);
+  });
+
   it("keeps a command a command when context is added, which sending then refuses", () => {
     const store = useComposerDraftStore.getState();
     store.setPrompt(threadRef, "! ls", AVAILABLE);
