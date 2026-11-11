@@ -291,6 +291,7 @@ const send = (
     readonly mode?: "start_immediately" | "queue_after_active";
     readonly deliveryIntent?: "auto" | "steer" | "restart";
     readonly model?: string;
+    readonly freshContext?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -316,6 +317,7 @@ const send = (
       ...(options.model === undefined
         ? {}
         : { modelSelection: { ...modelSelection, model: options.model } }),
+      ...(options.freshContext === true ? { freshContext: true } : {}),
       createdBy: "user",
       creationSource: "web",
     });
@@ -1066,23 +1068,25 @@ describe("user shell commands", () => {
     ),
   );
 
-  it.effect("a finished command folds in only a queued message for the same model", () =>
-    scenario("absorb-model", (input) =>
-      Effect.gen(function* () {
-        const active = yield* startAgentTurn(input, "first");
-        yield* send("one", "echo one", { shellCommand: true, mode: "queue_after_active" });
-        yield* send("ask", "what do you see?", { mode: "queue_after_active", model: "other" });
-        yield* completeTurn(input, active);
-        yield* finish("one", 0, "one\n");
-        yield* drain;
-        const current = yield* projection;
-        assert.equal(runOf(current.runs, "ask")?.status, "queued");
-        const prompt = input.started.at(-1)!;
-        assert.equal(prompt.runId, runOf(current.runs, "one")?.id);
-        assert.include(prompt.message.text, "echo one");
-        assert.notInclude(prompt.message.text, "what do you see?");
-      }),
-    ),
+  it.effect.each([{ model: "other" }, { freshContext: true }])(
+    "a finished command folds in only a queued message for the same model and session (%o)",
+    (options) =>
+      scenario("absorb-model", (input) =>
+        Effect.gen(function* () {
+          const active = yield* startAgentTurn(input, "first");
+          yield* send("one", "echo one", { shellCommand: true, mode: "queue_after_active" });
+          yield* send("ask", "what do you see?", { mode: "queue_after_active", ...options });
+          yield* completeTurn(input, active);
+          yield* finish("one", 0, "one\n");
+          yield* drain;
+          const current = yield* projection;
+          assert.equal(runOf(current.runs, "ask")?.status, "queued");
+          const prompt = input.started.at(-1)!;
+          assert.equal(prompt.runId, runOf(current.runs, "one")?.id);
+          assert.include(prompt.message.text, "echo one");
+          assert.notInclude(prompt.message.text, "what do you see?");
+        }),
+      ),
   );
 
   it.effect("thread Stop ends a steered command that outlived its turn, not the turn", () =>
@@ -1339,6 +1343,37 @@ describe("user shell commands", () => {
           assert.isTrue((result as { userShellDelivered?: boolean }).userShellDelivered);
           assert.deepEqual(transcript(current), ["work", "status", "status:result", "note"]);
           assert.isFalse(current.runs.some((run) => run.status === "queued"));
+        }),
+      { pause: true, failDelivery: true },
+    ),
+  );
+
+  it.effect("steers the paused turn cannot take, with no command among them, each still send", () =>
+    scenario(
+      "pause-messages-fail",
+      (input) =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const active = yield* startAgentTurn(input, "work");
+          yield* send("status", "git status", { shellCommand: true, deliveryIntent: "auto" });
+          yield* send("n1", "first note", { deliveryIntent: "auto" });
+          yield* send("n2", "second note", { deliveryIntent: "auto" });
+          yield* drain;
+          yield* orchestrator.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make("cancel-status"),
+            threadId,
+            runId: runOf((yield* projection).runs, "status")!.id,
+          });
+          yield* answerPause(yield* Queue.take(input.pauses), "paused");
+          yield* drain;
+          yield* completeTurn(input, active);
+          const first = input.started.at(-1)!;
+          assert.include(first.message.text, "first note");
+          yield* providerTurnRunning(first.runId);
+          yield* completeTurn(input, first.runId);
+          assert.include(input.started.at(-1)!.message.text, "second note");
+          assert.deepEqual(transcript(yield* projection), ["work", "n1", "n2"]);
         }),
       { pause: true, failDelivery: true },
     ),

@@ -15492,7 +15492,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   /**
    * A queued message a finished command folds into its run instead of starting its own. Only one
-   * for the same model: the run's turn would otherwise answer it with a model it was not sent to.
+   * for the same model and session: the run's turn would otherwise answer it with a model, or in
+   * a conversation, it was not sent to.
    */
   const absorbableQueuedMessage = (
     target: OrchestrationV2Run,
@@ -15504,6 +15505,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     run.providerInstanceId === target.providerInstanceId &&
     modelSelectionsEqual(run.modelSelection, target.modelSelection) &&
     run.queueHeld !== true &&
+    run.freshContext !== true &&
     run.restartContinuationOfRunId === undefined &&
     run.sourcePlanRef === undefined &&
     message.createdBy === "user" &&
@@ -16094,19 +16096,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
    * that ended while its commands ran. Queued as one front run that delivers them once the thread
    * is free. Not a fresh send: it neither releases a held queue nor ends a snooze.
    */
-  const queueUserShellRedelivery = Effect.fnUntraced(function* (input: {
+  const queueUserShellRedeliveryRun = Effect.fnUntraced(function* (input: {
     readonly command: OrchestrationV2ServerCommand;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
-    readonly messageIds: ReadonlyArray<MessageId>;
+    readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
     readonly now: DateTime.Utc;
   }) {
     const threadId = commandThreadId(input.command);
-    const projection = yield* getProjectionWithPendingEvents(threadId, input.events);
-    const messages = input.messageIds.flatMap((id) => {
-      const message = projection.messages.find((candidate) => candidate.id === id);
-      return message === undefined ? [] : [message];
-    });
+    const { messages } = input;
     const lead = messages.find((message) => message.shellCommand === true) ?? messages[0];
     if (lead === undefined) return;
     yield* dispatchMessage(
@@ -16177,6 +16175,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: input.now,
         payload: { ...candidate, queuePosition: index + 1 },
       });
+    }
+  });
+
+  const queueUserShellRedelivery = Effect.fnUntraced(function* (input: {
+    readonly command: OrchestrationV2ServerCommand;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+    readonly messageIds: ReadonlyArray<MessageId>;
+    readonly now: DateTime.Utc;
+  }) {
+    const projection = yield* getProjectionWithPendingEvents(
+      commandThreadId(input.command),
+      input.events,
+    );
+    const messages = input.messageIds.flatMap((id) => {
+      const message = projection.messages.find((candidate) => candidate.id === id);
+      return message === undefined ? [] : [message];
+    });
+    // Only a command's run delivers the messages folded into it, so without one each message
+    // gets a run of its own. Each goes to the front of the queue, so the last one goes first.
+    const runs = messages.some((message) => message.shellCommand === true)
+      ? [messages]
+      : messages.map((message) => [message]);
+    for (const runMessages of runs.toReversed()) {
+      yield* queueUserShellRedeliveryRun({ ...input, messages: runMessages });
     }
   });
 
@@ -17705,15 +17728,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   // A provider turn that starts running takes the hold steered `! cmd` commands wait for. Only
   // while the environment has shell commands on: a steer queued before they were turned off
-  // still runs, once the turn ends, like any queued message.
+  // still runs, once the turn ends, like any queued message. Only a turn's first running update:
+  // its later ones (usage, output) arrive about once a second and would each lock the thread.
+  const runningProviderTurns = new Map<ThreadId, OrchestrationV2ProviderTurn["id"]>();
   yield* eventSink
     .stream({ afterSequence: terminalEventsAfterSequence, eventType: "provider-turn.updated" })
     .pipe(
-      Stream.filter(
-        (stored) =>
-          stored.event.type === "provider-turn.updated" &&
-          stored.event.payload.status === "running",
-      ),
+      Stream.filter((stored) => {
+        const { event } = stored;
+        if (event.type !== "provider-turn.updated" || event.payload.status !== "running") {
+          return false;
+        }
+        if (runningProviderTurns.get(event.threadId) === event.payload.id) return false;
+        runningProviderTurns.set(event.threadId, event.payload.id);
+        return true;
+      }),
       Stream.filterEffect(() =>
         serverSettings.getSettings.pipe(
           Effect.map((settings) => settings.enableShellCommands),
