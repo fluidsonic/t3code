@@ -2319,10 +2319,14 @@ export function makeClaudeQueryOptions(input: {
     ...(deviceInstructions || input.onStop !== undefined
       ? {
           hooks: {
+            ...input.hooks,
             ...(deviceInstructions
               ? { SubagentStart: [{ hooks: [subagentDeviceInstructions] }] }
               : {}),
-            ...(input.onStop === undefined ? {} : { Stop: [{ hooks: [input.onStop] }] }),
+            // The session's turn-hold Stop hook runs beside this one.
+            ...(input.onStop === undefined
+              ? {}
+              : { Stop: [...(input.hooks?.Stop ?? []), { hooks: [input.onStop] }] }),
           },
         }
       : {}),
