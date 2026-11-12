@@ -75,6 +75,8 @@ interface AttachedTab {
   focusReleasing: boolean;
   /** The sessions streaming the guest; one stopping leaves the others' screencasts running. */
   readonly screencasts: Set<string | undefined>;
+  /** The page's unrevived crash, replayed to a server that connects again. */
+  crash: string | null;
   readonly onMessage: (
     event: Electron.Event,
     method: string,
@@ -95,6 +97,7 @@ export class DesktopBrowserHost extends Context.Service<
     readonly detach: (key: DesktopBrowserTabKey) => void;
     readonly loadFailed: (key: DesktopBrowserTabKey, failure: PreviewAutomationLoadError) => void;
     readonly setShown: (key: DesktopBrowserTabKey, shown: boolean | undefined) => void;
+    readonly crashChanged: (key: DesktopBrowserTabKey, message: string | null) => void;
     readonly humanStartedDownload: (source: Electron.WebContents) => boolean;
     readonly placeDownload: (source: Electron.WebContents, item: Electron.DownloadItem) => boolean;
     readonly pointers: Stream.Stream<{
@@ -108,6 +111,8 @@ export class DesktopBrowserHost extends Context.Service<
       readonly key: DesktopBrowserTabKey;
       readonly active: boolean;
     }>;
+    /** Reloads asked for a tab this host holds no debugger for, e.g. while its DevTools are open. */
+    readonly detachedReloads: Stream.Stream<DesktopBrowserTabKey>;
   }
 >()("@t3tools/desktop/preview/DesktopBrowserHost") {}
 
@@ -123,6 +128,7 @@ export const make = Effect.gen(function* () {
     readonly key: DesktopBrowserTabKey;
     readonly active: boolean;
   }>();
+  const detachedReloads = yield* PubSub.unbounded<DesktopBrowserTabKey>();
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const tabs = new Map<string, AttachedTab>();
   /** Threads whose agent turn runs, by the server's account. */
@@ -459,6 +465,7 @@ export const make = Effect.gen(function* () {
       agentUsed: false,
       focusReleasing: false,
       screencasts: new Set(),
+      crash: null,
       onMessage: (_event, method, params, sessionId) => {
         if (method === "Page.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
@@ -548,7 +555,13 @@ export const make = Effect.gen(function* () {
         return;
       }
       const tab = tabs.get(keyOf(command.value));
-      if (!tab) return;
+      if (!tab) {
+        if (command.value.type === "reload") {
+          const { threadId, tabId } = command.value;
+          runFork(PubSub.publish(detachedReloads, { threadId, tabId }));
+        }
+        return;
+      }
       if (command.value.type === "pointer") {
         const { threadId, tabId, phase, x, y } = command.value;
         runFork(PubSub.publish(pointers, { key: { threadId, tabId }, phase, x, y }));
@@ -558,9 +571,24 @@ export const make = Effect.gen(function* () {
         dropRelay(tab);
         return;
       }
+      if (command.value.type === "reload") {
+        // Only a crashed page: a page already reloading or navigating must keep going.
+        const contents = tab.debuggee.webContents;
+        if (!contents.isDestroyed() && contents.isCrashed()) contents.reload();
+        // The page loading again reports the revive; a page no reload had to revive says so
+        // at once, since the server waits for that answer.
+        else crashChanged(tab.key, null);
+        return;
+      }
       if (AGENT_INPUT_COMMAND.test(command.value.message)) tab.agentInputAt = performance.now();
       relayFor(tab).receive(command.value.message);
     });
+
+  const crashChanged = (key: DesktopBrowserTabKey, message: string | null) => {
+    const tab = tabs.get(keyOf(key));
+    if (tab) tab.crash = message;
+    emit({ type: "crash", ...key, message });
+  };
 
   const humanStartedDownload = (source: Electron.WebContents) => {
     const tab = [...tabs.values()].find((candidate) => candidate.debuggee.webContents === source);
@@ -583,6 +611,11 @@ export const make = Effect.gen(function* () {
               ? PubSub.publish(outbox, { type: "shown", ...tab.key, shown })
               : Effect.void,
           ),
+          Effect.andThen(
+            tab.crash === null
+              ? Effect.void
+              : PubSub.publish(outbox, { type: "crash", ...tab.key, message: tab.crash }),
+          ),
         );
       },
       { discard: true },
@@ -592,6 +625,7 @@ export const make = Effect.gen(function* () {
   return DesktopBrowserHost.of({
     pointers: Stream.fromPubSub(pointers),
     painting: Stream.fromPubSub(painting),
+    detachedReloads: Stream.fromPubSub(detachedReloads),
     // Subscribes before announcing, so no attach falls between the two.
     events: Stream.unwrap(
       Effect.gen(function* () {
@@ -605,6 +639,7 @@ export const make = Effect.gen(function* () {
     detach,
     loadFailed,
     setShown,
+    crashChanged,
     placeDownload,
     humanStartedDownload,
   });
