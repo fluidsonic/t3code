@@ -1003,6 +1003,23 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
   });
 }
 
+/**
+ * Lets an effect make protected requests, each checked against the destination's grants when it
+ * runs. Commands whose payload decides their grants, such as sending a `! cmd`, need it.
+ */
+export function withRpcPermissionGuard<R, ER>(
+  runtime: Atom.AtomRuntime<EnvironmentRegistry.EnvironmentRegistry | R, ER>,
+  registry: AtomRegistry.AtomRegistry,
+) {
+  return <A, E, RE>(effect: Effect.Effect<A, E, RE>) =>
+    effect.pipe(
+      Effect.provideService(RpcPermissionGuard, {
+        authorize: (id, method, payload) =>
+          createCommandPermissions(runtime, method).authorize(registry, id, payload),
+      }),
+    );
+}
+
 export function createEnvironmentRpcCommand<
   R,
   ER,
@@ -1070,10 +1087,7 @@ export function createEnvironmentRpcCommand<
           started = options.onStart?.(target, registry);
           return options.execute?.(input) ?? requestGuarded(options.tag, input);
         }),
-        Effect.provideService(RpcPermissionGuard, {
-          authorize: (id, method, payload) =>
-            createCommandPermissions(runtime, method).authorize(registry, id, payload),
-        }),
+        withRpcPermissionGuard(runtime, registry),
         Effect.tap(
           (result) => options.onSuccess?.(target, registry, result, started) ?? Effect.void,
         ),

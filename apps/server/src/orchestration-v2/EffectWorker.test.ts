@@ -94,6 +94,8 @@ function layerExecutorFor(input: {
         interrupt: input.interrupt ?? (() => Effect.void),
         steer: () => Effect.void,
         applyModelSelection: () => Effect.void,
+        pause: () => Effect.succeed("unsupported"),
+        release: () => Effect.succeed(true),
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined

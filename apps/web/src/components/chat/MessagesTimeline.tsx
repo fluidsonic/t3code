@@ -139,6 +139,7 @@ import { useThreadFindPositionReader } from "./useThreadFindPositionReader";
 import { ThreadActivityAnnouncer } from "./ThreadActivityAnnouncer";
 import { useStableHandoffRuns, useIncrementalTimelineRows, useStableRows } from "./useTimelineRows";
 import { useClientSettings } from "../../hooks/useSettings";
+import type { CodeBlockShellActions } from "./MarkdownCodeBlock.logic";
 
 function timelineListStateFor(identity: string): {
   readonly identity: string;
@@ -232,6 +233,8 @@ interface MessagesTimelineProps {
   runlessWorkActive?: boolean;
   activeTurnStartedAt?: string | null;
   worktreeSetup?: WorktreeSetupSnapshot | null;
+  /** A person's `! cmd`, not the agent, owns the working slot. */
+  userShellCommandOwnsWorkingSlot?: boolean;
   onCancelWorktreeSetup?: () => void;
   retryableWorkspacePreparationRunIds?: ReadonlySet<RunId>;
   onRetryWorkspacePreparation?: (runId: RunId) => void;
@@ -285,7 +288,7 @@ interface MessagesTimelineProps {
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
   onSendAppMessage?: (text: string) => Promise<void>;
-  onRunShellCommand?: (command: string) => void;
+  codeBlockShellActions?: CodeBlockShellActions | undefined;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onFileOpen?: (attachment: ChatFileAttachment) => void;
@@ -345,6 +348,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   runlessWorkActive = false,
   activeTurnStartedAt = null,
   worktreeSetup = null,
+  userShellCommandOwnsWorkingSlot = false,
   footer = null,
   onCancelWorktreeSetup,
   retryableWorkspacePreparationRunIds = EMPTY_RUN_IDS,
@@ -384,7 +388,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   onRevertToTurnCount,
   onUseArtifactTemplate = NOOP_USE_ARTIFACT_TEMPLATE,
   onSendAppMessage,
-  onRunShellCommand,
+  codeBlockShellActions,
   isRevertingCheckpoint,
   onImageExpand,
   onFileOpen = NOOP_OPEN_ATTACHMENT,
@@ -742,6 +746,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     worktreeSetup,
     toolCallVisibility,
     revealedMessageId,
+    userShellCommandOwnsWorkingSlot,
   });
   const rows = useStableRows(rawRows, listIdentityKey);
   const matchedApprovalRequestIds = new Set<string>();
@@ -1090,7 +1095,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     runs,
     activeThreadEnvironmentId,
     onRevertToTurnCount,
-    onRunShellCommand,
+    codeBlockShellActions,
     findActive,
     onImageExpand,
     onFileOpen,
