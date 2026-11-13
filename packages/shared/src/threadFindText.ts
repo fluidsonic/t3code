@@ -1,4 +1,3 @@
-import { shouldPreserveAssistantLineBreaks } from "./assistantInsights.ts";
 import { THREAD_FIND_BLOCK_TAGS } from "./threadFindBlockTags.ts";
 import {
   matchInlineSkills,
@@ -214,7 +213,11 @@ export function searchablePlanSegments(
 ): readonly string[] {
   return [
     proposedPlanTitle(markdown) ?? "Proposed plan",
-    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), { cwd, theme }),
+    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), {
+      cwd,
+      lineBreaks: true,
+      theme,
+    }),
   ];
 }
 
@@ -234,7 +237,7 @@ export function searchableMessageSegments(
   return markdownThreadFindText(message.text || (message.streaming ? "" : "(empty response)"), {
     cwd,
     skills,
-    lineBreaks: shouldPreserveAssistantLineBreaks(message.text),
+    lineBreaks: true,
     renderInsights: true,
     theme,
   });
