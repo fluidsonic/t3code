@@ -1,6 +1,7 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { threadContextRecord } from "@t3tools/shared/composerContextReferences";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 import {
   DraftId,
@@ -121,6 +122,20 @@ describe("queued message file edits", () => {
         removedExistingAttachment: true,
       }),
     ).toBe("discarded");
+    expect(store.getComposerDraft(threadTarget)).toBeNull();
+  });
+
+  it("finds an untouched queued command edit clean", () => {
+    const store = useComposerDraftStore.getState();
+    // Opened the way `useQueuedRunEdit` opens a queued command for editing.
+    const { prompt, shellMode } = composerPromptForMessage({
+      text: "npm test",
+      shellCommand: true,
+    });
+    store.setPrompt(editTarget, prompt, { shellMode });
+    expect(recoverQueuedMessageEdit({ editTarget, threadTarget, originalText: prompt })).toBe(
+      "clean",
+    );
     expect(store.getComposerDraft(threadTarget)).toBeNull();
   });
 

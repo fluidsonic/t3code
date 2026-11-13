@@ -29,6 +29,10 @@ export interface QueuedThreadRun {
   readonly context?: Message["context"];
   /** Carries the attribution a sent message shows: automation, agent sender, or guest. */
   readonly message?: Message;
+  /** A `! cmd` shell command; `text` is its message form, `! cmd`. */
+  readonly shellCommand?: true;
+  /** The command already ran and only the agent's reply waits, so it can no longer be edited. */
+  readonly shellCommandRan?: true;
 }
 
 export interface ThreadQueueWorkflowState {
@@ -166,6 +170,13 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
       messageId: run.userMessageId,
       ...(message?.context ? { context: message.context } : {}),
       ...(message ? { message } : {}),
+      ...(message?.shellCommand === true ? { shellCommand: true as const } : {}),
+      ...(message?.shellCommand === true &&
+      projection.turnItems.some(
+        (item) => item.type === "command_execution" && item.userShellMessageId === message.id,
+      )
+        ? { shellCommandRan: true as const }
+        : {}),
     };
   });
 

@@ -323,6 +323,11 @@ export function themeColorWithAlpha(color: string, alpha: number): string {
   return rgb ? `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${alpha})` : color;
 }
 
+// Tailwind's violet-300/500/700, the `! cmd` shell accent the web uses. Violet marks no other surface.
+const SHELL_VIOLET_300 = themeColorToNativeColor("oklch(0.811 0.111 293.571)");
+const SHELL_VIOLET_500 = themeColorToNativeColor("oklch(0.606 0.25 292.717)");
+const SHELL_VIOLET_700 = themeColorToNativeColor("oklch(0.491 0.27 292.581)");
+
 export function createMobileThemeVariables(
   colors: ThemeColors,
   appearance: MobileThemeAppearance,
@@ -395,6 +400,9 @@ export function createMobileThemeVariables(
     "--color-warning": c.warningSurface,
     "--color-warning-border": withAlpha(c.warning, 0.32),
     "--color-warning-foreground": c.warningForeground,
+    "--color-shell-tint": withAlpha(SHELL_VIOLET_500, 0.09),
+    "--color-shell-prefix": withAlpha(SHELL_VIOLET_500, 0.24),
+    "--color-shell-prefix-foreground": appearance === "dark" ? SHELL_VIOLET_300 : SHELL_VIOLET_700,
     "--color-danger": c.errorSurface,
     "--color-danger-border": withAlpha(c.error, 0.32),
     "--color-danger-foreground": c.errorForeground,

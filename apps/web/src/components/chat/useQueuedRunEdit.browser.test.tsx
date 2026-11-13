@@ -166,6 +166,7 @@ async function beginChangedEdit(hook: { current: HookResult | null }) {
       runId: RUN,
       messageId: MessageId.make("message-1"),
       text: "original",
+      shellCommand: false,
       attachments: [],
     }),
   );
@@ -209,6 +210,7 @@ describe("useQueuedRunEdit", () => {
         runId: RUN,
         messageId: MessageId.make("message-1"),
         text: prefix + ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+        shellCommand: false,
         attachments,
       };
       await act(() => requireHook(hook).beginEdit(request));
@@ -253,6 +255,7 @@ describe("useQueuedRunEdit", () => {
         runId: RUN,
         messageId: MessageId.make("message-1"),
         text: `Ultrathink:\n${ATTACHMENT_ONLY_BOOTSTRAP_PROMPT}`,
+        shellCommand: false,
         attachments: [
           {
             type: "image",
@@ -289,7 +292,15 @@ describe("useQueuedRunEdit", () => {
     ];
     await using _screen = await render(view(THREAD_A, "queued", hook, messages));
 
-    await act(() => requireHook(hook).beginEdit({ runId: RUN, messageId, text, attachments: [] }));
+    await act(() =>
+      requireHook(hook).beginEdit({
+        runId: RUN,
+        messageId,
+        text,
+        attachments: [],
+        shellCommand: false,
+      }),
+    );
 
     const draft = useComposerDraftStore.getState().getComposerDraft(requireHook(hook).draftTarget);
     expect(draft?.prompt).toBe(text);
@@ -308,7 +319,15 @@ describe("useQueuedRunEdit", () => {
       .join(" and ");
     const messages = [{ id: messageId, text, context: { version: 1, records: [kept, removed] } }];
     await using _screen = await render(view(THREAD_A, "queued", hook, messages));
-    await act(() => requireHook(hook).beginEdit({ runId: RUN, messageId, text, attachments: [] }));
+    await act(() =>
+      requireHook(hook).beginEdit({
+        runId: RUN,
+        messageId,
+        text,
+        attachments: [],
+        shellCommand: false,
+      }),
+    );
     const target = requireHook(hook).draftTarget;
     await act(() => useComposerDraftStore.getState().setThreadContexts(target, [kept]));
 
