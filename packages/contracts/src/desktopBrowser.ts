@@ -9,7 +9,7 @@ const TabKey = {
 
 export const DesktopBrowserEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("attached"), ...TabKey }),
-  /** Its `<webview>` went away: closed, crashed, swapped, or devtools took the debugger. */
+  /** Its `<webview>` went away: closed, swapped, or devtools took the debugger. */
   Schema.Struct({ type: Schema.Literal("detached"), ...TabKey }),
   Schema.Struct({ type: Schema.Literal("cdp"), ...TabKey, message: Schema.String }),
   /**
@@ -25,12 +25,20 @@ export const DesktopBrowserEvent = Schema.Union([
   }),
   /** Its `<webview>` started or stopped being on screen in a desktop window. */
   Schema.Struct({ type: Schema.Literal("shown"), ...TabKey, shown: Schema.Boolean }),
+  /** The page's renderer died, with the message to show, or a reload brought it back (`null`). */
+  Schema.Struct({
+    type: Schema.Literal("crash"),
+    ...TabKey,
+    message: Schema.NullOr(Schema.String),
+  }),
 ]);
 export type DesktopBrowserEvent = typeof DesktopBrowserEvent.Type;
 
 export const DesktopBrowserCommand = Schema.Union([
   Schema.Struct({ type: Schema.Literal("cdp"), ...TabKey, message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("release"), ...TabKey }),
+  /** Reload the page, which also revives one whose renderer crashed. */
+  Schema.Struct({ type: Schema.Literal("reload"), ...TabKey }),
   Schema.Struct({
     type: Schema.Literal("pointer"),
     ...TabKey,
