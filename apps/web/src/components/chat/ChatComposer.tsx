@@ -16,7 +16,11 @@ import {
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useRightPanelStore } from "~/rightPanelStore";
-import { importPastedComposerText, readPastedComposerContext } from "../composerInlineTokenPaste";
+import {
+  markComposerPasteAsPlainText,
+  importPastedComposerText,
+  readPastedComposerContext,
+} from "../composerInlineTokenPaste";
 import {
   questionAttachmentDraftId,
   trackOpenQuestionAttachmentDraft,
@@ -3036,6 +3040,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const { files, folders } = splitTransferredFiles(event.clipboardData);
     const plainText = event.clipboardData.getData("text/plain");
     const bypassAutoAttachment = consumePasteAsTextShortcut(pasteAsTextShortcutUntilRef);
+    if (bypassAutoAttachment) markComposerPasteAsPlainText(event.nativeEvent);
     const pastedContext =
       !isLiteralPendingAnswer &&
       (readPastedComposerContext(event.clipboardData)?.records.length ?? 0) > 0;
@@ -3341,6 +3346,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (speechInput.freezesEditor) return false;
         const shortcutArmed = consumePasteAsTextShortcut(pasteAsTextShortcutUntilRef);
         const bypassAutoAttachment = options?.bypassAutoAttachment === true || shortcutArmed;
+        if (bypassAutoAttachment) {
+          return composerEditorRef.current?.pastePlainTextAtEnd(text) ?? false;
+        }
         const promptLength = promptRef.current.length;
         if (
           !foldPastedText(text, bypassAutoAttachment, {
