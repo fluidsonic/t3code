@@ -2,6 +2,7 @@ import { pasteTextToFocusComposer, shouldRedirectInputToComposer } from "./compo
 import { readPastedComposerContext } from "../composerInlineTokenPaste";
 import { isPasteAsTextShortcut } from "@t3tools/client-runtime/text-paste";
 import { useEffect, useRef } from "react";
+import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
 import { isMacPlatform } from "../../lib/utils";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { getTerminalFocusOwner } from "../../lib/terminalFocus";
@@ -28,6 +29,12 @@ export function usePasteToFocusComposer(
         pasteAsTextShortcutUntilRef.current = Date.now() + 1_000;
       }
     };
+    const armPasteAsText = () => {
+      pasteAsTextShortcutUntilRef.current = Date.now() + 1_000;
+    };
+    const clearPasteAsText = () => {
+      pasteAsTextShortcutUntilRef.current = 0;
+    };
     const handler = (event: ClipboardEvent) => {
       if (isCommandPaletteOpen() || isInSideChatPane(event.target)) return;
       if (getTerminalFocusOwner() !== null) return;
@@ -38,7 +45,8 @@ export function usePasteToFocusComposer(
       const bypassAutoAttachment = Date.now() <= pasteAsTextShortcutUntilRef.current;
       pasteAsTextShortcutUntilRef.current = 0;
       if (
-        ((readPastedComposerContext(clipboardData)?.records.length ?? 0) === 0 &&
+        ((bypassAutoAttachment ||
+          (readPastedComposerContext(clipboardData)?.records.length ?? 0) === 0) &&
           composerRef.current?.pasteTextAtEnd(text, { bypassAutoAttachment })) ||
         composerRef.current?.insertTextAtEnd(text, { clipboardData })
       ) {
@@ -46,9 +54,13 @@ export function usePasteToFocusComposer(
         event.stopPropagation();
       }
     };
+    window.addEventListener(DESKTOP_PASTE_AS_TEXT_EVENT, armPasteAsText);
+    window.addEventListener("blur", clearPasteAsText);
     window.addEventListener("keydown", keyHandler, true);
     window.addEventListener("paste", handler, true);
     return () => {
+      window.removeEventListener(DESKTOP_PASTE_AS_TEXT_EVENT, armPasteAsText);
+      window.removeEventListener("blur", clearPasteAsText);
       window.removeEventListener("keydown", keyHandler, true);
       window.removeEventListener("paste", handler, true);
     };
