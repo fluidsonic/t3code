@@ -742,10 +742,6 @@ function remarkNormalizeLinksAndTagInlineCode() {
   };
 }
 
-export function shouldPreserveAssistantLineBreaks(text: string): boolean {
-  return /^★ Insight(?:\s|─)/mu.test(text);
-}
-
 export function remarkAssistantInsights(this: Processor) {
   return (tree: Root, file: { value: unknown }) => {
     const source = String(file.value);

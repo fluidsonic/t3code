@@ -1,4 +1,3 @@
-import { shouldPreserveAssistantLineBreaks } from "@t3tools/shared/markdownPipeline";
 import { type RunId, type TurnItemId } from "@t3tools/contracts";
 import { canForkProjectedAssistantItem } from "@t3tools/client-runtime/state/thread-workflows";
 import { agentWorkingDirectories } from "@t3tools/client-runtime/workspace-basename-lookup";
@@ -67,7 +66,7 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
               }
               threadRef={ctx.threadRef ?? undefined}
               isStreaming={Boolean(row.message.streaming)}
-              lineBreaks={shouldPreserveAssistantLineBreaks(messageText)}
+              lineBreaks
               skills={ctx.skills}
               headingLevelOffset={MESSAGE_HEADING_LEVEL}
               onUseArtifactTemplate={ctx.onUseArtifactTemplate}
@@ -118,7 +117,7 @@ export function SentMessageTimelineRow({
         text={row.text}
         cwd={ctx.markdownCwd}
         threadRef={ctx.threadRef ?? undefined}
-        lineBreaks={shouldPreserveAssistantLineBreaks(row.text)}
+        lineBreaks
         skills={ctx.skills}
         headingLevelOffset={MESSAGE_HEADING_LEVEL}
         onUseArtifactTemplate={ctx.onUseArtifactTemplate}

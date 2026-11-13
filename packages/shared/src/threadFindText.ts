@@ -32,7 +32,6 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
 import {
-  shouldPreserveAssistantLineBreaks,
   remarkAssistantInsights,
   CHAT_MARKDOWN_REHYPE_PLUGINS,
   CHAT_MARKDOWN_REMARK_PLUGINS,
@@ -222,7 +221,7 @@ function markdownThreadFindText(
 export function searchablePlanSegments(markdown: string, cwd?: string): readonly string[] {
   return [
     proposedPlanTitle(markdown) ?? "Proposed plan",
-    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), false, cwd, []),
+    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), false, cwd, [], true),
   ];
 }
 
@@ -243,7 +242,7 @@ export function searchableMessageSegments(
     false,
     cwd,
     skills,
-    shouldPreserveAssistantLineBreaks(message.text),
+    true,
     true,
   );
 }
