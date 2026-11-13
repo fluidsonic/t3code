@@ -13,14 +13,18 @@ const CLIPBOARD_EDIT_META = "composerClipboardEdit";
  * Tag custom paste/cut dispatches; ProseMirror only tags its built-in paths.
  * Not `uiEvent`: Tiptap's paste rules would style the already parsed paste a second time.
  */
-export function markAsClipboardEdit(tr: Transaction, event: "paste" | "cut"): Transaction {
+export function markAsClipboardEdit(
+  tr: Transaction,
+  event: "paste" | "pasteAsText" | "cut",
+): Transaction {
   return tr.setMeta(CLIPBOARD_EDIT_META, event);
 }
 
 function changeKindOf(tr: Transaction): ComposerChangeKind | null {
   if (!tr.docChanged) return null;
   const uiEvent = tr.getMeta("uiEvent");
-  if (uiEvent === "paste" || uiEvent === "drop" || uiEvent === "cut") return "other";
+  if (uiEvent === "paste" || uiEvent === "pasteAsText" || uiEvent === "drop" || uiEvent === "cut")
+    return "other";
   if (tr.getMeta(CLIPBOARD_EDIT_META) != null) return "other";
   // IME input replaces its own range on each keystroke; it is still typing.
   if (tr.getMeta("composition") != null) return "insert";

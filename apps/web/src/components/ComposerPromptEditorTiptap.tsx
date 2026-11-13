@@ -76,6 +76,7 @@ import {
   ComposerCodeBlockExtension,
   ComposerListExtensions,
   buildTiptapContent,
+  insertPlainTextPaste,
   convertBulletItemToTask,
   ComposerCodeExtension,
   ComposerBoldExtension,
@@ -136,11 +137,16 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { ComposerCodeBlockNodeView } from "./chat/ComposerCodeBlockNodeView";
 import { resolveAssistantCitationCommentDismissal } from "./chat/assistantCitationCommentDismissal";
 import { composerCodeBlockHighlight } from "./composerCodeBlockHighlight";
-import { importPastedComposerText, readPastedPlainText } from "./composerInlineTokenPaste";
+import {
+  isComposerPlainTextPaste,
+  importPastedComposerText,
+  readPastedPlainText,
+} from "./composerInlineTokenPaste";
 import { didComposerSelectionChangeVisibly } from "./composerSelection";
 import type { ComposerDraftContextRecords } from "./composerContextPresentation";
 
 export interface ComposerPromptEditorHandle {
+  pastePlainTextAtEnd: (text: string) => boolean;
   focus: () => void;
   focusAt: (cursor: number) => void;
   focusAtEnd: () => void;
@@ -1064,6 +1070,7 @@ function ComposerPromptEditorTiptapInner(
     const inCodeBlock = updated.state.selection.$from.parent.type.spec.code === true;
     const suppressTrigger =
       literalText ||
+      transaction.getMeta("uiEvent") === "pasteAsText" ||
       inCodeBlock ||
       [updated.state.selection.$from.nodeBefore, updated.state.selection.$from.nodeAfter].some(
         (node) => node?.isInline && node.isAtom && !node.isText && node.type.name !== "hardBreak",
@@ -1408,6 +1415,14 @@ function ComposerPromptEditorTiptapInner(
             );
             return true;
           }
+          if (isComposerPlainTextPaste(event)) {
+            const editorInstance = (view.dom as TiptapEditorHTMLElement).editor;
+            if (editorInstance) {
+              insertPlainTextPaste(editorInstance, pastedText);
+              scrollTiptapCaretIntoView(editorInstance);
+            }
+            return true;
+          }
           // Shown Markdown source is parsed when the caret leaves, so paste one line into it as text.
           const sourceType = view.state.schema.marks[MARKDOWN_SOURCE_MARK];
           const { from: pasteFrom, to: pasteTo, $from: $pasteFrom } = view.state.selection;
@@ -1721,6 +1736,14 @@ function ComposerPromptEditorTiptapInner(
   useImperativeHandle(
     editorRef,
     () => ({
+      pastePlainTextAtEnd: (text: string) => {
+        if (!editor || !editor.isEditable) return false;
+        editor.commands.setTextSelection(editor.state.doc.content.size - 1);
+        const inserted = insertPlainTextPaste(editor, text.replace(/\r\n?/g, "\n"));
+        editor.view.focus();
+        scrollTiptapCaretIntoView(editor);
+        return inserted;
+      },
       focus: () => {
         // The collapsed cursor cannot say where inside `$name` text a caret
         // sits, so restoring the caret passes along its exact offset.

@@ -16,6 +16,7 @@ import {
 import {
   buildDocJson,
   buildTiptapContent,
+  insertPlainTextPaste,
   caretTakesMarksBefore,
   ComposerBlockExtensions,
   ComposerCodeBlockExtension,
@@ -891,6 +892,58 @@ describe("model mention chips", () => {
     const removed = replace(loaded);
     expect(modelAttrs(removed)).toEqual([]);
     expect(serializeEditorDoc(removed).value).toBe(value);
+  });
+});
+
+describe("pasting as plain text", () => {
+  it.each([
+    { styling: true, marked: false },
+    { styling: false, marked: false },
+    { styling: true, marked: true },
+  ])(
+    "keeps Markdown and tokens literal with $styling styling and $marked marks",
+    ({ styling, marked }) => {
+      const editor = new Editor({
+        element: null,
+        extensions: [
+          StarterKit.configure({ bulletList: false, orderedList: false, listItem: false }),
+          ...ComposerListExtensions,
+        ],
+        content: buildDocJson("", () => null, { styling }),
+      });
+      editor.view.updateState(
+        editor.state.reconfigure({ plugins: editor.extensionManager.plugins }),
+      );
+      onTestFinished(() => editor.destroy());
+      if (marked) editor.commands.setMark("bold");
+      const text =
+        "**bold** *italic* [link](https://example.com) @file $skill model:codex/gpt-6.1 \n1. item\n# heading\n---\n```ts\ncode\n```\n\n";
+      expect(insertPlainTextPaste(editor, text)).toBe(true);
+      expect(serializeEditorDoc(editor.state.doc).value).toBe(text);
+      editor.state.doc.forEach((block) => {
+        expect(block.type.name).toBe("paragraph");
+        block.forEach((node) => {
+          expect(node.isText).toBe(true);
+          expect(node.marks).toEqual([]);
+        });
+      });
+      expect(serializeEditorDoc(editor.state.doc).contextIds).toEqual([]);
+      editor.commands.setMark("bold");
+      expect(insertPlainTextPaste(editor, "**single** @file")).toBe(true);
+      expect(editor.state.doc.lastChild?.firstChild?.marks).toEqual([]);
+    },
+  );
+
+  it("joins pasted lines with the line around the caret", () => {
+    const editor = new Editor({
+      element: null,
+      extensions: [StarterKit],
+      content: buildDocJson("[]", () => null, { styling: false }),
+    });
+    onTestFinished(() => editor.destroy());
+    editor.commands.setTextSelection(2);
+    expect(insertPlainTextPaste(editor, "one\n\ntwo")).toBe(true);
+    expect(serializeEditorDoc(editor.state.doc).value).toBe("[one\n\ntwo]");
   });
 });
 
