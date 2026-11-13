@@ -1487,6 +1487,7 @@ function AssistantMarkdownBlocks(props: {
           markdown={renderCodexInlineDirectivesAsMarkdown(
             withReferenceDefinitions(segment.markdown, definitions),
           )}
+          preserveSoftBreaks
           skills={props.skills}
           models={props.models}
           textStyle={props.markdownStyles.nativeTextStyle}

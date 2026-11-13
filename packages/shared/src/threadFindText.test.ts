@@ -96,6 +96,18 @@ it("excludes repeated legacy attachments containing literal context tags", () =>
 const assistantSegments = (text: string, cwd?: string) =>
   searchableMessageSegments({ role: "assistant", text, streaming: false }, cwd);
 
+it("keeps single line breaks in streaming and final assistant prose", () => {
+  for (const streaming of [true, false]) {
+    expect(
+      searchableMessageSegments({
+        role: "assistant",
+        text: "Stay healthy 🌱\nMarc",
+        streaming,
+      })?.map((segment) => segment.trim()),
+    ).toEqual(["Stay healthy 🌱", "Marc"]);
+  }
+});
+
 it("searches displayed prose and file-chip labels without hidden paths", () => {
   expect(
     assistantSegments("[important description](/tmp/actual.ts). `/tmp/inline-example.ts:42`"),
@@ -243,17 +255,16 @@ it("does not index the hidden marker of an alert written with CR-only line endin
   expect(assistantSegments("> [!NOTE]\r> hi")).toEqual(["hi"]);
 });
 
-it("keeps insight line breaks for backticked openers on their own line, not in prose", () => {
+it("renders a backticked insight opener on its own line as a callout, not in prose", () => {
   expect(assistantSegments("`★ Insight ─────`\nfirst line\nsecond line\n`─────`")).toEqual([
     "first line",
     " second line",
   ]);
-  expect(assistantSegments("`★ Insight ─────` opens a callout.\nfirst line\nsecond line")).toEqual([
-    "★ Insight ───── opens a callout. first line second line",
-  ]);
-  expect(
-    assistantSegments("`★ Insight ─────`\u2028opens a callout.\nfirst line\nsecond line"),
-  ).toEqual(["★ Insight ─────\u2028opens a callout. first line second line"]);
+  for (const separator of [" ", "\u2028"]) {
+    expect(
+      assistantSegments(`\`★ Insight ─────\`${separator}opens a callout.\nfirst line\nsecond line`),
+    ).toEqual([`★ Insight ─────${separator}opens a callout.`, " first line", " second line"]);
+  }
 });
 
 it("indexes image destinations rendered as file chips", () => {
@@ -265,7 +276,7 @@ it("indexes image destinations rendered as file chips", () => {
   ).toEqual(["notes.ts · L42–64 "]);
 });
 
-it("projects carriage-return soft line breaks to a space outside code blocks", () => {
-  expect(assistantSegments("First\rsecond")).toEqual(["First second"]);
+it("keeps carriage-return soft line breaks outside code blocks", () => {
+  expect(assistantSegments("First\rsecond")).toEqual(["First", " second"]);
   expect(assistantSegments("```text\nFirst\rsecond\n```")).toEqual(["First\rsecond\n"]);
 });
