@@ -222,8 +222,12 @@ function escapeTablePipes(text: string, inTableCell: boolean): string {
 
 function serializeChildren(node: Node, inTableCell = false): string {
   let out = "";
+  let afterBreak = false;
   for (const child of node.childNodes) {
-    out += serializeNode(child, inTableCell);
+    const text = serializeNode(child, inTableCell);
+    // Rendered Markdown keeps the source newline after a <br>, which the browser hides.
+    out += afterBreak && child.nodeType === Node.TEXT_NODE ? text.replace(/^\n/, "") : text;
+    afterBreak = child.nodeType === Node.ELEMENT_NODE && (child as Element).tagName === "BR";
   }
   return out;
 }

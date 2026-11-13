@@ -242,6 +242,20 @@ describe("serializeRenderedMarkdownFragment", () => {
     );
   });
 
+  it.each([
+    ["its own text node", [new FakeText("\n"), new FakeText("Marc")]],
+    ["the next line's text", [new FakeText("\nMarc")]],
+  ])("copies a line break as one newline when the source newline is %s", (_, after) => {
+    const paragraph = new FakeElement("P").append(
+      new FakeText("Stay healthy"),
+      new FakeElement("BR"),
+      ...after,
+    );
+    expect(
+      serializeRenderedMarkdownFragment(asNode(new FakeElement("DIV").append(paragraph))),
+    ).toBe("Stay healthy\nMarc");
+  });
+
   it("keeps a bare list item that sits alongside the code block", () => {
     const container = new FakeElement("DIV").append(
       new FakeElement("UL").append(new FakeElement("LI")),
