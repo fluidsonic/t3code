@@ -46,6 +46,7 @@ import {
   ThreadId,
   SERVER_BROWSER_AUTOMATION_CLIENT_ID,
   type PreviewAppearancePreference,
+  describePreviewCrash,
 } from "@t3tools/contracts";
 import { AgentScope, agentScopeLauncherScript } from "@t3tools/shared/AgentScope";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
@@ -328,8 +329,14 @@ interface Recording {
 interface ServerTab {
   readonly threadId: ThreadId;
   readonly tabId: string;
-  readonly page: Page;
-  readonly cdp: CDPSession;
+  // Replaced when a crashed page is revived; the tab and its context stay.
+  page: Page;
+  cdp: CDPSession;
+  crashed: boolean;
+  recovery: Promise<void> | null;
+  lastStatus: PreviewNavStatus;
+  /** What reviving loads; the reported URL is shortened and drops data payloads. */
+  crashedUrl: string | undefined;
   readonly frameSessions: Map<Frame, CDPSession>;
   /** Copy reads run in key order, outside the input queue. */
   copyReads: Promise<void>;
@@ -349,7 +356,12 @@ interface ServerTab {
 
   readonly isolatedContext: boolean;
 
-  readonly desktop: { readonly close: () => Promise<void> } | null;
+  // Replaced when a crashed desktop page is revived and connected again.
+  desktop: { readonly close: () => Promise<void> } | null;
+  /** A crashed desktop page the desktop revived, which then needs no reload. */
+  revivedOnDesktop: boolean;
+  /** Settles when the desktop reports a crashed page revived, or crashed again. */
+  desktopRevive: { readonly resolve: () => void; readonly reject: (cause: unknown) => void } | null;
   readonly profileId: string | undefined;
   readonly openerTabId: string | undefined;
 
@@ -377,10 +389,6 @@ interface ServerTab {
   desktopResize: PromiseWithResolvers<void>;
   loading: boolean;
   loadError: PreviewAutomationLoadError | undefined;
-  /** The renderer crash this page died of, or the one the page it replaced died of. */
-  crash: PreviewAutomationLoadError | undefined;
-  /** What Reload loads after a crash; the reported URL is shortened and drops data payloads. */
-  crashedUrl: string | undefined;
   closing: boolean;
   recording: Recording | null;
   initialNavigation: Promise<void> | null;
@@ -417,6 +425,7 @@ const READ_OPERATIONS: ReadonlySet<PreviewAutomationRequest["operation"]> = new 
 
 const AGENT_TAB_LIMIT = 8;
 const SERVER_TAB_LIMIT = 32;
+const CRASHED_PAGE_MESSAGE = describePreviewCrash();
 const AGENT_TAB_IDLE_MS = 30 * 60 * 1000;
 const IDLE_SWEEP_INTERVAL = "1 minute";
 
@@ -590,51 +599,6 @@ const make = Effect.gen(function* () {
     },
   });
 
-  // Playwright cannot reload a crashed page, so a fresh page takes over its tab.
-  const reopenCrashedTab = async (tab: ServerTab) => {
-    if (tab.desktop) return dropTab(tab, true);
-    const key = tabKey(tab.threadId, tab.tabId);
-    if (tabs.get(key) !== tab) return;
-    const crash = {
-      url: ServerBrowserPage.withoutDataPayload(tab.page.url()).slice(0, 2048),
-      code: -2,
-      description: "Page crashed",
-    };
-    tab.crash = crash;
-    const reopening = (async () => {
-      // The session must name the crash before a new page reads it, or it would load the URL again.
-      await runPromise(
-        manager
-          .reportStatus({
-            threadId: tab.threadId,
-            tabId: tab.tabId,
-            serverControlled: true,
-            navStatus: { _tag: "LoadFailed", title: "", ...crash },
-            canGoBack: false,
-            canGoForward: false,
-          })
-          .pipe(Effect.ignore),
-      );
-      dropTab(tab, false, true);
-      // A context that is still closing would take the new page down with it.
-      if (tab.isolatedContext) await tab.page.context().close().catch(constVoid);
-      const { sessions } = await runPromise(manager.list({ threadId: tab.threadId }));
-      const snapshot = sessions.find(
-        (session) => session.tabId === tab.tabId && session.runtime === "server",
-      );
-      if (!snapshot) {
-        throw new ServerBrowserTabNotFoundError({ threadId: tab.threadId, tabId: tab.tabId });
-      }
-      return createTab(snapshot, tab.page.url());
-    })().finally(() => {
-      pendingTabs.delete(key);
-      closedPendingTabs.delete(key);
-    });
-    // Reserved before the dead page leaves, so a lookup in between waits for its replacement.
-    pendingTabs.set(key, { agentId: tab.control.agentId, promise: reopening });
-    await reopening.catch(constVoid);
-  };
-
   const dialogStatus = (tab: ServerTab) =>
     tab.dialog
       ? {
@@ -683,12 +647,15 @@ const make = Effect.gen(function* () {
   };
 
   const report = (tab: ServerTab, navStatus: PreviewNavStatus) => {
+    // A crashed tab keeps reporting the crash until it is revived.
+    if (tab.crashed) return;
+    tab.lastStatus = navStatus;
     void tab.cdp
       .send("Page.getNavigationHistory")
       .catch(() => null)
       .then((history) => {
         // A status the dead page still had in flight must not replace the crash.
-        if (tab.crash) return;
+        if (tab.crashed) return;
         const index = history?.currentIndex ?? 0;
         const count = history?.entries.length ?? 0;
         runFork(
@@ -883,16 +850,19 @@ const make = Effect.gen(function* () {
     clearTimeout(timeout);
   };
 
-  const dropTab = (tab: ServerTab, closeSession: boolean, reopening = false) => {
+  const dropTab = (tab: ServerTab, closeSession: boolean) => {
     const key = tabKey(tab.threadId, tab.tabId);
     if (tabs.get(key) !== tab) return;
     tabs.delete(key);
     tab.closing = true;
     tab.viewerAttached?.resolve();
+    // A recovery waiting for the desktop to revive this page would otherwise wait forever.
+    tab.desktopRevive?.reject(
+      new ServerBrowserTabNotFoundError({ threadId: tab.threadId, tabId: tab.tabId }),
+    );
     clearAbortedNavigation(tab);
     // A desktop page outlives the connection unless its session closed with it.
-    const end =
-      (tab.desktop || reopening) && !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
+    const end = tab.desktop && !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
     for (const viewer of tab.viewers) viewer.push({ _tag: end });
     void tab.control.close().catch(constVoid);
     if (tab.desktop) void tab.desktop.close().catch(constVoid);
@@ -908,7 +878,7 @@ const make = Effect.gen(function* () {
       void closed.then(() => clearTimeout(forceClose));
       void page
         // A crashed page never answers `beforeunload`, so that close would not finish.
-        .close({ runBeforeUnload: tab.dialog === null && tab.crash === undefined })
+        .close({ runBeforeUnload: tab.dialog === null && !tab.crashed })
         .catch(() => page.close())
         .catch(constVoid);
       if (tab.isolatedContext) void closed.then(() => page.context().close()).catch(constVoid);
@@ -921,7 +891,222 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const desktopRenders = (snapshot: PreviewSessionSnapshot) =>
+  // A renderer crash takes only the page. The tab keeps its session, control, browser context,
+  // logs and downloads, so reviving it later keeps the cookies and sign-ins.
+  const markCrashed = (tab: ServerTab, description: string) => {
+    tab.revivedOnDesktop = false;
+    if (!tab.crashed) {
+      tab.crashed = true;
+      tab.crashedUrl = tab.page.url();
+      tab.loading = false;
+      clearAbortedNavigation(tab);
+      tab.dialog = null;
+      closeFileChooser(tab);
+      broadcastControl(tab);
+      // A crashed page streams no frames; reconnecting drops a viewer's frozen last frame
+      // for its own account of the failure.
+      for (const viewer of tab.viewers) viewer.push({ _tag: "reconnect" });
+      for (const session of tab.frameSessions.values()) void session.detach().catch(constVoid);
+      tab.frameSessions.clear();
+      void tab.recording?.encoder.close().catch(constVoid);
+      tab.recording = null;
+      // The desktop keeps its page to reload; only this connection to it goes.
+      if (tab.desktop) void tab.desktop.close().catch(constVoid);
+      else void tab.page.close().catch(constVoid);
+    }
+    const status = tab.lastStatus;
+    tab.lastStatus = {
+      _tag: "LoadFailed",
+      url: status._tag === "Idle" ? "about:blank" : status.url,
+      title: status._tag === "Idle" ? "" : status.title,
+      code: -1,
+      description,
+      crashed: true,
+    };
+    runFork(
+      manager
+        .reportStatus({
+          threadId: tab.threadId,
+          tabId: tab.tabId,
+          serverControlled: true,
+          navStatus: tab.lastStatus,
+          canGoBack: false,
+          canGoForward: false,
+        })
+        .pipe(Effect.ignore),
+    );
+  };
+
+  // A revived page is blank until its load commits, and the tab is still where it was.
+  const listedUrl = (tab: ServerTab) => {
+    const url = tab.page.url();
+    if (url !== "about:blank") return ServerBrowserPage.withoutDataPayload(url);
+    const status = tab.lastStatus;
+    return status._tag === "Idle" || status.url === "about:blank"
+      ? null
+      : ServerBrowserPage.withoutDataPayload(status.url);
+  };
+
+  const crashMessageError = (description: string) =>
+    new ServerBrowserPage.ServerBrowserOperationError({
+      tag: "PreviewAutomationExecutionError",
+      message: description,
+    });
+
+  const crashedError = (tab: ServerTab) =>
+    crashMessageError(
+      tab.lastStatus._tag === "LoadFailed" ? tab.lastStatus.description : CRASHED_PAGE_MESSAGE,
+    );
+
+  // A desktop page can crash while the server holds no connection to it, such as while its
+  // DevTools are open. It answers nothing until the desktop reloads it, so the server stays
+  // away and only reports the crash.
+  const disconnectedCrash = (threadId: string, tabId: string) =>
+    tabs.has(tabKey(threadId, tabId)) ? undefined : desktopChannel.crashOf({ threadId, tabId });
+
+  const reportDisconnectedCrash = (key: DesktopBrowserChannel.DesktopTabKey, description: string) =>
+    manager.list({ threadId: ThreadId.make(key.threadId) }).pipe(
+      Effect.flatMap(({ sessions }) => {
+        const status = sessions.find(
+          (session) => session.tabId === key.tabId && session.runtime === "server",
+        )?.navStatus;
+        if (!status) return Effect.void;
+        return manager.reportStatus({
+          threadId: ThreadId.make(key.threadId),
+          tabId: key.tabId,
+          serverControlled: true,
+          navStatus: {
+            _tag: "LoadFailed",
+            url: status._tag === "Idle" ? "about:blank" : status.url,
+            title: status._tag === "Idle" ? "" : status.title,
+            code: -1,
+            description,
+            crashed: true,
+          },
+          canGoBack: false,
+          canGoForward: false,
+        });
+      }),
+      Effect.ignore,
+    );
+
+  const disconnectedRevivals = new Map<
+    string,
+    Array<{ readonly resolve: () => void; readonly reject: (cause: unknown) => void }>
+  >();
+  const reviveDisconnectedDesktop = (key: DesktopBrowserChannel.DesktopTabKey) =>
+    new Promise<void>((resolve, reject) => {
+      const id = tabKey(key.threadId, key.tabId);
+      disconnectedRevivals.set(id, [...(disconnectedRevivals.get(id) ?? []), { resolve, reject }]);
+      runFork(desktopChannel.reload(key));
+    });
+
+  /**
+   * Opens a blank page in place of a crashed one; callers load what they want into it. A
+   * desktop page comes back already loaded, since only the desktop can reload it.
+   */
+  const reviveTab = (tab: ServerTab): Promise<void> => {
+    if (!tab.crashed) return Promise.resolve();
+    tab.recovery ??= (tab.desktop ? reviveDesktopPage(tab) : reviveServerPage(tab)).finally(() => {
+      tab.recovery = null;
+    });
+    return tab.recovery;
+  };
+
+  const reviveServerPage = async (tab: ServerTab) => {
+    // A filled page keeps the size its viewers gave it; they resize it again on reconnect.
+    const lastSize = tab.page.viewportSize();
+    const page = await tab.page.context().newPage();
+    let crashedInSetup = false;
+    page.once("crash", () => {
+      crashedInSetup = true;
+    });
+    if (tab.closing) {
+      await page.close().catch(constVoid);
+      throw new ServerBrowserTabNotFoundError({ threadId: tab.threadId, tabId: tab.tabId });
+    }
+    tab.page = page;
+    tab.cdp = await openPage(page, false);
+    tab.fileChooserIntercepted = false;
+    listenToPage(tab, page);
+    tab.crashed = false;
+    if (crashedInSetup) {
+      markCrashed(tab, CRASHED_PAGE_MESSAGE);
+      throw crashedError(tab);
+    }
+    if (tab.colorScheme !== "system") await page.emulateMedia({ colorScheme: tab.colorScheme });
+    if (tab.setting._tag === "fill" && lastSize) {
+      await page.setViewportSize(lastSize);
+      await applyZoom(tab);
+    } else await applySetting(tab, tab.setting);
+    for (const viewer of tab.viewers) viewer.push({ _tag: "reconnect" });
+  };
+
+  const reviveDesktopPage = async (tab: ServerTab) => {
+    const key = { threadId: tab.threadId, tabId: tab.tabId };
+    if (!(await desktopRenders(key))) throw crashedError(tab);
+    if (!tab.revivedOnDesktop) {
+      await new Promise<void>((resolve, reject) => {
+        tab.desktopRevive = { resolve, reject };
+        runFork(desktopChannel.reload(key));
+      }).finally(() => {
+        tab.desktopRevive = null;
+      });
+    }
+    if (tab.closing) throw new ServerBrowserTabNotFoundError(key);
+    const connected = await connectDesktop(key);
+    if (tab.closing || !tab.crashed) {
+      await connected.close();
+      if (tab.closing) throw new ServerBrowserTabNotFoundError(key);
+      return;
+    }
+    const page = connected.page;
+    tab.desktop = { close: connected.close };
+    tab.page = page;
+    tab.cdp = await openPage(page, true);
+    await page.emulateMedia({ colorScheme: tab.colorScheme === "system" ? null : tab.colorScheme });
+    listenToPage(tab, page);
+    await listenToDesktopCdp(tab, tab.cdp);
+    tab.crashed = false;
+    tab.revivedOnDesktop = false;
+    reportRevivedDesktopPage(tab);
+    for (const viewer of tab.viewers) viewer.push({ _tag: "reconnect" });
+  };
+
+  // The desktop's reload began before this connection, so its progress so far goes unseen.
+  const reportRevivedDesktopPage = (tab: ServerTab) => {
+    const url = tab.page.url();
+    if (url === "about:blank") report(tab, { _tag: "Idle" });
+    else if (url.startsWith("chrome-error://"))
+      report(tab, {
+        _tag: "LoadFailed",
+        url: tab.lastStatus._tag === "Idle" ? "about:blank" : tab.lastStatus.url,
+        title: "",
+        ...ServerBrowserPage.parseNetError("net::ERR_FAILED"),
+      });
+    else {
+      report(tab, { _tag: "Loading", url: url.slice(0, 2048), title: "" });
+      void tab.page.waitForLoadState("load").then(() => reportLoaded(tab), constVoid);
+    }
+  };
+
+  const loadRevived = async (tab: ServerTab, status: PreviewNavStatus) => {
+    // The desktop's reload already loaded it.
+    if (tab.desktop) return;
+    const url = tab.crashedUrl ?? (status._tag === "Idle" ? "about:blank" : status.url);
+    if (url === "about:blank") report(tab, { _tag: "Idle" });
+    else await tab.page.goto(url, VIEWER_NAVIGATION_OPTIONS);
+  };
+
+  const reloadCrashed = async (tab: ServerTab) => {
+    const status = tab.lastStatus;
+    await reviveTab(tab);
+    await loadRevived(tab, status);
+  };
+
+  const desktopRenders = (
+    snapshot: DesktopBrowserChannel.DesktopTabKey & { readonly headless?: boolean | undefined },
+  ) =>
     desktopChannel.available && !snapshot.headless
       ? runPromise(
           Effect.gen(function* () {
@@ -938,7 +1123,7 @@ const make = Effect.gen(function* () {
         )
       : Promise.resolve(false);
 
-  const connectDesktop = async (snapshot: PreviewSessionSnapshot) => {
+  const connectDesktop = async (snapshot: DesktopBrowserChannel.DesktopTabKey) => {
     const scope = await runPromise(Scope.make());
     try {
       const endpoint = await runPromise(
@@ -960,60 +1145,8 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const createTab = async (
-    snapshot: PreviewSessionSnapshot,
-    crashedUrl?: string,
-  ): Promise<ServerTab> => {
-    const opened: Array<() => Promise<void>> = [];
-    try {
-      return await setUpTab(snapshot, opened, crashedUrl);
-    } catch (cause) {
-      // An unpublished tab is in no list, so nothing else would ever close it.
-      for (const close of opened.reverse()) await close().catch(constVoid);
-      throw cause;
-    }
-  };
-
-  const setUpTab = async (
-    snapshot: PreviewSessionSnapshot,
-    opened: Array<() => Promise<void>>,
-    crashedUrl: string | undefined,
-  ): Promise<ServerTab> => {
-    const adopted = adoptedPages.get(tabKey(snapshot.threadId, snapshot.tabId));
-    adoptedPages.delete(tabKey(snapshot.threadId, snapshot.tabId));
-    const desktop =
-      adopted === undefined && (await desktopRenders(snapshot))
-        ? await connectDesktop(snapshot)
-        : null;
-    if (desktop) opened.push(desktop.close);
-    // Attaching over CDP emulates a light scheme; a tab on System follows the desktop's.
-    if (desktop) await desktop.page.emulateMedia({ colorScheme: null });
-    // Otherwise a desktop that attaches late, or has no channel to draw it, shows its own page.
-    if (!desktop) {
-      await runPromise(
-        manager
-          .markHeadless({ threadId: ThreadId.make(snapshot.threadId), tabId: snapshot.tabId })
-          .pipe(Effect.ignore),
-      );
-    }
-    const isolatedContext =
-      adopted === undefined &&
-      desktop === null &&
-      ((snapshot.automationOwner !== undefined && snapshot.profileId === undefined) ||
-        snapshot.profileId === INCOGNITO_BROWSER_PROFILE_ID);
-    const context =
-      adopted?.page.context() ??
-      desktop?.page.context() ??
-      (await contexts.contextFor(
-        snapshot.profileId ?? "default",
-        isolatedContext ? tabKey(snapshot.threadId, snapshot.tabId) : undefined,
-      ));
-    if (isolatedContext) opened.push(() => context.close());
-    if (adopted?.page.isClosed()) throw new Error("The popup closed before it opened.");
-    if (!desktop) await prepareContext(context);
-    const page = adopted?.page ?? desktop?.page ?? (await context.newPage());
-    if (!desktop) opened.push(() => page.close());
-    const cdp = await context.newCDPSession(page);
+  const openPage = async (page: Page, desktop: boolean) => {
+    const cdp = await page.context().newCDPSession(page);
     await installPdfDocumentNavigation(cdp);
     // The desktop's page is already a normal browser. A popup's first request
     // went out before it became a tab; everything after presents as Chrome.
@@ -1021,98 +1154,33 @@ const make = Effect.gen(function* () {
     if (!desktop) await recordCopies(cdp);
     page.setDefaultTimeout(NAVIGATION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    const control = new SessionControl(snapshot.automationOwner ?? null, () =>
-      ServerBrowserPage.invalidateRefs(page),
-    );
-    let pendingFileChooserOffer = Promise.resolve();
-    const tab: ServerTab = {
-      threadId: ThreadId.make(snapshot.threadId),
-      tabId: snapshot.tabId,
-      page,
-      cdp,
-      frameSessions: new Map(),
-      copyReads: Promise.resolve(),
-      copyKeyedUntil: 0,
-      createdAt: Date.now(),
-      usedAt: Date.now(),
-      viewers: new Set(),
-      viewerAttached: null,
-      consoleEntries: [],
-      networkEntries: [],
-      actionTimeline: [],
-      control,
-      agentOperating: false,
-      fileChooserIntercepted: false,
-      onFileChooser: (chooser) => {
-        pendingFileChooserOffer = pendingFileChooserOffer
-          .then(() => offerFileChooser(tab, chooser))
-          .catch(constVoid);
-      },
-      isolatedContext,
-      desktop: desktop === null ? null : { close: desktop.close },
-      profileId: snapshot.profileId,
-      openerTabId: adopted?.openerTabId,
-      downloads: [],
-      fileChooser: null,
-      dialog: null,
-      setting: snapshot.viewport ?? FILL_PREVIEW_VIEWPORT,
-      colorScheme: "system",
-      zoomFactor: 1,
-      desktopViewport: null,
-      desktopViewportRead: Promise.resolve(null),
-      desktopViewportNext: null,
-      desktopViewportStale: true,
-      desktopViewportChanges: 0,
-      desktopResize: Promise.withResolvers<void>(),
-      loading: false,
-      loadError: undefined,
-      // The page a crash left behind is blank; the session still names what crashed.
-      crash:
-        !desktop && !adopted && snapshot.navStatus._tag === "LoadFailed"
-          ? {
-              url: snapshot.navStatus.url,
-              code: snapshot.navStatus.code,
-              description: snapshot.navStatus.description,
-            }
-          : undefined,
-      crashedUrl,
-      closing: false,
-      recording: null,
-      recordingStart: null,
-      initialNavigation: null,
-      pendingInitialRequestUrl: null,
-      navigationGeneration: 0,
-      stoppedGeneration: null,
-      abortedNavigation: null,
-      captureLock: Promise.resolve(),
-      capturing: 0,
+    return cdp;
+  };
+
+  const listenToDesktopCdp = async (tab: ServerTab, cdp: CDPSession) => {
+    // The desktop resizes and zooms its webview itself; viewers map input with the new size.
+    const remeasure = () => {
+      tab.desktopViewportStale = true;
+      tab.desktopViewportChanges += 1;
+      if (tab.viewers.size > 0) return broadcastViewport(tab).catch(constVoid);
     };
-    if (!desktop) {
-      await page.setViewportSize(fixedViewportSize(tab.setting) ?? UNATTACHED_FILL_VIEWPORT);
-    }
-    await applyRendering(tab, snapshot);
-    if (desktop) {
-      // The desktop resizes and zooms its webview itself; viewers map input with the new size.
-      const remeasure = () => {
-        tab.desktopViewportStale = true;
-        tab.desktopViewportChanges += 1;
-        if (tab.viewers.size > 0) return broadcastViewport(tab).catch(constVoid);
-      };
-      cdp.on("Page.frameResized", () => {
-        const drawn = tab.desktopResize;
-        tab.desktopResize = Promise.withResolvers();
-        drawn.resolve();
-        return remeasure();
-      });
-      // A read a navigation broke has a fresh page to measure.
-      cdp.on("Page.loadEventFired", remeasure);
-      // Closing a dialog resizes nothing, and the host can close it without us.
-      cdp.on("Page.javascriptDialogClosed", () => {
-        tab.dialog = null;
-        return remeasure();
-      });
-      await cdp.send("Page.enable");
-    }
+    cdp.on("Page.frameResized", () => {
+      const drawn = tab.desktopResize;
+      tab.desktopResize = Promise.withResolvers();
+      drawn.resolve();
+      return remeasure();
+    });
+    // A read a navigation broke has a fresh page to measure.
+    cdp.on("Page.loadEventFired", remeasure);
+    // Closing a dialog resizes nothing, and the host can close it without us.
+    cdp.on("Page.javascriptDialogClosed", () => {
+      tab.dialog = null;
+      return remeasure();
+    });
+    await cdp.send("Page.enable");
+  };
+
+  const listenToPage = (tab: ServerTab, page: Page) => {
     const isMainNavigation = (request: { isNavigationRequest(): boolean; frame(): unknown }) =>
       request.isNavigationRequest() && request.frame() === page.mainFrame();
     const navigationGenerations = new WeakMap<object, number>();
@@ -1127,7 +1195,6 @@ const make = Effect.gen(function* () {
       clearAbortedNavigation(tab);
       tab.loading = true;
       tab.loadError = undefined;
-      tab.crash = undefined;
       tab.crashedUrl = undefined;
       if (stoppedInitialRequest) {
         tab.stoppedGeneration = tab.navigationGeneration;
@@ -1154,10 +1221,8 @@ const make = Effect.gen(function* () {
       }
       // Same-document navigations (SPA routes) fire no load event.
       if (frame === page.mainFrame() && !tab.loading) void reportLoaded(tab);
-      if (!desktop) void recordFrameCopies(tab, frame);
+      if (!tab.desktop) void recordFrameCopies(tab, frame);
     });
-    // An adopted popup's frames may have loaded before the tab listened.
-    if (adopted) for (const frame of page.frames()) void recordFrameCopies(tab, frame);
     page.on("requestfailed", (request) => {
       const errorText = request.failure()?.errorText ?? "";
       pushBounded(tab.networkEntries, {
@@ -1223,21 +1288,154 @@ const make = Effect.gen(function* () {
       tab.dialog = dialog;
       broadcastControl(tab);
     });
-    page.on("download", (download) => void saveDownload(tab, download));
+    page.on("download", (download) => void saveDownload(tab, page, download));
     updateFileChooserInterception(tab);
     // Popups become tabs and keep `window.opener`, so sign-in popups can report back.
     page.on("popup", (popup) => void adoptPopup(tab, popup));
+    page.on("close", () => {
+      if (tab.page === page && !tab.crashed) dropTab(tab, true);
+    });
+    page.on("crash", () => {
+      // The desktop reports its own page's crashes, with why.
+      if (tab.page !== page || tab.crashed || tab.closing || tab.desktop) return;
+      markCrashed(tab, CRASHED_PAGE_MESSAGE);
+    });
+  };
+
+  const createTab = async (snapshot: PreviewSessionSnapshot): Promise<ServerTab> => {
+    const opened: Array<() => Promise<void>> = [];
+    try {
+      return await setUpTab(snapshot, opened);
+    } catch (cause) {
+      // An unpublished tab is in no list, so nothing else would ever close it.
+      for (const close of opened.reverse()) await close().catch(constVoid);
+      throw cause;
+    }
+  };
+
+  const setUpTab = async (
+    snapshot: PreviewSessionSnapshot,
+    opened: Array<() => Promise<void>>,
+  ): Promise<ServerTab> => {
+    const adopted = adoptedPages.get(tabKey(snapshot.threadId, snapshot.tabId));
+    adoptedPages.delete(tabKey(snapshot.threadId, snapshot.tabId));
+    const onDesktop = adopted === undefined && (await desktopRenders(snapshot));
+    const desktopCrash = onDesktop ? desktopChannel.crashOf(snapshot) : undefined;
+    if (desktopCrash !== undefined) throw crashMessageError(desktopCrash);
+    const desktop = onDesktop ? await connectDesktop(snapshot) : null;
+    if (desktop) opened.push(desktop.close);
+    // Attaching over CDP emulates a light scheme; a tab on System follows the desktop's.
+    if (desktop) await desktop.page.emulateMedia({ colorScheme: null });
+    // Otherwise a desktop that attaches late, or has no channel to draw it, shows its own page.
+    if (!desktop) {
+      await runPromise(
+        manager
+          .markHeadless({ threadId: ThreadId.make(snapshot.threadId), tabId: snapshot.tabId })
+          .pipe(Effect.ignore),
+      );
+    }
+    const isolatedContext =
+      adopted === undefined &&
+      desktop === null &&
+      ((snapshot.automationOwner !== undefined && snapshot.profileId === undefined) ||
+        snapshot.profileId === INCOGNITO_BROWSER_PROFILE_ID);
+    const context =
+      adopted?.page.context() ??
+      desktop?.page.context() ??
+      (await contexts.contextFor(
+        snapshot.profileId ?? "default",
+        isolatedContext ? tabKey(snapshot.threadId, snapshot.tabId) : undefined,
+      ));
+    if (isolatedContext) opened.push(() => context.close());
+    if (adopted?.page.isClosed()) throw new Error("The popup closed before it opened.");
+    if (!desktop) await prepareContext(context);
+    const page = adopted?.page ?? desktop?.page ?? (await context.newPage());
+    if (!desktop) opened.push(() => page.close());
+    const cdp = await openPage(page, desktop !== null);
+    const control = new SessionControl(snapshot.automationOwner ?? null, () =>
+      ServerBrowserPage.invalidateRefs(tab.page),
+    );
+    let pendingFileChooserOffer = Promise.resolve();
+    const tab: ServerTab = {
+      threadId: ThreadId.make(snapshot.threadId),
+      tabId: snapshot.tabId,
+      page,
+      cdp,
+      crashed: false,
+      recovery: null,
+      lastStatus: snapshot.navStatus,
+      crashedUrl: undefined,
+      frameSessions: new Map(),
+      copyReads: Promise.resolve(),
+      copyKeyedUntil: 0,
+      createdAt: Date.now(),
+      usedAt: Date.now(),
+      viewers: new Set(),
+      viewerAttached: null,
+      consoleEntries: [],
+      networkEntries: [],
+      actionTimeline: [],
+      control,
+      agentOperating: false,
+      fileChooserIntercepted: false,
+      onFileChooser: (chooser) => {
+        pendingFileChooserOffer = pendingFileChooserOffer
+          .then(() => offerFileChooser(tab, chooser))
+          .catch(constVoid);
+      },
+      isolatedContext,
+      desktop: desktop === null ? null : { close: desktop.close },
+      revivedOnDesktop: false,
+      desktopRevive: null,
+      profileId: snapshot.profileId,
+      openerTabId: adopted?.openerTabId,
+      downloads: [],
+      fileChooser: null,
+      dialog: null,
+      setting: snapshot.viewport ?? FILL_PREVIEW_VIEWPORT,
+      colorScheme: "system",
+      zoomFactor: 1,
+      desktopViewport: null,
+      desktopViewportRead: Promise.resolve(null),
+      desktopViewportNext: null,
+      desktopViewportStale: true,
+      desktopViewportChanges: 0,
+      desktopResize: Promise.withResolvers<void>(),
+      loading: false,
+      loadError: undefined,
+      closing: false,
+      recording: null,
+      recordingStart: null,
+      initialNavigation: null,
+      pendingInitialRequestUrl: null,
+      navigationGeneration: 0,
+      stoppedGeneration: null,
+      abortedNavigation: null,
+      captureLock: Promise.resolve(),
+      capturing: 0,
+    };
+    if (!desktop) {
+      await page.setViewportSize(fixedViewportSize(tab.setting) ?? UNATTACHED_FILL_VIEWPORT);
+    }
+    await applyRendering(tab, snapshot);
+    listenToPage(tab, page);
+    if (desktop) await listenToDesktopCdp(tab, cdp);
+    // An adopted popup's frames may have loaded before the tab listened.
+    if (adopted) for (const frame of page.frames()) void recordFrameCopies(tab, frame);
     const key = tabKey(tab.threadId, tab.tabId);
     if (closedPendingTabs.delete(key)) {
       await control.close().catch(constVoid);
       throw new ServerBrowserTabNotFoundError({ threadId: tab.threadId, tabId: tab.tabId });
     }
-    page.on("close", () => dropTab(tab, true));
-    page.on("crash", () => reopenCrashedTab(tab));
     tabs.set(key, tab);
     reportLiveTabs();
+    // A crash the desktop reported while this connected found no tab to mark.
+    const pendingCrash = desktop ? desktopChannel.crashOf(snapshot) : undefined;
+    if (pendingCrash !== undefined) markCrashed(tab, pendingCrash);
+    else if (desktop && snapshot.navStatus._tag === "LoadFailed" && snapshot.navStatus.crashed)
+      reportRevivedDesktopPage(tab);
     // A desktop page navigates on its own and can finish loading before these listeners attach.
-    if (desktop) void page.waitForLoadState("load").then(() => reportLoaded(tab), constVoid);
+    else if (desktop) void page.waitForLoadState("load").then(() => reportLoaded(tab), constVoid);
     // Existing desktop and popup PDFs can start loading before interception attaches.
     if (
       snapshot.navStatus._tag === "Loading" &&
@@ -1314,7 +1512,9 @@ const make = Effect.gen(function* () {
     });
   };
 
-  const saveDownload = async (tab: ServerTab, download: Download) => {
+  const saveDownload = async (tab: ServerTab, page: Page, download: Download) => {
+    // A download can finish after its page crashed, or after a revive replaced it.
+    const pageLive = () => !tab.closing && !tab.crashed && tab.page === page;
     const id = NodeCrypto.randomUUID();
     const path = NodePath.join(downloadDir(tab), id);
     const navigation =
@@ -1330,7 +1530,7 @@ const make = Effect.gen(function* () {
       // saveAs copies with the process umask; a download should stay readable by its owner only.
       await NodeFSP.chmod(path, 0o600);
       const { size } = await NodeFSP.stat(path);
-      if (tab.closing || size > DOWNLOAD_MAX_BYTES) {
+      if (!pageLive() || size > DOWNLOAD_MAX_BYTES) {
         await NodeFSP.rm(path, { force: true });
         return;
       }
@@ -1361,7 +1561,7 @@ const make = Effect.gen(function* () {
       await NodeFSP.rm(path, { force: true }).catch(constVoid);
       runFork(Effect.logWarning("server preview download failed", { cause }));
     } finally {
-      if (navigation !== null && !tab.closing) {
+      if (navigation !== null && pageLive()) {
         settleAbortedNavigation(tab, navigation, download.url(), offered);
       }
       // saveAs copies the artifact; cached profile contexts otherwise retain the original.
@@ -1397,6 +1597,7 @@ const make = Effect.gen(function* () {
         .element()
         .getAttribute("accept")
         .catch(() => null)) ?? "";
+    if (tab.crashed) return;
     if (!(await isFileChooserCurrent(chooser))) return;
     if (previous) closeFileChooser(tab);
     tab.fileChooser = {
@@ -1896,7 +2097,6 @@ const make = Effect.gen(function* () {
   };
 
   const loadErrorOf = (tab: ServerTab): PreviewAutomationLoadError | undefined => {
-    if (tab.crash) return tab.crash;
     if (!tab.page.url().startsWith("chrome-error://")) return undefined;
     // A desktop failure from before CDP attached is superseded by any navigation we observe.
     if (tab.loadError || !tab.desktop || tab.navigationGeneration > 0) return tab.loadError;
@@ -1948,6 +2148,7 @@ const make = Effect.gen(function* () {
         ...profileStatus(),
       };
     }
+    if (tab.crashed) throw crashedError(tab);
     const url = ServerBrowserPage.withoutDataPayload(tab.page.url());
     const loadError = loadErrorOf(tab);
     const statusUrl = loadError?.url ?? (url === "about:blank" ? null : url);
@@ -1986,11 +2187,7 @@ const make = Effect.gen(function* () {
         .filter((candidate) => candidate.threadId === tab.threadId)
         .map((candidate) => ({
           tabId: candidate.tabId,
-          url:
-            candidate.page.url() === "about:blank"
-              ? null
-              : (loadErrorOf(candidate)?.url ??
-                ServerBrowserPage.withoutDataPayload(candidate.page.url())),
+          url: loadErrorOf(candidate)?.url ?? listedUrl(candidate),
           ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
           owner: tabOwner(candidate),
           ownedByCaller: candidate.control.agentId === agentSessionId,
@@ -2023,6 +2220,8 @@ const make = Effect.gen(function* () {
     readiness: "load" | "domContentLoaded" | "none",
     timeout: number,
   ) => {
+    // A recovery already under way finishes first, so this navigation lands after it.
+    await reviveTab(tab);
     tab.pendingInitialRequestUrl = null;
     const startedAt = performance.now();
     const navigation = tab.page.goto(url, { timeout, waitUntil: "commit" });
@@ -2121,7 +2320,8 @@ const make = Effect.gen(function* () {
           framesInFlight.add(delivered);
         });
         await opened.send("Page.startScreencast", RECORDING_SCREENCAST);
-        if (tab.closing) throw new Error("The tab closed while the recording started.");
+        if (tab.closing || tab.crashed)
+          throw new Error("The tab closed while the recording started.");
         const recording: Recording = {
           encoder,
           session: opened,
@@ -2336,6 +2536,13 @@ const make = Effect.gen(function* () {
           "Multiple tabs belong to this agent session. Pass a tabId from preview_open or preview_status tabs.",
         reason: "tabRequired",
       });
+    const crash =
+      request.tabId === undefined ? undefined : disconnectedCrash(request.threadId, request.tabId);
+    if (crash !== undefined) {
+      // Navigating revives a crashed tab; nothing else has a page to act on.
+      if (request.operation !== "navigate") throw crashMessageError(crash);
+      await reviveDisconnectedDesktop({ threadId: request.threadId, tabId: request.tabId! });
+    }
     const tab =
       request.tabId === undefined
         ? latestThreadTab(request.threadId, request.agentSessionId)
@@ -2374,13 +2581,19 @@ const make = Effect.gen(function* () {
   ): Promise<unknown> => {
     const input = request.input;
     switch (request.operation) {
-      case "status":
+      case "status": {
+        const crash =
+          request.tabId === undefined
+            ? undefined
+            : disconnectedCrash(request.threadId, request.tabId);
+        if (crash !== undefined) throw crashMessageError(crash);
         return statusWithTitle(
           request.tabId === undefined
             ? latestThreadTab(request.threadId, request.agentSessionId)
             : tabs.get(tabKey(request.threadId, request.tabId)),
           request.agentSessionId,
         );
+      }
       case "open": {
         if (!request.agentSessionId)
           throw new BrowserControlInterrupted({
@@ -2624,6 +2837,8 @@ const make = Effect.gen(function* () {
     deadlineMs: number,
   ) => {
     const input = request.input;
+    // Navigating revives a crashed tab; nothing else has a page to act on.
+    if (tab.crashed && request.operation !== "navigate") throw crashedError(tab);
     switch (request.operation) {
       case "navigate": {
         const navigateInput = input as PreviewAutomationNavigateInput;
@@ -2789,6 +3004,13 @@ const make = Effect.gen(function* () {
       const key = tabKey(event.threadId, event.tabId);
       const tab = tabs.get(key);
       if (event.type === "closed" && !tab && pendingTabs.has(key)) closedPendingTabs.add(key);
+      if (event.type === "closed") {
+        for (const revival of disconnectedRevivals.get(key) ?? [])
+          revival.reject(
+            new ServerBrowserTabNotFoundError({ threadId: event.threadId, tabId: event.tabId }),
+          );
+        disconnectedRevivals.delete(key);
+      }
       if (!tab) return;
       if (event.type === "closed") {
         closedSessions.add(key);
@@ -2797,10 +3019,22 @@ const make = Effect.gen(function* () {
         return;
       }
       if (event.type === "resized") {
+        if (tab.crashed) {
+          // The revived page takes these from the tab.
+          tab.setting = event.snapshot.viewport ?? FILL_PREVIEW_VIEWPORT;
+          tab.colorScheme = event.snapshot.colorScheme ?? "system";
+          tab.zoomFactor = event.snapshot.zoomFactor ?? 1;
+          // A hard reload or a clear is a reload as well, so it revives the page.
+          if (!event.request) return;
+        }
         // Desktop tabs only record the setting, so status need not wait behind an agent action.
         if (tab.desktop) tab.setting = event.snapshot.viewport ?? FILL_PREVIEW_VIEWPORT;
         await tab.control
           .system(async () => {
+            // Revives to a blank page, so the clears land before the one load below.
+            const status = tab.lastStatus;
+            const reviving = tab.crashed;
+            if (reviving) await reviveTab(tab);
             if (
               !viewportSettingsEqual(event.snapshot.viewport ?? FILL_PREVIEW_VIEWPORT, tab.setting)
             ) {
@@ -2810,7 +3044,8 @@ const make = Effect.gen(function* () {
             const request = event.request;
             if (request?.clear === "cookies") await tab.cdp.send("Network.clearBrowserCookies");
             if (request?.clear === "cache") await tab.cdp.send("Network.clearBrowserCache");
-            if (request?.hardReload) {
+            if (reviving) await loadRevived(tab, status);
+            else if (request?.hardReload) {
               tab.pendingInitialRequestUrl = null;
               await tab.cdp.send("Page.reload", { ignoreCache: true });
             }
@@ -2841,6 +3076,17 @@ const make = Effect.gen(function* () {
     viewer.requestedSize = null;
   };
 
+  // A reload or navigation is all a crashed page answers, and either revives it.
+  const reviveForViewer = (tab: ServerTab, message: Record<string, unknown>) => {
+    if (message.type === "reload") tab.control.trackUntilHandoff(reloadCrashed(tab));
+    else if (message.type === "navigate" && typeof message.url === "string") {
+      const url = normalizePreviewUrl(message.url);
+      tab.control.trackUntilHandoff(
+        reviveTab(tab).then(() => tab.page.goto(url, VIEWER_NAVIGATION_OPTIONS)),
+      );
+    }
+  };
+
   const dispatchViewerInput = async (
     tab: ServerTab,
     session: CDPSession,
@@ -2849,6 +3095,7 @@ const make = Effect.gen(function* () {
   ) => {
     const message = asRecord(raw);
     if (!message) return;
+    if (tab.crashed) return reviveForViewer(tab, message);
     const modifiers = modifiersOf(message);
     switch (message.type) {
       case "mouse": {
@@ -2977,12 +3224,6 @@ const make = Effect.gen(function* () {
       }
       case "reload":
         tab.pendingInitialRequestUrl = null;
-        if (tab.crash) {
-          tab.control.trackUntilHandoff(
-            tab.page.goto(tab.crashedUrl ?? tab.crash.url, VIEWER_NAVIGATION_OPTIONS),
-          );
-          return;
-        }
         if (message.ignoreCache === true) {
           await session.send("Page.reload", { ignoreCache: true });
           return;
@@ -3002,6 +3243,35 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const registerViewer = Effect.fn("ServerBrowser.registerViewer")(function* (
+    tab: ServerTab,
+    viewer: ViewerState,
+    session?: CDPSession,
+  ) {
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        tab.viewers.add(viewer);
+        tab.viewerAttached?.resolve();
+        tab.viewerAttached = null;
+        reportLiveTabs();
+      }),
+      () =>
+        Effect.promise(async () => {
+          await tab.control.disconnect(
+            viewer.id,
+            session && (() => releaseViewerInput(viewer, session)),
+          );
+          tab.viewers.delete(viewer);
+          broadcastControl(tab);
+          reportLiveTabs();
+        }),
+    );
+    if (viewer.canOperate && tab.control.agentId === null && tab.control.controller === null) {
+      yield* Effect.promise(() => tab.control.take(viewer.id));
+    }
+    broadcastControl(tab);
+  });
+
   const attachViewer: ServerBrowser["Service"]["attachViewer"] = Effect.fn(
     "ServerBrowser.attachViewer",
   )(function* (input) {
@@ -3010,6 +3280,39 @@ const make = Effect.gen(function* () {
       capacity: VIEWER_OUTPUT_LIMIT,
       strategy: "dropping",
     });
+    if (tab.crashed) {
+      // A crashed page streams nothing, but its viewer can still take control and revive it.
+      const viewer: ViewerState = {
+        id: NodeCrypto.randomUUID(),
+        canOperate: input.canOperate,
+        pressedKeys: new Map(),
+        pressedButtons: new Map(),
+        push: (next) => void Queue.offerUnsafe(output, next),
+        pause: async () => {},
+        resume: async () => {},
+        scrolledAt: 0,
+        requestedSize: null,
+      };
+      yield* registerViewer(tab, viewer);
+      return {
+        output,
+        input: (raw: unknown) =>
+          Effect.promise(async () => {
+            const message = asRecord(raw);
+            if (!viewer.canOperate || !message) return;
+            await (
+              message.type === "takeControl"
+                ? tab.control.take(viewer.id)
+                : message.type === "releaseControl"
+                  ? tab.control.release(viewer.id)
+                  : tab.control.human(viewer.id, async () => {
+                      if (tab.crashed) reviveForViewer(tab, message);
+                    })
+            ).catch(constVoid);
+            broadcastControl(tab);
+          }),
+      } satisfies ServerBrowserViewer;
+    }
     const session = yield* Effect.acquireRelease(
       Effect.tryPromise({
         try: () => tab.page.context().newCDPSession(tab.page),
@@ -3086,25 +3389,7 @@ const make = Effect.gen(function* () {
       scrolledAt: 0,
       requestedSize: null,
     };
-    yield* Effect.acquireRelease(
-      Effect.sync(() => {
-        tab.viewers.add(viewer);
-        tab.viewerAttached?.resolve();
-        tab.viewerAttached = null;
-        reportLiveTabs();
-      }),
-      () =>
-        Effect.promise(async () => {
-          await tab.control.disconnect(viewer.id, () => releaseViewerInput(viewer, session));
-          tab.viewers.delete(viewer);
-          broadcastControl(tab);
-          reportLiveTabs();
-        }),
-    );
-    if (input.canOperate && tab.control.agentId === null && tab.control.controller === null) {
-      yield* Effect.promise(() => tab.control.take(viewer.id));
-    }
-    broadcastControl(tab);
+    yield* registerViewer(tab, viewer, session);
     pushFileChooser(tab);
     const pushStill = async () => {
       const data = await withCaptureLock(tab, async () => {
@@ -3265,7 +3550,9 @@ const make = Effect.gen(function* () {
     Stream.runForEach((key) =>
       Effect.sync(() => {
         const tab = tabs.get(tabKey(key.threadId, key.tabId));
-        if (tab?.desktop) dropTab(tab, false);
+        if (!tab?.desktop) return;
+        // A crashed page stays listed; attaching again replays whether it still is.
+        if (!tab.crashed) dropTab(tab, false);
       }),
     ),
     Effect.forkScoped,
@@ -3275,20 +3562,55 @@ const make = Effect.gen(function* () {
     Stream.runForEach((change) => desktopChannel.turn(change.threadId, change.active)),
     Effect.forkScoped,
   );
-  // Reconnect returned pages immediately so all clients keep receiving URL and title changes.
-  yield* desktopChannel.attached.pipe(
-    Stream.runForEach((key) =>
-      Effect.gen(function* () {
-        if (tabs.has(tabKey(key.threadId, key.tabId))) return;
-        const { sessions } = yield* manager.list({ threadId: ThreadId.make(key.threadId) });
-        const snapshot = sessions.find(
-          (session) => session.tabId === key.tabId && session.runtime === "server",
-        );
-        if (snapshot) yield* Effect.promise(() => ensureTab(snapshot).catch(constVoid));
-      }).pipe(Effect.ignore),
+  // The page came back, for example after its DevTools closed or a reload revived it. Reconnect
+  // now rather than on the next viewer or agent, or the tab's URL and title stop reaching every
+  // client in the meantime. A crashed page answers nothing until reloaded.
+  const connectAttached = Effect.fn("ServerBrowser.connectAttached")(
+    function* (key: DesktopBrowserChannel.DesktopTabKey) {
+      if (tabs.has(tabKey(key.threadId, key.tabId))) return;
+      if (desktopChannel.crashOf(key) !== undefined) return;
+      if (!(yield* desktopChannel.isAttached(key))) return;
+      const { sessions } = yield* manager.list({ threadId: ThreadId.make(key.threadId) });
+      const snapshot = sessions.find(
+        (session) => session.tabId === key.tabId && session.runtime === "server",
+      );
+      if (snapshot) yield* Effect.promise(() => ensureTab(snapshot).catch(constVoid));
+    },
+    (effect) => effect.pipe(Effect.ignore),
+  );
+  // Only the desktop sees its page's renderer die, and why. A reload revives it, whether a
+  // person started it there or recovering the tab here did.
+  yield* desktopChannel.crashes.pipe(
+    Stream.runForEach(({ key, message }) =>
+      Effect.sync(() => {
+        const id = tabKey(key.threadId, key.tabId);
+        const tab = tabs.get(id);
+        if (!tab) {
+          const waiting = disconnectedRevivals.get(id) ?? [];
+          disconnectedRevivals.delete(id);
+          if (message !== null) {
+            for (const revival of waiting) revival.reject(crashMessageError(message));
+            runFork(reportDisconnectedCrash(key, message));
+          } else {
+            for (const revival of waiting) revival.resolve();
+            runFork(connectAttached(key));
+          }
+          return;
+        }
+        if (!tab.desktop || tab.closing) return;
+        if (message !== null) {
+          markCrashed(tab, message);
+          tab.desktopRevive?.reject(crashedError(tab));
+        } else if (tab.crashed) {
+          tab.revivedOnDesktop = true;
+          if (tab.desktopRevive) tab.desktopRevive.resolve();
+          else void reviveTab(tab).catch(constVoid);
+        }
+      }),
     ),
     Effect.forkScoped,
   );
+  yield* desktopChannel.attached.pipe(Stream.runForEach(connectAttached), Effect.forkScoped);
   yield* Effect.sync(closeIdleAgentTabs).pipe(
     Effect.repeat(Schedule.spaced(IDLE_SWEEP_INTERVAL)),
     Effect.forkScoped,

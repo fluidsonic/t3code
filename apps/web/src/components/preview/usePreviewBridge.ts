@@ -178,6 +178,7 @@ export function buildReportInput(args: {
           title: status.title,
           code: status.code,
           description: status.description,
+          ...(status.crashed ? { crashed: true as const } : {}),
         },
       },
       lastReportedUrl: status.url,
