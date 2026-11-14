@@ -5,6 +5,7 @@ import type {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import { isLiveUserShellCommand } from "@t3tools/shared/orchestrationV2Timeline";
 import * as Schema from "effect/Schema";
 
 /**
@@ -732,6 +733,14 @@ export function buildBoundedThreadProjection(input: {
   }
   for (const item of dependencyTurnItems) {
     turnItemById.set(String(item.id), item);
+  }
+  // Undelivered commands are composer state outside the timeline window.
+  if (input.projection.thread.hasShellCommands === true) {
+    for (const item of controlProjection.turnItems) {
+      if (isLiveUserShellCommand(item, controlProjection.runs)) {
+        turnItemById.set(String(item.id), item);
+      }
+    }
   }
   const turnItems = [...turnItemById.values()];
 

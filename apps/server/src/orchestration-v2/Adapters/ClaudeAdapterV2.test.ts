@@ -85,6 +85,7 @@ import * as PortScanner from "../../preview/PortScanner.ts";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { WorkflowAgentTranscriptReadObserver } from "../workflowAgentTranscript.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import { T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -754,7 +755,11 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
 });
 
 describe("ClaudeAdapterV2 device instructions", () => {
-  const options = (input: { readonly mcp: boolean; readonly deviceToolsAvailable: boolean }) =>
+  const options = (input: {
+    readonly mcp: boolean;
+    readonly deviceToolsAvailable: boolean;
+    readonly hooks?: ClaudeSdk.Options["hooks"];
+  }) =>
     ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: {
         instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -767,6 +772,7 @@ describe("ClaudeAdapterV2 device instructions", () => {
         ? { mcpServers: { "t3-code": { type: "http" as const, url: "http://127.0.0.1/mcp" } } }
         : {}),
       deviceToolsAvailable: input.deviceToolsAvailable,
+      ...(input.hooks === undefined ? {} : { hooks: input.hooks }),
       environment: {},
     });
   const append = (input: { readonly mcp: boolean; readonly deviceToolsAvailable: boolean }) =>
@@ -817,6 +823,13 @@ describe("ClaudeAdapterV2 device instructions", () => {
     ]);
     assert.deepEqual(await subagentContext({ mcp: true, deviceToolsAvailable: false }), []);
     assert.deepEqual(await subagentContext({ mcp: false, deviceToolsAvailable: true }), []);
+  });
+
+  it("keeps the session's turn-hold hooks beside the subagent device hook", () => {
+    const stop = [{ hooks: [async () => ({})] }];
+    const hooks = options({ mcp: true, deviceToolsAvailable: true, hooks: { Stop: stop } }).hooks;
+    assert.strictEqual(hooks?.Stop, stop);
+    assert.lengthOf(hooks?.SubagentStart ?? [], 1);
   });
 });
 
@@ -2010,6 +2023,107 @@ describe("ClaudeAdapterV2 resume compaction", () => {
         ),
       ),
     ),
+  );
+});
+
+describe("ClaudeAdapterV2 turn hold", () => {
+  it.effect.each([
+    { enableShellCommands: false, hooks: false },
+    { enableShellCommands: true, hooks: true },
+  ] as const)(
+    "registers the turn-hold hooks only with shell commands on ($enableShellCommands)",
+    ({ enableShellCommands, hooks }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-claude-turn-hold-",
+          });
+          let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+            instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+            settings: DEFAULT_CLAUDE_SETTINGS,
+            environment: {},
+            attachmentsDir,
+            fileSystem,
+            path: yield* Path.Path,
+            random: yield* SecureRandom.SecureRandom,
+            idAllocator,
+            queryRunner: {
+              allocateSessionId: Effect.succeed("native-thread-claude-turn-hold"),
+              open: (input) =>
+                Effect.sync(() => {
+                  openedOptions = input.options;
+                  return {
+                    messages: Stream.never,
+                    offer: () => Effect.void,
+                    setModel: () => Effect.void,
+                    applyFlagSettings: () => Effect.void,
+                    setPermissionMode: () => Effect.void,
+                    backgroundTasks: () => Effect.succeed(false),
+                    mcpServerStatus: Effect.succeed([]),
+                    readMcpResource: () => Effect.die("unexpected MCP resource read"),
+                    callMcpTool: () => Effect.die("unexpected MCP tool call"),
+                    listPermissionRules: Effect.die("unexpected permission rules read"),
+                    stopTask: () => Effect.void,
+                    interrupt: Effect.void,
+                    close: Effect.void,
+                  };
+                }),
+              forkSession: () => Effect.die("unused"),
+              subagentModel: () => Effect.succeed(null),
+              subagentLaunchToolUseId: () => Effect.succeed(null),
+              assertComplete: Effect.void,
+            },
+          });
+          const threadId = ThreadId.make("thread-claude-turn-hold");
+          const runtime = yield* adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("provider-session-claude-turn-hold"),
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          const providerThread = yield* runtime.ensureThread({
+            threadId,
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          const attemptId = RunAttemptId.make("attempt-claude-turn-hold");
+          yield* runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId,
+              providerThread,
+              now: yield* DateTime.now,
+              attemptId,
+              text: "work",
+              attachments: [],
+            }),
+          );
+          assert.equal(openedOptions?.hooks !== undefined, hooks);
+          const providerTurnId = idAllocator.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${attemptId}`,
+          });
+          // Without the hooks nothing can hold the turn, so steered commands interrupt it.
+          if (!hooks) {
+            assert.equal(
+              yield* runtime.pauseTurn!({ providerThread, providerTurnId }),
+              "unsupported",
+            );
+          }
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+              ServerSettings.layerTest({ enableShellCommands }),
+            ),
+          ),
+        ),
+      ),
   );
 });
 

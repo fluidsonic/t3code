@@ -78,7 +78,10 @@ import {
   ProjectId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
-import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
+import {
+  createOrchestrationV2TurnItemVisibility,
+  isUndeliveredUserShellCommand,
+} from "@t3tools/shared/orchestrationV2Timeline";
 import {
   deriveBlockedOnThreadWait,
   derivePendingBackgroundWork,
@@ -116,6 +119,7 @@ import {
   type SelectTimelinePageResult,
   type ThreadHistoryPrefix,
 } from "./threadHistoryPaging.ts";
+import { isUserShellCommandItem } from "@t3tools/provider-core/server/userShellCommand";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -1565,9 +1569,11 @@ function visibleTurnItemsThroughRun(input: {
       sourceItemId: row.sourceItemId,
       item: row.item,
     }));
+  const sourceHasShellCommands = input.sourceProjection.thread.hasShellCommands === true;
   const localPrefix = inheritedVisibleTurnItemsFromLocalItems(
     input.sourceProjection.turnItems.filter(
       (item) =>
+        !(sourceHasShellCommands && isUndeliveredUserShellCommand(item)) &&
         isVisible(item) &&
         isTurnItemAtOrBeforeRun({
           historyOrigin: input.sourceProjection.thread.historyOrigin,
@@ -1757,6 +1763,14 @@ export function threadShellFromProjection(
     runs,
     pullRequests: projection.thread.pullRequests,
   });
+  const runActivity = {
+    status: activityRun?.status ?? null,
+    startedAt: activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
+  };
+  const activity =
+    projection.thread.hasShellCommands === true
+      ? withUserShellActivity(runActivity, projection.turnItems)
+      : runActivity;
   return {
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
@@ -1804,9 +1818,8 @@ export function threadShellFromProjection(
       latestRun != null && isBackgroundWakeRunForShell(latestRun, projection),
     activeRunId: activeRun?.id ?? null,
     blockedOnThreadWait: deriveBlockedOnThreadWait({ activeRun, turnItems: projection.turnItems }),
-    activityRunStatus: activityRun?.status ?? null,
-    activityRunStartedAt:
-      activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
+    activityRunStatus: activity.status,
+    activityRunStartedAt: activity.startedAt,
     status: latestRun?.status ?? "idle",
     ...threadErrorSummary(
       latestRootProviderFailure(latestRun, projection.turnItems),
@@ -1922,6 +1935,27 @@ function isInterruptibleRunForShell(run: OrchestrationV2ThreadProjection["runs"]
 }
 
 type ShellActivityRunStatus = "preparing" | "running" | "starting" | "waiting";
+
+/**
+ * A person's `! cmd` is work in progress: the thread reads as running while one runs, before its
+ * run's agent turn starts and after it ends.
+ */
+function withUserShellActivity(
+  activity: {
+    readonly status: ShellActivityRunStatus | null;
+    readonly startedAt: DateTime.Utc | null;
+  },
+  turnItems: ReadonlyArray<OrchestrationV2TurnItem>,
+): { readonly status: ShellActivityRunStatus | null; readonly startedAt: DateTime.Utc | null } {
+  const running = turnItems.find(
+    (item) => isUserShellCommandItem(item) && item.status === "running",
+  );
+  if (running === undefined) return activity;
+  return {
+    status: "running",
+    startedAt: activity.startedAt ?? running.startedAt ?? running.updatedAt,
+  };
+}
 
 function isActivityRunForShell(
   run: OrchestrationV2ThreadProjection["runs"][number],
@@ -2242,6 +2276,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readonly attemptStatus?: string | null;
       readonly persistentOutput?: boolean;
       readonly deferredWork?: OrchestrationV2TurnItem["deferredWork"];
+      readonly userShellMessageId?: string;
+      readonly userShellDelivered?: boolean;
     };
     type TimelineIndexRow = {
       readonly sourceThreadId: ThreadId;
@@ -3159,6 +3195,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const retainedWindowRows = Effect.fn("ProjectionStore.retainedWindowRows")(function* (
       threadId: ThreadId,
       window: ProjectionWindow,
+      // The thread's `hasShellCommands`. Without it the thread has no `! cmd` items, so its
+      // window skips their filter and branches, which read every item's payload.
+      shellCommands: boolean,
     ) {
       const eligible = sql`
                 WITH eligible AS NOT MATERIALIZED (
@@ -3239,6 +3278,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                         )
                       )
                     )
+                    ${
+                      shellCommands
+                        ? sql`
+                    -- Mirrors isUndeliveredUserShellCommand: a person's command joins the
+                    -- conversation once its result reaches the agent.
+                    AND NOT (
+                      item.type = 'command_execution'
+                      AND json_extract(item.payload_json, '$.userShellMessageId') IS NOT NULL
+                      AND json_extract(item.payload_json, '$.userShellDelivered') IS NOT 1
+                    )`
+                        : sql``
+                    }
                     AND NOT (
                       item.type = 'run_interrupt_result'
                       AND EXISTS (
@@ -3525,6 +3576,50 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     ORDER BY ordinal DESC, turn_item_id DESC
                     LIMIT 1
                   ) AS latest
+                  ${
+                    shellCommands
+                      ? sql`
+                  UNION
+                  -- Commands not delivered yet are live state the composer shows, outside the
+                  -- timeline: waiting or running (these terms match the recovery index's
+                  -- predicate, so it serves this branch)...
+                  SELECT shell.rowid AS item_rowid, shell.ordinal, shell.turn_item_id
+                  FROM orchestration_v2_projection_turn_items AS shell
+                  WHERE shell.thread_id = ${threadId}
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                    AND ${window.rowLimit} > 0
+                    AND shell.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                    AND shell.status IN ('pending', 'running', 'waiting')
+                    AND shell.type = 'command_execution'
+                    AND json_extract(shell.payload_json, '$.userShellMessageId') IS NOT NULL
+                    AND json_extract(shell.payload_json, '$.userShellDelivered') IS NOT 1
+                  UNION
+                  -- ...or finished in a run that has yet to start its turn, or whose turn waits
+                  -- for it (isLiveUserShellCommand), found through the (thread, run) index. One
+                  -- branch with an OR would scan the thread's items.
+                  SELECT shell.rowid AS item_rowid, shell.ordinal, shell.turn_item_id
+                  FROM orchestration_v2_projection_turn_items AS shell
+                  WHERE shell.thread_id = ${threadId}
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                    AND ${window.rowLimit} > 0
+                    AND shell.run_id IN (
+                      SELECT run_id FROM orchestration_v2_projection_runs
+                      WHERE thread_id = ${threadId} AND status IN ('queued', 'starting', 'running')
+                    )
+                    AND (
+                      shell.status IN ('completed', 'failed')
+                      OR shell.run_id IN (
+                        SELECT run_id FROM orchestration_v2_projection_runs
+                        WHERE thread_id = ${threadId} AND status IN ('queued', 'starting')
+                      )
+                    )
+                    AND shell.type = 'command_execution'
+                    AND json_extract(shell.payload_json, '$.userShellMessageId') IS NOT NULL
+                    AND json_extract(shell.payload_json, '$.userShellDelivered') IS NOT 1`
+                      : sql``
+                  }
                   ORDER BY ordinal ASC, turn_item_id ASC
                 )
               `;
@@ -3618,6 +3713,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           recentRunIds === null
             ? sql``
             : sql`INDEXED BY ${sql.literal(`orchestration_v2_projection_${index}`)}`;
+        const decodedThread = yield* decodeThreadPayload(threadRow.payload_json);
 
         type WindowPayloadRow = PayloadRow & {
           readonly work_last_id?: string | null;
@@ -3651,7 +3747,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ORDER BY ordinal ASC, turn_item_id ASC
               `
               : yield* sql<PayloadRow>`
-                ${yield* retainedWindowRows(threadId, window)}
+                ${yield* retainedWindowRows(threadId, window, decodedThread.hasShellCommands === true)}
                 -- CROSS JOIN keeps the sorted IDs as the outer loop, so SQLite
                 -- skips sorting again once the payloads are attached. Carry the
                 -- rowid through selection to avoid a second string-key index lookup.
@@ -3828,7 +3924,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           contextHandoffRows,
           contextTransferRows,
         ] = yield* Effect.all([
-          decodeThreadPayload(threadRow.payload_json),
+          Effect.succeed(decodedThread),
           (fields !== undefined && !fields.includes("runs")) ||
           (window === undefined &&
             (matchesNothing(filter?.runIds) ||
@@ -4522,10 +4618,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             .length >= Math.max(window.userTurnLimit, THREAD_HISTORY_PAGE_POLICY.maxUserTurns)
         ) {
           const counted = yield* sql<{ readonly inherited_rows: number | null }>`
-            ${yield* retainedWindowRows(forkedFrom.threadId, {
-              ...sourceWindow,
-              rowLimit: sourceWindow.suppressLocal ? 0 : sourceWindow.rowLimit,
-            })}
+            ${yield* retainedWindowRows(
+              forkedFrom.threadId,
+              {
+                ...sourceWindow,
+                rowLimit: sourceWindow.suppressLocal ? 0 : sourceWindow.rowLimit,
+              },
+              // A fork copies its source's flag, and inherits only items from before it forked.
+              projection.thread.hasShellCommands === true,
+            )}
             SELECT CASE
               WHEN json_extract(source.payload_json, '$.forkedFrom.type') = 'run' THEN NULL
               WHEN NOT EXISTS (
@@ -5141,7 +5242,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT 1 FROM orchestration_v2_projection_messages
                 WHERE thread_id = ${threadId} AND role = 'user'
                     AND (lower(trim(json_extract(payload_json, '$.text'), ${javascriptTrimWhitespace})) <> '/compact'
-                      OR json_array_length(payload_json, '$.attachments') > 0)
+                      OR json_array_length(payload_json, '$.attachments') > 0
+                      ${thread.hasShellCommands === true ? sql`OR json_extract(payload_json, '$.shellCommand') = 1` : sql``})
               ) AS present
             `;
             return {
@@ -6389,12 +6491,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ordinal: number;
           attempt_id: string | null;
           attempt_status: string | null;
+          user_shell_message_id?: string | null;
+          user_shell_delivered?: number | null;
         }>`SELECT item.turn_item_id, item.run_id, item.node_id, item.parent_item_id, item.type, item.status, item.ordinal,
           ${includeAttempts ? sql`attempt.attempt_id` : sql`NULL`} AS attempt_id,
           ${includeAttempts ? sql`attempt.status` : sql`NULL`} AS attempt_status,
           CASE WHEN item.type = 'user_message' THEN json_extract(item.payload_json, '$.inputIntent') END AS input_intent,
           CASE WHEN item.type = 'user_message' THEN json_extract(item.payload_json, '$.createdBy') END AS created_by,
           CASE WHEN item.type IN ('user_message', 'assistant_message') THEN json_extract(item.payload_json, '$.messageId') END AS message_id
+          ${
+            // A thread without `! cmd` items reads only the columns it read before them.
+            records.thread.hasShellCommands === true
+              ? sql`,
+          CASE WHEN item.type = 'command_execution' THEN json_extract(item.payload_json, '$.userShellMessageId') END AS user_shell_message_id,
+          CASE WHEN item.type = 'command_execution' THEN json_extract(item.payload_json, '$.userShellDelivered') END AS user_shell_delivered`
+              : sql``
+          }
         FROM orchestration_v2_projection_turn_items AS item
         ${
           includeAttempts
@@ -6424,6 +6536,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ...(row.input_intent === null ? {} : { inputIntent: row.input_intent }),
           ...(row.created_by === null ? {} : { createdBy: row.created_by }),
           ...(row.message_id === null ? {} : { messageId: MessageId.make(row.message_id) }),
+          ...(row.user_shell_message_id === null || row.user_shell_message_id === undefined
+            ? {}
+            : {
+                userShellMessageId: row.user_shell_message_id,
+                userShellDelivered: row.user_shell_delivered === 1,
+              }),
         }));
         const local: Array<TimelineIndexRow> = items.map((item) => ({
           sourceThreadId: threadId,
@@ -6460,6 +6578,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ),
             ...source.local.filter(
               (row) =>
+                !(
+                  source.records.thread.hasShellCommands === true &&
+                  isUndeliveredUserShellCommand(row.item)
+                ) &&
                 isInheritedVisible(row.item) &&
                 isTurnItemAtOrBeforeRun({
                   historyOrigin: source.records.thread.historyOrigin,
@@ -8427,17 +8549,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : { id: RunId.make(row.active_run_id), status: "running" },
             turnItems: pendingTurnItemsByThreadId.get(thread.id) ?? [],
           }),
-          activityRunStartedAt:
-            row.activity_run_started_at === null
-              ? null
-              : DateTime.makeUnsafe(row.activity_run_started_at),
-          activityRunStatus:
-            row.activity_run_status === "preparing" ||
-            row.activity_run_status === "starting" ||
-            row.activity_run_status === "running" ||
-            row.activity_run_status === "waiting"
-              ? row.activity_run_status
-              : null,
+          ...(() => {
+            const runActivity = {
+              status:
+                row.activity_run_status === "preparing" ||
+                row.activity_run_status === "starting" ||
+                row.activity_run_status === "running" ||
+                row.activity_run_status === "waiting"
+                  ? row.activity_run_status
+                  : null,
+              startedAt:
+                row.activity_run_started_at === null
+                  ? null
+                  : DateTime.makeUnsafe(row.activity_run_started_at),
+            };
+            const activity =
+              thread.hasShellCommands === true
+                ? withUserShellActivity(
+                    runActivity,
+                    pendingTurnItemsByThreadId.get(thread.id) ?? [],
+                  )
+                : runActivity;
+            return { activityRunStatus: activity.status, activityRunStartedAt: activity.startedAt };
+          })(),
           ...threadErrorSummary(
             terminalFailureItem?.type === "error" ? terminalFailureItem.failure : null,
             row.last_error,

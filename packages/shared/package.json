@@ -279,6 +279,10 @@
       "types": "./src/pullRequestComposerTrigger.ts",
       "import": "./src/pullRequestComposerTrigger.ts"
     },
+    "./shellCommand": {
+      "types": "./src/shellCommand.ts",
+      "import": "./src/shellCommand.ts"
+    },
     "./composerInlineTokens": {
       "types": "./src/composerInlineTokens.ts",
       "import": "./src/composerInlineTokens.ts"

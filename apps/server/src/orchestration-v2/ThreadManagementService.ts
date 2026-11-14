@@ -762,6 +762,8 @@ const make = Effect.gen(function* () {
               ),
             );
       case "message.dispatch":
+        // A `! cmd` runs on the server; only the agent's reply after it needs the provider.
+        if (command.shellCommand === true) return Effect.void;
         return orchestrator.getThreadRecords(command.threadId, []).pipe(
           Effect.flatMap((projection) =>
             assertProviderInstanceEnabled({

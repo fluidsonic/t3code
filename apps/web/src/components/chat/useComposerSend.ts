@@ -18,8 +18,10 @@ import {
 import { isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
 import {
   AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
   DEFAULT_MODEL,
   type EnvironmentId,
+  type MessageId,
   type ModelSelection,
   type PreviewAnnotationPayload,
   type ScopedThreadRef,
@@ -44,6 +46,7 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import { createModelSelection } from "@t3tools/shared/model";
+import { shellCommandFromPrompt, shellCommandMessageText } from "@t3tools/shared/shellCommand";
 import { type SetStateAction, useLayoutEffect, useRef } from "react";
 import { flushSync } from "react-dom";
 import { useNavigate } from "@tanstack/react-router";
@@ -93,7 +96,7 @@ import {
   responseContextReference,
 } from "../../lib/composerContextRecords";
 import { environmentServerConfigsAtom } from "../../state/server";
-import { threadEnvironment } from "../../state/threads";
+import { environmentThreadDetails, threadEnvironment } from "../../state/threads";
 import { runMobileComposerTransition } from "./draftHeroTransition";
 import { useClientSettingsHydrated } from "../../hooks/useSettings";
 import { useStableCallback } from "../../hooks/useStableCallback";
@@ -106,6 +109,7 @@ import {
 } from "./composerSend.logic";
 import { useMultipleModelSend } from "./useMultipleModelSend";
 import { type ComposerDispatchMode } from "@t3tools/client-runtime/state/composer-dispatch";
+import { userShellCommandIsPending } from "@t3tools/client-runtime/user-shell-command";
 import {
   awaitAttachmentUploads,
   getUploadedAttachments,
@@ -367,14 +371,18 @@ export function useComposerSend(input: ComposerSendInput) {
   const { sendInFlight: sendInFlightRef } = draftSendState(routeThreadKey);
   const composerSendGenerationRef = useRef(0);
   const environmentUnavailableSendToastSlotRef = useRef(0);
+  // The message ids of a Run's commands, until the thread's projection has them.
+  const shellCommandsInFlightRef = useRef(new Map<string, ReadonlyArray<MessageId>>());
+  const shownThreadIdRef = useRef(activeThread?.id);
   // A send awaits uploads before it declines, so it reads the approvals pending by then.
   const pendingApprovalsRef = useRef(pendingApprovals);
   const respondingRequestIdsRef = useRef(respondingRequestIds);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- mirrors approvals into refs that an async send reads after awaiting uploads
   useLayoutEffect(() => {
+    shownThreadIdRef.current = activeThread?.id;
     pendingApprovalsRef.current = pendingApprovals;
     respondingRequestIdsRef.current = respondingRequestIds;
-  }, [pendingApprovals, respondingRequestIds]);
+  }, [activeThread?.id, pendingApprovals, respondingRequestIds]);
 
   const onSend = async (
     e?: { preventDefault: () => void },
@@ -544,10 +552,14 @@ export function useComposerSend(input: ComposerSendInput) {
       return;
     }
     const multipleModelSelections = sendCtx.multipleModelSelections;
-    const approvalFeedbackTarget = pendingApprovalsRef.current.find(
-      (approval) =>
-        approval.supportsFeedback && approval.requestId === sendCtx.shownPendingApprovalIds[0],
-    );
+    const shellMode = sendCtx.shellMode && !queuedRunEdit.isEditing;
+    // A command isn't an answer to the agent, so it leaves pending approvals alone.
+    const approvalFeedbackTarget = shellMode
+      ? undefined
+      : pendingApprovalsRef.current.find(
+          (approval) =>
+            approval.supportsFeedback && approval.requestId === sendCtx.shownPendingApprovalIds[0],
+        );
     const multipleModelBlock =
       multipleModelSelections === null
         ? null
@@ -649,6 +661,26 @@ export function useComposerSend(input: ComposerSendInput) {
       );
       return;
     }
+    const shellCommand = shellMode ? shellCommandFromPrompt(promptForSend) : null;
+    if (shellMode) {
+      if (shellCommand === null) return;
+      const blocked =
+        multipleModelSelections !== null
+          ? "Run in shell with one model selected."
+          : directAnnotation ||
+              composerImages.length > 0 ||
+              composerFiles.length > 0 ||
+              composerTerminalContexts.length > 0 ||
+              composerPreviewAnnotations.length > 0 ||
+              composerReviewComments.length > 0 ||
+              composerThreadContexts.length > 0
+            ? "Remove attachments and context to run a command."
+            : null;
+      if (blocked !== null) {
+        toastManager.add(stackedThreadToast({ type: "warning", title: blocked }));
+        return;
+      }
+    }
     const {
       trimmedPrompt: trimmed,
       sendableTerminalContexts: sendableComposerTerminalContexts,
@@ -665,6 +697,7 @@ export function useComposerSend(input: ComposerSendInput) {
         composerEnvironmentContexts.length,
     });
     const feedbackCommand =
+      !shellMode &&
       ctxSelectedProvider === "codex" &&
       composerImages.length === 0 &&
       composerFiles.length === 0 &&
@@ -730,7 +763,12 @@ export function useComposerSend(input: ComposerSendInput) {
       composerThreadContexts.length === 0 &&
       composerEnvironmentContexts.length === 0 &&
       replyTo === null;
-    if (freshSessionAvailable && composerHoldsOnlyText && isClearComposerCommand(trimmed)) {
+    if (
+      !shellMode &&
+      freshSessionAvailable &&
+      composerHoldsOnlyText &&
+      isClearComposerCommand(trimmed)
+    ) {
       armFreshSession(routeThreadKey);
       promptRef.current = "";
       clearComposerDraftContent(composerDraftTarget);
@@ -786,8 +824,11 @@ export function useComposerSend(input: ComposerSendInput) {
       reviewComments: composerReviewCommentsSnapshot,
       threadContexts: composerThreadContextsSnapshot,
       environmentContexts: composerEnvironmentContextsSnapshot,
-      messageText: messageTextForSend,
     } = sendSnapshot;
+    // The snapshot keeps the composer text (`!cmd`) for a retry; the wire gets the message's
+    // stored form, `! cmd`.
+    const messageTextForSend =
+      shellCommand === null ? sendSnapshot.messageText : shellCommandMessageText(shellCommand);
     const {
       missingWorktreeBaseBranch,
       baseBranchForWorktree,
@@ -833,13 +874,16 @@ export function useComposerSend(input: ComposerSendInput) {
     );
     const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
-    const outgoingMessageText = formatOutgoingPrompt({
-      provider: ctxSelectedProvider,
-      model: ctxSelectedModel,
-      models: ctxSelectedProviderModels,
-      effort: ctxSelectedPromptEffort,
-      text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
-    });
+    const outgoingMessageText =
+      shellCommand !== null
+        ? messageTextForSend
+        : formatOutgoingPrompt({
+            provider: ctxSelectedProvider,
+            model: ctxSelectedModel,
+            models: ctxSelectedProviderModels,
+            effort: ctxSelectedPromptEffort,
+            text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+          });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
       return;
     }
@@ -968,7 +1012,7 @@ export function useComposerSend(input: ComposerSendInput) {
     // drafts leave them alone. After navigating away during an upload, the shown approvals
     // are another thread's, so this send leaves them alone too.
     const approvalsToDecline =
-      currentRouteThreadKeyRef.current === routeThreadKey
+      !shellMode && currentRouteThreadKeyRef.current === routeThreadKey
         ? pendingApprovalsRef.current.filter((approval) =>
             sendCtx?.shownPendingApprovalIds.includes(approval.requestId),
           )
@@ -1130,7 +1174,8 @@ export function useComposerSend(input: ComposerSendInput) {
       return;
     }
     const optimisticAttachments = optimisticMessageAttachments(composerAttachmentsSnapshot);
-    if (!shouldQueueBehindActiveRun) {
+    // A command joins the transcript only once its result reaches the agent, so it anchors nothing.
+    if (!shouldQueueBehindActiveRun && !shellMode) {
       anchorNewTurn(
         scopedThreadKey(scopeThreadRef(activeThread.environmentId, threadIdForSend)),
         messageIdForSend,
@@ -1140,6 +1185,7 @@ export function useComposerSend(input: ComposerSendInput) {
       id: messageIdForSend,
       role: "user",
       text: outgoingMessageText,
+      ...(shellMode ? { shellCommand: true } : {}),
       ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
       ...(outgoingMessageContext !== undefined ? { context: outgoingMessageContext } : {}),
       runId: null,
@@ -1296,6 +1342,7 @@ export function useComposerSend(input: ComposerSendInput) {
           message: {
             messageId: messageIdForSend,
             role: "user",
+            ...(shellMode ? { shellCommand: true } : {}),
             attachments: turnAttachmentsResult.value,
             ...withMessageContext({
               text: outgoingMessageText,
@@ -1436,7 +1483,9 @@ export function useComposerSend(input: ComposerSendInput) {
           );
         }
       } else {
-        const retryComposerImages = restoreComposerDraft(composerDraftTarget, sendSnapshot);
+        const retryComposerImages = restoreComposerDraft(composerDraftTarget, sendSnapshot, {
+          shellMode,
+        });
         if (currentRouteThreadKeyRef.current === routeThreadKey) {
           promptRef.current = sendSnapshot.draftText;
           composerImagesRef.current = retryComposerImages;
@@ -1446,9 +1495,10 @@ export function useComposerSend(input: ComposerSendInput) {
             cursor: collapseExpandedComposerCursor(
               sendSnapshot.draftText,
               sendSnapshot.draftText.length,
+              shellMode,
             ),
             prompt: sendSnapshot.draftText,
-            detectTrigger: true,
+            detectTrigger: !shellMode,
           });
         }
       }
@@ -1505,5 +1555,132 @@ export function useComposerSend(input: ComposerSendInput) {
     });
     if (ready) return onSendLatest(...args);
   };
-  return { onSend: onSendWithRouting };
+
+  /**
+   * Runs `commands` as if each were sent as `! command`, without touching the draft. Several run
+   * as a group, each after the previous succeeds. Thread and settings are captured before
+   * `confirm`, so the commands run where they were clicked.
+   */
+  const runShellCommand = async (
+    commands: ReadonlyArray<string>,
+    confirm: () => Promise<boolean>,
+  ) => {
+    const sendCtx = composerRef.current?.getSendContext();
+    const refusal =
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) ||
+      !readEnvironmentScope(environmentId, AuthTerminalOperateScope)
+        ? "You don't have permission to run commands here."
+        : activeEnvironmentUnavailable
+          ? "Not connected. Try again once the environment is connected."
+          : !activeThread || !isServerThread || !sendCtx || threadDetailLoading
+            ? "The thread is still loading. Try again in a moment."
+            : isRevertingCheckpoint
+              ? "Wait for the thread to finish restoring a checkpoint."
+              : null;
+    if (refusal !== null || !activeThread || !sendCtx) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "warning",
+          title: commands.length === 1 ? "Couldn't run the command" : "Couldn't run the commands",
+          ...(refusal === null ? {} : { description: refusal }),
+        }),
+      );
+      return;
+    }
+    const threadId = activeThread.id;
+    // Clicking Run again before the command's result reaches the agent sends nothing more: until
+    // the projection has the first click's messages, by their ids; then, by the projection.
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    const inFlightKey = `${scopedThreadKey(threadRef)}\n${JSON.stringify(commands)}`;
+    const projection =
+      appAtomRegistry.get(environmentThreadDetails.quietThreadAtom(threadRef))?.projection ?? null;
+    const inFlight = shellCommandsInFlightRef.current.get(inFlightKey);
+    if (
+      (inFlight !== undefined &&
+        !inFlight.some((id) => projection?.messages.some((message) => message.id === id))) ||
+      (projection !== null &&
+        commands.some((command) => userShellCommandIsPending(projection, command)))
+    ) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "info",
+          title: commands.length === 1 ? "Already running" : "Already running some of these",
+          description: "It runs once; Run again after its result reaches the agent.",
+        }),
+      );
+      return;
+    }
+    shellCommandsInFlightRef.current.set(inFlightKey, []);
+    const dispatchMode = sendQueuesBehindSetup
+      ? "queue"
+      : (composerRef.current?.defaultDispatchMode() ?? "auto");
+    const queued = sendQueuesBehindSetup || (phase === "running" && dispatchMode === "queue");
+    const steered = !queued && phase === "running" && dispatchMode === "steer";
+    if (!(await confirm())) {
+      shellCommandsInFlightRef.current.delete(inFlightKey);
+      return;
+    }
+    // As after a send: left on the Run button, focus would run the command again on the next Space.
+    composerRef.current?.focusAtEnd();
+    const sent = commands.map((text) => ({
+      messageId: newMessageId(),
+      text: shellCommandMessageText(text),
+    }));
+    const messageIds = new Set(sent.map((message) => message.messageId));
+    shellCommandsInFlightRef.current.set(inFlightKey, [...messageIds]);
+    const createdAt = new Date().toISOString();
+    // Optimistic copies belong to the thread on screen.
+    if (shownThreadIdRef.current === threadId) {
+      setOptimisticUserMessages((existing) => [
+        ...existing,
+        ...sent.map((message, index) => ({
+          id: message.messageId,
+          role: "user" as const,
+          text: message.text,
+          shellCommand: true,
+          runId: null,
+          createdAt,
+          updatedAt: createdAt,
+          streaming: false,
+          // The ones after the first wait behind it.
+          ...(steered
+            ? { inputIntent: "steer" as const }
+            : queued || index > 0
+              ? { inputIntent: "queued_turn" as const }
+              : {}),
+        })),
+      ]);
+    }
+    setThreadError(threadId, null);
+    const result = await startThreadTurn({
+      environmentId,
+      input: {
+        threadId,
+        message: {
+          messageId: sent[0]!.messageId,
+          role: "user",
+          text: sent[0]!.text,
+          shellCommand: true,
+          ...(sent.length > 1 ? { followingShellCommands: sent.slice(1) } : {}),
+          attachments: [],
+        },
+        modelSelection: sendCtx.selectedModelSelection,
+        runtimeMode,
+        interactionMode: DEFAULT_INTERACTION_MODE,
+        dispatchMode,
+        createdAt,
+      },
+    });
+    if (result._tag === "Success") return;
+    shellCommandsInFlightRef.current.delete(inFlightKey);
+    setOptimisticUserMessages((existing) =>
+      existing.filter((message) => !messageIds.has(message.id)),
+    );
+    if (!isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      setThreadError(threadId, error instanceof Error ? error.message : "Failed to run command.");
+    }
+  };
+
+  return { onSend: onSendWithRouting, runShellCommand };
 }
