@@ -8,6 +8,7 @@ import {
   InputRule,
   Node,
   wrappingInputRule,
+  type Command,
   type JSONContent,
   type TiptapEditorHTMLElement,
 } from "@tiptap/core";
@@ -25,7 +26,12 @@ import {
 } from "@tiptap/pm/state";
 import { DocAttrStep, ReplaceStep } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
-import type { Node as ProseMirrorNode, NodeType, ResolvedPos, Slice } from "@tiptap/pm/model";
+import {
+  type Node as ProseMirrorNode,
+  type NodeType,
+  type ResolvedPos,
+  Slice,
+} from "@tiptap/pm/model";
 import type {
   AssistantCitation,
   ComposerContextClipboardFragment,
@@ -1657,7 +1663,7 @@ function ComposerPromptEditorTiptapInner(
                 literalLength,
                 isKnownModel,
               },
-              (content) => {
+              (insert) => {
                 editorInstance
                   .chain()
                   .command(({ tr }) => {
@@ -1666,7 +1672,7 @@ function ComposerPromptEditorTiptapInner(
                   })
                   // Pasted chips and lines would split shown Markdown, so parse it first.
                   .command(collapseShownMarkdownSource)
-                  .insertContent(content)
+                  .command(insert)
                   .command(({ tr }) => {
                     // Move after a pasted rule so the next keystroke cannot replace it; add a trailing line
                     // if needed.
@@ -2152,16 +2158,28 @@ function insertMarkdownParagraphs(
     literalLength?: number;
     isKnownModel?: IsKnownModel;
   },
-  insertContent: (content: JSONContent[] | JSONContent) => void,
+  insert: (command: Command) => void,
 ): void {
   const blocks = buildTiptapContent(value, skillLabelFor, options);
   if (blocks.length === 1 && blocks[0]?.type === "paragraph") {
     const inline = (blocks[0]?.content ?? []) as JSONContent[];
     if (inline.length === 0) return;
-    insertContent(inline);
+    insert(({ commands }) => commands.insertContent(inline));
     return;
   }
-  insertContent(blocks as JSONContent[]);
+  // Open edge paragraphs join the text around the caret, as in any text editor.
+  const open = (block: Record<string, unknown> | undefined) =>
+    block?.type === "paragraph" ? 1 : 0;
+  insert(({ tr }) => {
+    tr.replaceSelection(
+      Slice.fromJSON(tr.doc.type.schema, {
+        content: blocks,
+        openStart: open(blocks[0]),
+        openEnd: open(blocks.at(-1)),
+      }),
+    );
+    return true;
+  });
 }
 
 /** Placing the caret can show Markdown markers, so place it again in the shown source. */
