@@ -49,9 +49,9 @@ function composer(text = "") {
       return api;
     },
     // The custom paste path bypasses ProseMirror's clipboard tagging.
-    paste: (s: string) => {
+    paste: (s: string, asText = false) => {
       clock += 80;
-      dispatch(markAsClipboardEdit(state.tr.insertText(s), "paste"));
+      dispatch(markAsClipboardEdit(state.tr.insertText(s), asText ? "pasteAsText" : "paste"));
       return api;
     },
     cut: (n: number) => {
@@ -109,8 +109,8 @@ describe("composer undo grouping", () => {
     expect(editor.undo().text()).toBe("draft ");
   });
 
-  it("gives a paste its own step", () => {
-    const editor = composer().type("see ").paste("pasted text").type(" ok");
+  it.each([false, true])("gives a paste its own step (asText=%s)", (asText) => {
+    const editor = composer().type("see ").paste("pasted text", asText).type(" ok");
     expect(editor.undo().text()).toBe("see pasted text");
     expect(editor.undo().text()).toBe("see ");
   });

@@ -5,6 +5,7 @@ import {
   type MarkType,
   type Node as ProseMirrorNode,
   type ResolvedPos,
+  Slice,
 } from "@tiptap/pm/model";
 import {
   Bold,
@@ -672,7 +673,12 @@ function listNormalizationPlugin(isComposing: () => boolean) {
       const undoesInputRule = oldState.plugins.some(
         (plugin) => plugin.spec.isInputRules && plugin.getState(oldState),
       );
-      if (undoesInputRule || transactions.some(isHistoryTransaction)) {
+      if (
+        undoesInputRule ||
+        transactions.some(
+          (tr) => isHistoryTransaction(tr) || tr.getMeta("uiEvent") === "pasteAsText",
+        )
+      ) {
         pending.clear();
         return null;
       }
@@ -903,6 +909,24 @@ function textJsonForSpan(text: string, marks: RichTextMark[]): Record<string, un
       .map((mark) => ({ type: MARK_TO_TIPTAP[mark] }));
   }
   return json;
+}
+
+export function insertPlainTextPaste(editor: Editor, text: string): boolean {
+  const { state } = editor;
+  const { from, to } = state.selection;
+  const tr = state.selection.$from.parent.type.spec.code
+    ? state.tr.insertText(text, from, to)
+    : // Open paragraphs join the first and last lines with the text around the caret.
+      state.tr.replaceSelection(
+        Slice.fromJSON(state.schema, {
+          content: buildTiptapContent(text, () => null, { literalText: true }),
+          openStart: 1,
+          openEnd: 1,
+        }),
+      );
+  // Tiptap applies Markdown paste rules to transactions tagged with uiEvent=paste.
+  editor.view.dispatch(tr.setMeta("uiEvent", "pasteAsText"));
+  return true;
 }
 
 /** Keeps literalLength leading characters unstyled so path queries reach file search unchanged. */
