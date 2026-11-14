@@ -79,6 +79,18 @@ it("excludes repeated legacy attachments containing literal context tags", () =>
 const assistantSegments = (text: string, cwd?: string) =>
   searchableMessageSegments({ role: "assistant", text, streaming: false }, cwd);
 
+it("keeps single line breaks in streaming and final assistant prose", () => {
+  for (const streaming of [true, false]) {
+    expect(
+      searchableMessageSegments({
+        role: "assistant",
+        text: "Stay healthy 🌱\nMarc",
+        streaming,
+      })?.map((segment) => segment.trim()),
+    ).toEqual(["Stay healthy 🌱", "Marc"]);
+  }
+});
+
 it("searches displayed prose and file-chip labels without hidden paths", () => {
   expect(
     assistantSegments("[important description](/tmp/actual.ts). `/tmp/inline-example.ts:42`"),
