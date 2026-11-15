@@ -502,6 +502,40 @@ it.each(["x\r\n\r\ny", "x\r\ry"])(
   },
 );
 
+it.each([
+  {
+    value: "Sign-off: ",
+    caret: "end",
+    text: "Stay healthy\nMarc",
+    lines: ["Sign-off: Stay healthy", "Marc"],
+  },
+  { value: "[]", caret: 2, text: "one\ntwo", lines: ["[one", "two]"] },
+  {
+    value: "Notes: ",
+    caret: "end",
+    text: "First.\n\nSecond.",
+    lines: ["Notes: First.", "", "Second."],
+  },
+] as const)(
+  "joins pasted $text with the line around the caret",
+  async ({ value, caret, text, lines }) => {
+    await using screen = await mountEditor(value);
+    const { editor } = screen;
+    await act(async () => {
+      editor.commands.focus(caret);
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", text);
+      editor.view.dom.dispatchEvent(
+        new ClipboardEvent("paste", { clipboardData, cancelable: true }),
+      );
+    });
+    const paragraphs: string[] = [];
+    editor.state.doc.forEach((node) => paragraphs.push(node.textContent));
+    expect(paragraphs).toEqual(lines);
+    expect(serializeEditorDoc(editor.state.doc).value).toBe(lines.join("\n"));
+  },
+);
+
 it("keeps the caret inside unknown dollar text across rich and plain remounts", async () => {
   const value = "echo $HOME now";
   await using screen = await mountEditor(value);
