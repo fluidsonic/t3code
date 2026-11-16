@@ -139,6 +139,49 @@ it.effect("redeems a guest link once and sends each guest message once, with its
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("never runs a guest message as a shell command", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* setup;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    yield* orchestrator.dispatch({
+      type: "thread.guest-share.redeem",
+      commandId: CommandId.make("redeem-shell"),
+      threadId,
+      shareId,
+      guestName: "Sam",
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.guest-message.submit",
+      commandId: CommandId.make("submit-shell"),
+      threadId,
+      shareId,
+      guestMessageId,
+      text: "rm -rf ~",
+    });
+
+    const send = orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("send-shell"),
+      threadId,
+      messageId: MessageId.make("send-shell"),
+      guestMessageId,
+      text: "rm -rf ~",
+      shellCommand: true,
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(send)));
+    const projection = yield* projections.getThreadProjection(threadId);
+    assert.deepEqual(
+      projection.thread.guestShare?.messages.map((message) => message.status),
+      ["pending"],
+    );
+    assert.lengthOf(projection.runs, 0);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("rejects guest messages until the link is redeemed and after archive", () =>
   Effect.gen(function* () {
     const orchestrator = yield* setup;
