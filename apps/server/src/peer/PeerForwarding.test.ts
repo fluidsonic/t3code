@@ -549,23 +549,23 @@ it.effect("launches in a linked environment with the caller's modes, retry-safe"
           ...args,
         });
 
-      const first = yield* launch("thread:laptop-plan");
+      const first = yield* launch("thread:laptop-full");
       expect(first.isError).toBe(false);
       expect(first.structuredContent).toMatchObject({
         projectId: boxProject,
         modelSelection: codex,
       });
-      const retried = yield* launch("thread:laptop-plan");
+      const retried = yield* launch("thread:laptop-full");
       const [launched, relaunched] = (yield* Ref.get(seen)).launches;
       // The thread there runs with the caller's own modes here, below the
       // link's full access, and a retry asks for the same thread.
-      expect(launched).toMatchObject({ runtimeMode: "full-access", interactionMode: "plan" });
+      expect(launched).toMatchObject({ runtimeMode: "full-access", interactionMode: "default" });
       expect(relaunched?.threadId).toBe(launched?.threadId);
       expect(retried.structuredContent).toEqual(first.structuredContent);
 
-      // An escalation past the caller's own modes is refused here.
-      const escalated = yield* launch("thread:laptop-plan", { interactionMode: "default" });
-      expect(failureOf(escalated)).toMatchObject({ code: "interaction_mode_escalation_denied" });
+      // Launched threads never run in plan mode, so a plan-mode caller cannot launch one.
+      const fromPlan = yield* launch("thread:laptop-plan", { clientRequestId: "launch-plan" });
+      expect(failureOf(fromPlan)).toMatchObject({ code: "interaction_mode_escalation_denied" });
       // A pending upload lives here, so it cannot go along.
       yield* Ref.set(b.bearers, []);
       const withUpload = yield* launch("thread:laptop-full", {
