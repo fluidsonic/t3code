@@ -213,7 +213,8 @@ const withSavedProjectSettingsAfterCreate = withSavedProjectSettings.pipe(
 
 export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   t3_thread_launch: McpToolAccess.startsThreads(
-    (input) => input,
+    // Agent-launched threads never start in plan mode; a plan-mode caller cannot launch them.
+    (input) => ({ runtimeMode: input.runtimeMode, interactionMode: "default" }),
     (input, { runtimeMode, interactionMode, linkOrigin }) =>
       Effect.gen(function* () {
         const scope = yield* McpInvocationContext.McpInvocationContext;
