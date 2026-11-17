@@ -3,6 +3,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import {
   CommandId,
   latestProviderTurnForAttempt,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ContextHandoff,
   type OrchestrationV2ExecutionNode,
@@ -67,6 +68,8 @@ import {
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { userShellCommandItemId } from "@t3tools/shared/shellCommand";
+import { composeUserShellPrompt } from "./UserShellCommands.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -192,6 +195,7 @@ export const layer: Layer.Layer<
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const projects = yield* ProjectService.ProjectService;
+    const serverConfig = yield* ServerConfig.ServerConfig;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -423,6 +427,55 @@ export const layer: Layer.Layer<
       },
     );
 
+    // A run started by `! cmd` messages prompts with their results; its first attempt also carries
+    // the commands folded into it and a message that followed them. A restart prompts with the
+    // steered message alone.
+    const composeShellPrompt = Effect.fn("ProviderTurnStartService.composeShellPrompt")(
+      function* (input: {
+        readonly run: OrchestrationV2Run;
+        readonly attempt: OrchestrationV2RunAttempt;
+        readonly message: OrchestrationV2ConversationMessage;
+        readonly driver: string;
+      }) {
+        const { turnItems } = yield* projectionStore.getThreadRecords(
+          input.run.threadId,
+          ["turnItems"],
+          { turnItemRunIds: [input.run.id], turnItemTypes: ["user_message", "command_execution"] },
+        );
+        const batch =
+          input.attempt.reason === "initial"
+            ? turnItems
+                .flatMap((item) =>
+                  item.type === "user_message" &&
+                  (item.inputIntent === "turn_start" || item.inputIntent === "queued_turn")
+                    ? [item]
+                    : [],
+                )
+                .toSorted((left, right) => left.ordinal - right.ordinal)
+            : [];
+        const entries =
+          batch.length === 0
+            ? [{ ...input.message, messageId: input.message.id }]
+            : batch.map((item) => ({ ...item, messageId: item.messageId }));
+        const commandItems = new Map(turnItems.map((item) => [item.id, item] as const));
+        for (const entry of entries) {
+          const itemId = userShellCommandItemId(entry.messageId);
+          if (entry.shellCommand !== true || commandItems.has(itemId)) continue;
+          const item = yield* projectionStore.getTurnItem({
+            threadId: input.run.threadId,
+            itemId,
+          });
+          if (item !== null) commandItems.set(itemId, item);
+        }
+        return composeUserShellPrompt({
+          driver: input.driver,
+          entries,
+          commandItem: (messageId) => commandItems.get(userShellCommandItemId(messageId)),
+          attachmentsDir: serverConfig.attachmentsDir,
+        });
+      },
+    );
+
     const start = Effect.fn("orchestrationV2.providerTurnStart.start")(function* (
       input: {
         readonly threadId: ThreadId;
@@ -473,6 +526,7 @@ export const layer: Layer.Layer<
                     projection.messages.some(
                       (message) =>
                         message.id === source.userMessageId &&
+                        message.shellCommand !== true &&
                         (isCompactionCommandMessage(message) || parseGoalCommand(message) !== null),
                     ))),
             )));
@@ -552,7 +606,9 @@ export const layer: Layer.Layer<
           });
         },
       );
+      // A `! cmd` message is a shell command, never a provider slash command.
       if (
+        providerMessage.shellCommand !== true &&
         providerMessage.attachments.length === 0 &&
         providerMessage.text.trimStart().startsWith("/")
       ) {
@@ -844,16 +900,31 @@ export const layer: Layer.Layer<
       });
       let effectiveHandoffs = handoffs;
       let resumeFellBack = false;
-      const userText = projectComposerContextForProvider({
-        text: providerMessage.text,
-        records: providerMessage.context?.records ?? [],
-      });
+      const shellPrompt =
+        providerMessage.shellCommand === true
+          ? yield* composeShellPrompt({
+              run,
+              attempt,
+              message: providerMessage,
+              driver: session.driver,
+            })
+          : undefined;
+      const userText =
+        shellPrompt?.text ??
+        projectComposerContextForProvider({
+          text: providerMessage.text,
+          records: providerMessage.context?.records ?? [],
+        });
+      const promptAttachments = shellPrompt?.attachments ?? providerMessage.attachments;
       // Native goal commands go verbatim; handoff history waits a turn.
       const goalDriver =
         session.driver === "codex" ||
         session.driver === "claudeAgent" ||
         session.providerSession.capabilities.turns.supportsNativeGoals === true;
-      const goalCommand = goalDriver && parseGoalCommand(providerMessage) !== null;
+      const goalCommand =
+        goalDriver &&
+        providerMessage.shellCommand !== true &&
+        parseGoalCommand(providerMessage) !== null;
       // The provider turn marks cancellation work delivered; restart continuations use their own text or resume natively.
       const noteContinuation = isRestartNoteContinuation(
         run,
@@ -868,8 +939,9 @@ export const layer: Layer.Layer<
           projection.messages
             .filter(
               (candidate) =>
-                isCompactionCommandMessage(candidate) ||
-                (goalDriver && parseGoalCommand(candidate) !== null),
+                candidate.shellCommand !== true &&
+                (isCompactionCommandMessage(candidate) ||
+                  (goalDriver && parseGoalCommand(candidate) !== null)),
             )
             .map((candidate) => candidate.id),
         ),
@@ -1026,7 +1098,7 @@ export const layer: Layer.Layer<
               tokenCap,
               modelContextWindow,
               userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
-              attachments: providerMessage.attachments,
+              attachments: promptAttachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:
                 budgetProviderThread.contextUsage?.usedTokens === undefined
@@ -1355,7 +1427,10 @@ export const layer: Layer.Layer<
             handoffs: [...handoffs, ...resumedRetryHandoff],
             providerThread: { ...resumed.success, id: providerThread.id },
             budget: context.budget,
-            deferInline: isCompactionCommandMessage(providerMessage) || goalCommand,
+            deferInline:
+              (providerMessage.shellCommand !== true &&
+                isCompactionCommandMessage(providerMessage)) ||
+              goalCommand,
             alreadyDeliveredItemIds: context.deliveredItemIds,
             persist: () => Effect.void,
           }).pipe(
@@ -1868,7 +1943,7 @@ export const layer: Layer.Layer<
         message: {
           messageId: message.id,
           text: userText,
-          attachments: providerMessage.attachments,
+          attachments: promptAttachments,
           createdBy: message.createdBy,
           creationSource: message.creationSource,
           ...(message.scheduledTaskId === undefined
