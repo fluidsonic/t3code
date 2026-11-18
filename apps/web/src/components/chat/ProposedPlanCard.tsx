@@ -201,6 +201,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               environmentId={environmentId}
               threadRef={threadRef}
               isStreaming={false}
+              lineBreaks
               headingLevelOffset={3}
             />
           ) : (
@@ -210,6 +211,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               environmentId={environmentId}
               threadRef={threadRef}
               isStreaming={false}
+              lineBreaks
               headingLevelOffset={3}
             />
           )}

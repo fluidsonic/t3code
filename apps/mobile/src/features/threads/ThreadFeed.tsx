@@ -1448,6 +1448,7 @@ function AssistantMarkdownBlocks(props: {
                 definitions,
               ),
             )}
+            preserveSoftBreaks
             skills={props.skills}
             models={props.models}
             textStyle={props.markdownStyles.nativeTextStyle}
