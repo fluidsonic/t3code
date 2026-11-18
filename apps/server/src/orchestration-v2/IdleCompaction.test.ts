@@ -179,6 +179,11 @@ describe("idleCompactionWindow", () => {
     // A turn Claude itself reported as cancelled did run, so it stays the latest.
     steered.runs = steered.runs.map((run) => ({ ...run, startedAt: at(-MINUTE_MS) }));
     expect(idleCompactionWindow(steered, NOW_MS)).toBeNull();
+    const shellCommand = records(cache);
+    shellCommand.messages = [
+      { ...shellCommand.messages[0]!, text: "/compact", shellCommand: true },
+    ];
+    expect(idleCompactionWindow(shellCommand, NOW_MS)).not.toBeNull();
     const archived = records(cache);
     archived.thread = { ...archived.thread, archivedAt: at() };
     expect(idleCompactionWindow(archived, NOW_MS)).toBeNull();

@@ -99,6 +99,7 @@ it("prepares a repeated paste without a tile, and still keeps a different image"
     addComposerFilesToDraft: () => [],
     removeComposerImageFromDraft: () => {},
     insertAttachmentReferences: () => false,
+    isShellMode: false,
   } satisfies IntakeInput;
   let intake!: Intake;
   await using _screen = await render(
@@ -164,6 +165,7 @@ it.each(["thread", "session"] as const)(
       activeThreadId: threadId,
       activePendingProgress: null,
       activePendingIsResponding: false,
+      isShellMode: false,
       pendingUserInputs: [],
       supportsQuestionAttachments: false,
       isLiteralPendingAnswer: false,
