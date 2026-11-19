@@ -79,6 +79,8 @@ export interface SelectableMarkdownTextProps {
   readonly preserveSoftBreaks?: boolean;
   readonly onLinkPress?: (href: string) => void;
   readonly onCiteText?: (text: string) => void;
+  /** A tap on a fenced code block's body; selection, copy and the long-press menu still work. */
+  readonly onCodeBlockPress?: (block: { readonly code: string; readonly language: string }) => void;
   readonly fileContextMenu?: (href: string) => MarkdownFileContextMenu | undefined;
   readonly onFileContextMenuAction?: (href: string, actionId: string) => void;
   readonly linkCustomization?: (href: string) => MarkdownLinkCustomization | undefined;

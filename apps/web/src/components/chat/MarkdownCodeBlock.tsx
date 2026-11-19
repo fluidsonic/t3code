@@ -1,5 +1,7 @@
-import { useGT } from "gt-react";
-import { PlayIcon, WrapTextIcon, CheckIcon, CopyIcon } from "lucide-react";
+import { userShellCommandFromCodeBlock } from "@t3tools/client-runtime/user-shell-command";
+import { canEditInTerminal } from "@t3tools/shared/projectScripts";
+import { T, useGT } from "gt-react";
+import { CheckIcon, CopyIcon, EllipsisIcon, PlayIcon, WrapTextIcon } from "lucide-react";
 import { toHtml } from "hast-util-to-html";
 import React, { use, useEffect, useState, type ReactNode } from "react";
 
@@ -18,15 +20,18 @@ import {
   syntheticFileNameForLanguageId,
 } from "../../pierre-icons";
 import { Button } from "../ui/button";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { SharedTooltipTrigger } from "../ui/shared-tooltip";
 import { HighlightedCodeLines } from "./HighlightedCodeLines";
 import {
+  type CodeBlockShellActions,
   createHighlightCacheKey,
   estimateHighlightedSize,
   extractFenceLanguage,
 } from "./MarkdownCodeBlock.logic";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
 import { PierreEntryIcon } from "./PierreEntryIcon";
+import { ShellCommandText } from "./ShellCommandText";
 
 const MAX_HIGHLIGHT_CACHE_ENTRIES = 500;
 const MAX_HIGHLIGHT_CACHE_MEMORY_BYTES = 50 * 1024 * 1024;
@@ -132,9 +137,10 @@ function MarkdownCodeBlockTitleContent({
 export function MarkdownCodeBlock({
   code,
   language,
+  fenceLanguageTag = null,
   fenceTitle,
   theme,
-  onRunShellCommand,
+  shellActions,
   isStreaming,
   viewToggle,
   canWrap = true,
@@ -143,9 +149,12 @@ export function MarkdownCodeBlock({
 }: {
   code: string;
   language: string;
+  /** The fence's own tag; `language` falls back to text, and only a shell tag runs as written. */
+  fenceLanguageTag?: string | null;
   fenceTitle: string | null;
   theme: "light" | "dark";
-  onRunShellCommand?: ((command: string) => void) | undefined;
+  /** Set only on a closed fence; see `CodeBlockShellActions`. */
+  shellActions?: CodeBlockShellActions | undefined;
   isStreaming: boolean;
   viewToggle?: ReactNode;
   canWrap?: boolean;
@@ -153,26 +162,19 @@ export function MarkdownCodeBlock({
   children: ReactNode;
 }) {
   const gt = useGT();
-  const { copyToClipboard, isCopied: copied } = useCopyToClipboard({
-    timeout: 1200,
-    onError: (cause) =>
-      reportMarkdownActionFailure(
-        {
-          operation: "copy-code-block",
-          language,
-          ...(fenceTitle ? { fenceTitle } : {}),
-        },
-        cause,
-      ),
-  });
   const defaultWrapped = useClientSettings((settings) => settings.wordWrap);
   const [wrapOverride, setWrapOverride] = useState<boolean | null>(null);
   const wrapped = wrapOverride ?? defaultWrapped;
   const wrapLabel = wrapped ? gt("Disable line wrap") : gt("Wrap lines");
-  const copyLabel = copied ? gt("Copied") : gt("Copy code");
   const command = code.trim();
+  const runInTerminal = shellActions?.runInTerminal;
+  const runCommand = shellActions?.runCommand;
+  const userCommand =
+    runCommand !== undefined && !isStreaming
+      ? userShellCommandFromCodeBlock(code, fenceLanguageTag)
+      : null;
   const canRun =
-    onRunShellCommand !== undefined &&
+    runInTerminal !== undefined &&
     !isStreaming &&
     /^(?:sh|bash|zsh|fish|shell|powershell|pwsh)$/.test(language) &&
     code.endsWith("\n") &&
@@ -182,24 +184,36 @@ export function MarkdownCodeBlock({
     // make the rendered command differ from what the terminal would receive.
     !/[\p{Cc}\p{Cf}]/u.test(code.slice(0, -1));
 
-  const handleCopy = () => copyToClipboard(code.endsWith("\n") ? code.slice(0, -1) : code);
-
   const copyButton = (
-    <SharedTooltipTrigger
-      label={copyLabel}
-      render={
-        <Button
-          type="button"
-          variant="ghost-muted"
-          size="icon-xs"
-          onClick={handleCopy}
-          aria-label={copyLabel}
-        />
-      }
-    >
-      {copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
-    </SharedTooltipTrigger>
+    <CodeBlockCopyButton code={code} language={language} fenceTitle={fenceTitle} />
   );
+
+  const commandActions =
+    userCommand !== null && runCommand !== undefined ? (
+      <ShellCommandRunButton command={userCommand} runCommand={runCommand} />
+    ) : null;
+  const commandMenu =
+    userCommand !== null && shellActions !== undefined ? (
+      <ShellCommandMenu command={userCommand} shellActions={shellActions} />
+    ) : null;
+  // With shell commands on, a command's actions menu offers Run in terminal instead.
+  const terminalButton =
+    canRun && commandMenu === null ? (
+      <SharedTooltipTrigger
+        label={gt("Run in terminal")}
+        render={
+          <Button
+            type="button"
+            variant="ghost-muted"
+            size="icon-xs"
+            onClick={() => runInTerminal(command)}
+            aria-label={gt("Run in terminal")}
+          />
+        }
+      >
+        <PlayIcon className="size-3" />
+      </SharedTooltipTrigger>
+    ) : null;
 
   if (diagram) {
     return (
@@ -226,6 +240,7 @@ export function MarkdownCodeBlock({
           role="toolbar"
           aria-label={gt("Code block actions")}
         >
+          {commandActions === null ? null : <span className="me-1 flex">{commandActions}</span>}
           {canWrap ? (
             <SharedTooltipTrigger
               label={wrapLabel}
@@ -243,29 +258,306 @@ export function MarkdownCodeBlock({
               <WrapTextIcon className="size-3" />
             </SharedTooltipTrigger>
           ) : null}
-          {canRun ? (
-            <SharedTooltipTrigger
-              label={gt("Run in terminal")}
-              render={
-                <Button
-                  type="button"
-                  variant="ghost-muted"
-                  size="icon-xs"
-                  onClick={() => onRunShellCommand(command)}
-                  aria-label={gt("Run in terminal")}
-                />
-              }
-            >
-              <PlayIcon className="size-3" />
-            </SharedTooltipTrigger>
-          ) : null}
+          {terminalButton}
           {viewToggle}
           {copyButton}
+          {commandMenu}
         </span>
       }
     >
       {children}
     </MarkdownCodeBlockFrame>
+  );
+}
+
+function CodeBlockCopyButton({
+  code,
+  language,
+  fenceTitle,
+}: {
+  code: string;
+  language: string;
+  fenceTitle: string | null;
+}) {
+  const gt = useGT();
+  const { copyToClipboard, isCopied: copied } = useCopyToClipboard({
+    timeout: 1200,
+    onError: (cause) =>
+      reportMarkdownActionFailure(
+        {
+          operation: "copy-code-block",
+          language,
+          ...(fenceTitle ? { fenceTitle } : {}),
+        },
+        cause,
+      ),
+  });
+  const copyLabel = copied ? gt("Copied") : gt("Copy code");
+  const handleCopy = () => copyToClipboard(code.endsWith("\n") ? code.slice(0, -1) : code);
+
+  return (
+    <SharedTooltipTrigger
+      label={copyLabel}
+      render={
+        <Button
+          type="button"
+          variant="ghost-muted"
+          size="icon-xs"
+          onClick={handleCopy}
+          aria-label={copyLabel}
+        />
+      }
+    >
+      {copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
+    </SharedTooltipTrigger>
+  );
+}
+
+function ShellCommandRunButton(props: {
+  readonly command: string;
+  readonly runCommand: (command: string) => void;
+  /** Names the command, where several Run buttons share a block. */
+  readonly label?: string;
+}) {
+  const gt = useGT();
+  return (
+    <SharedTooltipTrigger
+      label={gt("Runs in the thread's workspace and sends the result to the agent")}
+      render={
+        <Button
+          type="button"
+          variant="ghost-muted"
+          size="xs"
+          onClick={() => props.runCommand(props.command)}
+          aria-label={props.label ?? gt("Run")}
+        />
+      }
+    >
+      <PlayIcon className="size-3" />
+      <T>Run</T>
+    </SharedTooltipTrigger>
+  );
+}
+
+function ShellCommandMenu(props: {
+  readonly command: string;
+  readonly shellActions: CodeBlockShellActions;
+  readonly label?: string;
+  /** The button that opens it, where a block's doesn't fit. */
+  readonly trigger?: React.ReactElement;
+}) {
+  const gt = useGT();
+  const { command, shellActions } = props;
+  const [canCopyToTerminal, setCanCopyToTerminal] = useState(false);
+  // A multi-line command would run as it reaches the prompt (see `canEditInTerminal`), and a
+  // control character such as a tab would act there (completion) instead of showing.
+  const typeableInTerminal = canEditInTerminal(command) && !/[\p{Cc}\p{Cf}]/u.test(command);
+  const copyCommand = () => {
+    if (typeof navigator === "undefined" || navigator.clipboard == null) return;
+    void navigator.clipboard.writeText(command).catch((cause) => {
+      reportMarkdownActionFailure({ operation: "copy-code-block", language: "shell" }, cause);
+    });
+  };
+  return (
+    <Menu
+      onOpenChange={(open) => {
+        if (open) setCanCopyToTerminal(shellActions.canCopyToTerminal?.() === true);
+      }}
+    >
+      <MenuTrigger
+        render={
+          props.trigger ?? (
+            <Button
+              type="button"
+              variant="ghost-muted"
+              size="icon-xs"
+              aria-label={props.label ?? gt("More command actions")}
+            />
+          )
+        }
+      >
+        <EllipsisIcon className="size-3" />
+      </MenuTrigger>
+      <MenuPopup align="end">
+        {shellActions.editCommand ? (
+          <MenuItem onClick={() => shellActions.editCommand?.(command)}>
+            <T>Edit in the composer</T>
+          </MenuItem>
+        ) : null}
+        {shellActions.editInTerminal && typeableInTerminal ? (
+          <MenuItem onClick={() => shellActions.editInTerminal?.(command)}>
+            <T>Edit in terminal</T>
+          </MenuItem>
+        ) : null}
+        {shellActions.runInTerminal && typeableInTerminal && !command.endsWith("\\") ? (
+          <MenuItem onClick={() => shellActions.runInTerminal?.(command)}>
+            <T>Run in terminal</T>
+          </MenuItem>
+        ) : null}
+        {shellActions.copyToTerminal && typeableInTerminal && canCopyToTerminal ? (
+          <MenuItem onClick={() => shellActions.copyToTerminal?.(command)}>
+            <T>Copy to active terminal</T>
+          </MenuItem>
+        ) : null}
+        <MenuItem onClick={copyCommand}>
+          <T>Copy command</T>
+        </MenuItem>
+      </MenuPopup>
+    </Menu>
+  );
+}
+
+/**
+ * An untagged block of `! cmd` lines: each command on its own row with its own actions, so one
+ * failing never runs the rest. `commands` are what the rows run, without their `!`; Copy copies
+ * the block as written.
+ */
+export function ShellCommandsCodeBlock(props: {
+  readonly code: string;
+  readonly commands: ReadonlyArray<string>;
+  readonly theme: "light" | "dark";
+  readonly shellActions: CodeBlockShellActions;
+}) {
+  const gt = useGT();
+  const { shellActions } = props;
+  const runCommand = shellActions.runCommand;
+  const runCommands = props.commands.length > 1 ? shellActions.runCommands : undefined;
+  return (
+    <MarkdownCodeBlockFrame
+      language="text"
+      fenceTitle={null}
+      theme={props.theme}
+      headerProps={THREAD_FIND_IGNORE_PROPS}
+      actions={
+        <span
+          className="flex items-center gap-0.5"
+          role="toolbar"
+          aria-label={gt("Code block actions")}
+        >
+          {runCommands === undefined ? null : (
+            <SharedTooltipTrigger
+              label={gt(
+                "Runs them in order and sends the results to the agent. A failure skips the rest.",
+              )}
+              render={
+                <Button
+                  type="button"
+                  variant="ghost-muted"
+                  size="xs"
+                  onClick={() => runCommands(props.commands)}
+                  aria-label={gt("Run all")}
+                />
+              }
+            >
+              <PlayIcon className="size-3" />
+              <T>Run all</T>
+            </SharedTooltipTrigger>
+          )}
+          <CodeBlockCopyButton code={props.code} language="text" fenceTitle={null} />
+        </span>
+      }
+    >
+      {/* Not `ul` and `code`: the markdown styles for lists and inline code would apply. */}
+      <div
+        role="list"
+        className="chat-markdown-codeblock-commands flex flex-col gap-1 px-1.5 py-1.5"
+      >
+        {props.commands.map((command, index) => (
+          // The row a pointer, focus or open menu is on lights up, so its actions' target is clear.
+          <div
+            // A block's commands never reorder, and the same command can appear twice.
+            // oxlint-disable-next-line react/no-array-index-key
+            key={index}
+            role="listitem"
+            className="flex items-start gap-2 rounded-md ps-1.5 transition-colors hover:bg-shell-command-tint has-[:focus-visible]:bg-shell-command-tint has-[[data-popup-open]]:bg-shell-command-tint"
+          >
+            <div className="min-w-0 flex-1 py-0.5 leading-5 whitespace-pre-wrap [overflow-wrap:anywhere]">
+              <ShellCommandText command={command} block />
+            </div>
+            <span
+              {...THREAD_FIND_IGNORE_PROPS}
+              className="flex shrink-0 items-center gap-0.5"
+              role="toolbar"
+              aria-label={gt("Command actions")}
+            >
+              {runCommand === undefined ? null : (
+                <ShellCommandRunButton
+                  command={command}
+                  runCommand={runCommand}
+                  {...(props.commands.length > 1
+                    ? { label: gt("Run {command}", { command }) }
+                    : {})}
+                />
+              )}
+              <ShellCommandMenu
+                command={command}
+                shellActions={shellActions}
+                {...(props.commands.length > 1
+                  ? { label: gt("More actions for {command}", { command }) }
+                  : {})}
+              />
+            </span>
+          </div>
+        ))}
+      </div>
+    </MarkdownCodeBlockFrame>
+  );
+}
+
+/**
+ * An inline `` `! cmd` `` in prose, with Run and the block's other actions. Only the command's last
+ * character stays on their line, so they never wrap alone and a long path still wraps.
+ */
+export function ShellCommandInline(props: {
+  readonly command: string;
+  readonly shellActions: CodeBlockShellActions;
+}) {
+  const gt = useGT();
+  const { command, shellActions } = props;
+  const { runCommand } = shellActions;
+  const tailStart = command.length - ([...command].at(-1)?.length ?? 0);
+  return (
+    <span className="shell-command-inline font-mono">
+      <span className="shell-command-prefix">!</span>
+      <span className="shell-command-gap"> </span>
+      {command.slice(0, tailStart)}
+      <span className="whitespace-nowrap">
+        {command.slice(tailStart)}
+        <span
+          {...THREAD_FIND_IGNORE_PROPS}
+          className="shell-command-inline-actions"
+          role="toolbar"
+          aria-label={gt("Command actions")}
+        >
+          {runCommand === undefined ? null : (
+            <SharedTooltipTrigger
+              label={gt("Runs in the thread's workspace and sends the result to the agent")}
+              render={
+                <button
+                  type="button"
+                  className="shell-command-inline-action"
+                  aria-label={gt("Run {command}", { command })}
+                  onClick={() => runCommand(command)}
+                />
+              }
+            >
+              <PlayIcon />
+            </SharedTooltipTrigger>
+          )}
+          <ShellCommandMenu
+            command={command}
+            shellActions={shellActions}
+            trigger={
+              <button
+                type="button"
+                className="shell-command-inline-action"
+                aria-label={gt("More actions for {command}", { command })}
+              />
+            }
+          />
+        </span>
+      </span>
+    </span>
   );
 }
 

@@ -6,6 +6,7 @@ import {
   isLiveSubagentTurnItem,
   waitingOnSubagentsLabel,
 } from "@t3tools/client-runtime/state/subagentRuntime";
+import { userShellCommandOwnsWorkingSlot } from "@t3tools/client-runtime/user-shell-command";
 import * as Equal from "effect/Equal";
 import { shallow } from "zustand/vanilla/shallow";
 import { claudeResumeCompactionAge } from "@t3tools/shared/claudeCompaction";
@@ -1628,6 +1629,21 @@ function deriveTimelineTurnFolds(
   });
 }
 
+/** `userShellCommandOwnsWorkingSlot` with this thread's optimistic sends. */
+export function deriveUserShellCommandOwnsWorkingSlot(input: {
+  readonly projection: Parameters<typeof userShellCommandOwnsWorkingSlot>[0]["projection"];
+  readonly optimisticMessages: ReadonlyArray<
+    Pick<ChatMessage, "id" | "shellCommand" | "inputIntent">
+  >;
+}): boolean {
+  return userShellCommandOwnsWorkingSlot({
+    projection: input.projection,
+    sendingShellMessageIds: input.optimisticMessages.flatMap((message) =>
+      message.shellCommand === true && message.inputIntent !== "queued_turn" ? [message.id] : [],
+    ),
+  });
+}
+
 export function deriveMessagesTimelineRows(
   input: {
     timelineEntries: ReadonlyArray<TimelineEntry>;
@@ -1650,10 +1666,14 @@ export function deriveMessagesTimelineRows(
     worktreeSetup?: WorktreeSetupSnapshot | null;
     toolCallVisibility?: ToolCallVisibility;
     revealedMessageId?: MessageId | null;
+    /** See `deriveUserShellCommandOwnsWorkingSlot`. */
+    userShellCommandOwnsWorkingSlot?: boolean;
   },
   resolve: MessageResolver = m,
 ): MessagesTimelineRow[] {
-  const timelineEntries = timelineRowEntries(input);
+  // A `! cmd` working for the person shows in the footer, and no agent response is live.
+  const isWorking = input.isWorking && input.userShellCommandOwnsWorkingSlot !== true;
+  const timelineEntries = timelineRowEntries({ ...input, isWorking });
   const embeddedResultRunIds = new Set<RunId>();
   for (const entry of timelineEntries) {
     if ((entry.kind === "html-render" || entry.kind === "mcp-app") && entry.runId !== null) {
@@ -1699,9 +1719,9 @@ export function deriveMessagesTimelineRows(
   const activeVisualResponseRunIds = deriveActiveVisualResponseRunIds({
     timelineEntries: timelineEntries,
     unsettledRunId,
-    isWorking: input.isWorking,
+    isWorking: isWorking,
   });
-  const runlessWorkActive = input.isWorking && input.runlessWorkActive === true;
+  const runlessWorkActive = isWorking && input.runlessWorkActive === true;
   const foldsByAnchorEntryId =
     input.toolCallVisibility === "zen"
       ? new Map<string, TurnFold>()
@@ -1747,16 +1767,16 @@ export function deriveMessagesTimelineRows(
   const runIdIsActiveResponse = (runId: RunId | null | undefined) =>
     runId == null ? runlessWorkActive : activeVisualResponseRunIds.has(runId);
   const workEntryIsInActiveRun = (entry: WorkLogEntry) =>
-    input.isWorking &&
+    isWorking &&
     entry.toolLifecycleStatus === "inProgress" &&
     (entry.runId == null ? runlessWorkActive : entry.runId === unsettledRunId);
 
-  const activeTurnHeaderIndex = input.isWorking
+  const activeTurnHeaderIndex = isWorking
     ? lastResponseBoundaryIndex(timelineEntries) + 1
     : timelineEntries.length;
 
   const activeToolEntries: Array<Extract<TimelineEntry, { kind: "work" }>> = [];
-  if (input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
+  if (isWorking && (unsettledRunId !== null || runlessWorkActive)) {
     let tailAttemptId: string | null | undefined;
     for (let index = timelineEntries.length - 1; index >= activeTurnHeaderIndex; index -= 1) {
       const entry = timelineEntries[index]!;
@@ -1875,7 +1895,7 @@ export function deriveMessagesTimelineRows(
       workEntryIsInActiveRun(entry.entry),
   );
   const activeRunIsCompaction =
-    input.isWorking && unsettledRunId !== null && compactionRuns.has(unsettledRunId);
+    isWorking && unsettledRunId !== null && compactionRuns.has(unsettledRunId);
   // The item can finish before its run settles; only other work should keep activity visible.
   const compactionRunFinished =
     activeRunIsCompaction &&
@@ -1954,7 +1974,7 @@ export function deriveMessagesTimelineRows(
       continue;
     }
 
-    if (input.isWorking && index === activeTurnHeaderIndex) {
+    if (isWorking && index === activeTurnHeaderIndex) {
       appendWorkingRow();
     }
 
@@ -2399,11 +2419,11 @@ export function deriveMessagesTimelineRows(
     latestTimelineEntry.message.role === "assistant" &&
     latestTimelineEntry.message.streaming;
   const hasWorkingRow = nextRows.some((row) => row.kind === "working");
-  if (input.isWorking && !hasWorkingRow && activeTurnHeaderIndex === timelineEntries.length) {
+  if (isWorking && !hasWorkingRow && activeTurnHeaderIndex === timelineEntries.length) {
     appendWorkingRow();
   }
   if (
-    input.isWorking &&
+    isWorking &&
     input.latestRun?.turnEnded !== true &&
     !replyIsStreaming &&
     !setupOwnsWorkingSlot &&
