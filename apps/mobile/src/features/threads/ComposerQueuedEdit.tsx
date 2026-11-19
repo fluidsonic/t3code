@@ -11,6 +11,7 @@ import { assetImageSource } from "../../lib/assetImageSource";
 
 export function ComposerQueuedEditBanner(props: {
   readonly saving: boolean;
+  readonly shellCommand?: boolean;
   readonly onCancel: () => void;
 }) {
   const gt = useGT();
@@ -18,12 +19,16 @@ export function ComposerQueuedEditBanner(props: {
     <View className="flex-row items-center gap-2 px-4 pb-2">
       <SymbolView name="pencil" size={12} tintColorClassName="accent-foreground-muted" />
       <Text className="min-w-0 flex-1 text-xs text-foreground-muted" numberOfLines={1}>
-        <T>Editing queued message</T>
+        {props.shellCommand ? <T>Editing queued command</T> : <T>Editing queued message</T>}
       </Text>
       <Button
         label={gt("Cancel")}
         tone="text"
-        accessibilityLabel={gt("Cancel editing queued message")}
+        accessibilityLabel={
+          props.shellCommand
+            ? gt("Cancel editing queued command")
+            : gt("Cancel editing queued message")
+        }
         disabled={props.saving}
         onPress={props.onCancel}
       />

@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
@@ -31,6 +32,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as ServerConfig from "../config.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -326,6 +328,9 @@ it.effect(
             layerSessionManager,
             Layer.mock(EventSink.EventSinkV2)({}),
             McpAppModelContext.layerEmpty,
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-turn-control-" }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
           ),
         ),
       );
@@ -436,6 +441,9 @@ it.effect("steers a running turn with the thread's MCP app model context", () =>
                 },
               ]),
           }),
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-turn-control-" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
         ),
       ),
     );

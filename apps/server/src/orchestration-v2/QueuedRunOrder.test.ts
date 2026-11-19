@@ -13,6 +13,7 @@ const delegatedCompletion = {
 describe("queued run delivery order", () => {
   it("delivers completions and queued messages in request order, keeping manual queue order", () => {
     const projection = {
+      thread: {},
       messages: [
         { id: "message:old" },
         { id: "message:moved" },
@@ -60,6 +61,53 @@ describe("queued run delivery order", () => {
       "run:moved",
       "run:old",
       "run:later-completion",
+    ]);
+  });
+
+  it("puts a steer that waits for shell commands first", () => {
+    const projection = {
+      thread: { hasShellCommands: true },
+      messages: [
+        { id: "message:queued" },
+        {
+          id: "message:automatic",
+          delegatedCompletion: { generation: 1, parentRunId: "run:parent", taskIds: ["task"] },
+        },
+        { id: "message:steer", shellSteer: true },
+      ],
+      runs: [
+        {
+          id: "run:queued",
+          ordinal: 2,
+          queuePosition: 1,
+          requestedAt: at("10:00:00"),
+          status: "queued",
+          userMessageId: "message:queued",
+        },
+        {
+          id: "run:automatic",
+          ordinal: 3,
+          queuePosition: 2,
+          requestedAt: at("10:01:00"),
+          status: "queued",
+          userMessageId: "message:automatic",
+        },
+        {
+          id: "run:steer",
+          ordinal: 4,
+          queuePosition: 3,
+          requestedAt: at("10:02:00"),
+          status: "queued",
+          userMessageId: "message:steer",
+        },
+      ],
+    } as never;
+
+    // The steer jumps both queues; the rest keep request order.
+    expect(queuedRunsInDeliveryOrder(projection).map((run) => run.id)).toEqual([
+      "run:steer",
+      "run:queued",
+      "run:automatic",
     ]);
   });
 });
