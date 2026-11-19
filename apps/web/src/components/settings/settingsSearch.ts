@@ -910,6 +910,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     desktopOnly: true,
   },
   {
+    id: "swipe-navigation",
+    title: msg("Swipe navigation"),
+    to: "/settings/general",
+    searchTerms: [
+      msg("trackpad gesture two finger back forward history mouse horizontal scroll wheel tilt"),
+    ],
+    desktopOnly: true,
+    macOnly: true,
+  },
+  {
     id: "text-generation-model",
     title: msg("Text generation model"),
     to: "/settings/threads",
