@@ -407,6 +407,22 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                     onValueChange={(value) => write({ enableAgentBrowserAccess: value })}
                   />
                 </SettingsSection>
+                <SettingsSection title={gt("Shell commands")}>
+                  <SettingsSwitchRow
+                    icon="terminal"
+                    label={gt("Shell commands (beta)")}
+                    subtitle={
+                      projectSelected
+                        ? gt("Environment-wide setting. Select All projects to change it.")
+                        : gt(
+                            "Type ! into an empty composer to run a command in the thread's workspace and send its output to the agent. Commands run outside provider sandboxes and approvals.",
+                          )
+                    }
+                    value={uniform("enableShellCommands")}
+                    disabled={disabledFor("enableShellCommands")}
+                    onValueChange={(value) => write({ enableShellCommands: value })}
+                  />
+                </SettingsSection>
                 <AutoSettleSettingsRows write={write} pending={pendingWrites > 0} />
               </>
             ) : null}

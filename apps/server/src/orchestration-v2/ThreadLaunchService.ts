@@ -90,6 +90,8 @@ export interface ThreadLaunchInitialMessage {
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly senderThreadId?: ThreadId;
   readonly text: string;
+  /** Only a person's client launch sets it; the orchestrator refuses it from anyone else. */
+  readonly shellCommand?: boolean;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly context?: import("@t3tools/contracts").OrchestrationMessageContext | undefined;
   /** Ask the first run for a result as data matching this JSON Schema. */
@@ -265,6 +267,9 @@ export class ThreadLaunchService extends Context.Service<
 >()("t3/orchestration-v2/ThreadLaunchService") {}
 
 const isThreadLaunchError = Schema.is(ThreadLaunchError);
+
+export const initialMessageCommandId = (launchCommandId: CommandId): CommandId =>
+  CommandId.make(`${launchCommandId}:initial-message`);
 
 function failureDetail(error: unknown): string {
   if (isThreadLaunchError(error)) {
@@ -1433,6 +1438,7 @@ const make = Effect.gen(function* () {
                     .message({ threadId: candidateThreadId, ordinal: 1 })
                     .pipe(Effect.mapError(mapError(input, "dispatch-message", candidateThreadId)))),
                 text: input.initialMessage.text,
+                ...(input.initialMessage.shellCommand === true ? { shellCommand: true } : {}),
                 ...(input.initialMessage.scheduledTaskId === undefined
                   ? {}
                   : { scheduledTaskId: input.initialMessage.scheduledTaskId }),
@@ -1505,7 +1511,7 @@ const make = Effect.gen(function* () {
           // claim that carried none, takes it in a command of its own.
           let accepted = claimed;
           if (!claimed.storedEvents.some((stored) => stored.event.type === "run.created")) {
-            const messageCommandId = CommandId.make(`${input.commandId}:initial-message`);
+            const messageCommandId = initialMessageCommandId(input.commandId);
             const messageReceipt = yield* readReceipt(input, messageCommandId);
             messageWasAlreadyAccepted = Option.isSome(messageReceipt);
             accepted = yield* threads

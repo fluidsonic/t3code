@@ -6,6 +6,7 @@ import { restoredNewTaskDraftKey } from "./new-task-draft-key";
 import {
   appendComposerDraftAttachments,
   clearComposerDraftContent,
+  composerDraftTextContent,
   flushComposerDrafts,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
@@ -21,7 +22,7 @@ export async function recoverFailedThreadDraft(message: QueuedThreadMessage): Pr
   }
 
   await mergeComposerDraftContent(targetKey, {
-    text: source.text,
+    ...composerDraftTextContent(source),
     context: source.context,
     attachments: [],
   });
