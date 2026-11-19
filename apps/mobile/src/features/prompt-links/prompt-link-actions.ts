@@ -32,7 +32,8 @@ export async function applyLinkedPromptToThreadDraft(
   }
   const action = linkedThreadDraftAction(getComposerDraftSnapshot(draftKey).text, prompt.text);
   if (action !== "ask") {
-    if (action === "fill") setComposerDraftText(draftKey, prompt.text);
+    // A link fills prose; only the person typing `!` makes a command.
+    if (action === "fill") setComposerDraftText(draftKey, prompt.text, { shellMode: false });
     showPromptLinkNotice(notice);
     return;
   }
@@ -40,7 +41,7 @@ export async function applyLinkedPromptToThreadDraft(
     { text: m(msg("Keep mine")), style: "cancel" },
     {
       text: m(msg("Replace", { $context: "verb, replaces the draft" })),
-      onPress: () => setComposerDraftText(draftKey, prompt.text),
+      onPress: () => setComposerDraftText(draftKey, prompt.text, { shellMode: false }),
     },
   ]);
 }
