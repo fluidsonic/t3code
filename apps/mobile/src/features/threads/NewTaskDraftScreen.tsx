@@ -1,4 +1,4 @@
-import { T, useGT, useMessages, Var } from "gt-react-native";
+import { msg, T, useGT, useMessages, Var } from "gt-react-native";
 import { errorDisplayMessage } from "@t3tools/client-runtime/errors";
 import { DraftEnvironmentControl } from "./DraftEnvironmentControl";
 import { NativeScrollEdgeEffectsContext } from "../../native/NativeScrollViewMarker";
@@ -40,6 +40,7 @@ import {
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   resolveEnvironmentMachineKind,
 } from "@t3tools/contracts";
+import { resolveComposerShellSend } from "../../lib/composerShellCommand";
 
 import { ComposerEditor, type ComposerEditorHandle } from "../../components/ComposerEditor";
 import { composerContextImportsAtom } from "../../state/use-composer-drafts";
@@ -64,6 +65,7 @@ import {
   getComposerDraftSnapshot,
   updateComposerDraftSettings,
   scheduleUnusedComposerAttachmentCleanup,
+  setComposerDraftText,
 } from "../../state/use-composer-drafts";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { useProjectClone } from "../../state/projectClones";
@@ -106,6 +108,7 @@ import { appAtomRegistry } from "../../state/atom-registry";
 import { mobilePreferencesAtom } from "../../state/preferences";
 
 import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
+import { readCanRunShellCommands } from "../../state/shell-commands";
 
 // Below this (keyboard up on iPad, phone landscape) the hero cannot fit above the composer,
 // so the project and environment pickers move into the composer controls instead.
@@ -681,6 +684,15 @@ export function NewTaskDraftScreen(props: {
       Dialog.alert(gt("Too much context"), contextBlockReason);
       return null;
     }
+    const shellSend = resolveComposerShellSend({
+      draft,
+      canRunShellCommands: readCanRunShellCommands(selectedProject.environmentId),
+    });
+    if (shellSend.kind === "empty") return null;
+    if (shellSend.kind === "blocked") {
+      Dialog.alert(m(msg("Can't run this command")), shellSend.reason);
+      return null;
+    }
     const strandedThread = threadContextsOutsideEnvironment({
       text: draft.text,
       records: draft.context?.records ?? [],
@@ -1060,7 +1072,10 @@ export function NewTaskDraftScreen(props: {
             <ComposerEditor
               draftKey={flow.draftKey}
               value={flow.prompt}
-              onChangeText={flow.setPrompt}
+              // This disconnected fallback has no shell mode, so a leading `!` stays prose here.
+              onChangeText={(text) => {
+                if (flow.draftKey) setComposerDraftText(flow.draftKey, text);
+              }}
               placeholder={gt("Ask anything")}
               multiline
               style={{ minHeight: 64 }}
@@ -1135,6 +1150,9 @@ export function NewTaskDraftScreen(props: {
         isSavingQueuedEdit={false}
         onCancelQueuedRunEdit={() => {}}
         onRemoveQueuedEditAttachment={() => {}}
+        liveShellCommands={[]}
+        userShellCommandOwnsWorkingSlot={false}
+        onStoppedShellCommand={() => {}}
         projectWorkspaceRoot={selectedProject.workspaceRoot}
         threadCwd={flow.workspaceCwd}
         selectedThreadQueueCount={0}

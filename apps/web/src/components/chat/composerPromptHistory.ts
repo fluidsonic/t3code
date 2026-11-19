@@ -1,4 +1,5 @@
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
 import {
   EnvironmentContextRecord,
   type OrchestrationMessageContext,
@@ -22,6 +23,8 @@ const isEnvironmentContextRecord = Schema.is(EnvironmentContextRecord);
 type ComposerPromptHistoryMessage = Parameters<typeof resolveUserMessagePresentation>[0] & {
   readonly id: string;
   readonly context?: OrchestrationMessageContext | undefined;
+  readonly shellCommand?: boolean | undefined;
+  readonly shellCommandStopped?: true | undefined;
 };
 
 /** Thread and machine mentions; the draft holds these records, so recall can restore their chips. */
@@ -36,6 +39,8 @@ interface ComposerPromptHistoryEntry {
   readonly id: string;
   readonly prompt: string;
   readonly mentions: ComposerPromptHistoryMentions;
+  /** The entry is a `! cmd` shell command and comes back in shell mode. */
+  readonly shellMode: boolean;
 }
 
 export interface ComposerPromptHistoryPosition {
@@ -56,6 +61,7 @@ interface ComposerPromptHistoryStep {
   readonly position: ComposerPromptHistoryPosition | null;
   readonly prompt: string;
   readonly mentions: ComposerPromptHistoryMentions;
+  readonly shellMode: boolean;
 }
 
 function stripTrailingReviewComments(prompt: string): string {
@@ -165,19 +171,32 @@ export function recallComposerMessage(
   };
 }
 
+/**
+ * `shellCommands` is whether a recalled command comes back as one. Without it, a command's
+ * message recalls as its text, `! cmd`, like any other message, except a stopped command: the
+ * agent never saw it, so it stays a command, which the composer then refuses to send.
+ */
 export function buildComposerPromptHistoryEntries(
   messages: ReadonlyArray<ComposerPromptHistoryMessage>,
+  options: { readonly shellCommands: boolean },
 ): ComposerPromptHistoryEntry[] {
   const entries: ComposerPromptHistoryEntry[] = [];
   for (const message of messages) {
     if (message.role !== "user") continue;
     // Automations and other agents send user-role messages; recall only what the user typed.
     if (resolveUserMessagePresentation(message).attribution !== null) continue;
-    const { prompt, mentions } = recallComposerMessage(message);
+    const { prompt, mentions, shellMode } =
+      message.shellCommand === true &&
+      (options.shellCommands || message.shellCommandStopped === true)
+        ? {
+            ...composerPromptForMessage({ text: message.text.trim(), shellCommand: true }),
+            mentions: NO_MENTIONS,
+          }
+        : { ...recallComposerMessage(message), shellMode: false };
     if (prompt.length === 0) continue;
-    const entry = { id: message.id, prompt, mentions };
+    const entry = { id: message.id, prompt, mentions, shellMode };
     const previous = entries[entries.length - 1];
-    if (previous && previous.prompt === prompt) {
+    if (previous && previous.prompt === prompt && previous.shellMode === shellMode) {
       entries[entries.length - 1] = entry;
       continue;
     }
@@ -191,6 +210,7 @@ function recall(entry: ComposerPromptHistoryEntry): ComposerPromptHistoryStep {
     position: { entryId: entry.id, recalled: entry.prompt },
     prompt: entry.prompt,
     mentions: entry.mentions,
+    shellMode: entry.shellMode,
   };
 }
 
@@ -213,6 +233,6 @@ export function stepComposerPromptHistory(input: {
 
   if (activeIndex < 0) return null;
   const entry = entries[activeIndex + 1];
-  if (!entry) return { position: null, prompt: "", mentions: NO_MENTIONS };
+  if (!entry) return { position: null, prompt: "", mentions: NO_MENTIONS, shellMode: false };
   return recall(entry);
 }
