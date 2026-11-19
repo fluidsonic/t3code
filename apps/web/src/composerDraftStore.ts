@@ -1,4 +1,9 @@
 import {
+  composerDraftIsShellCommand,
+  nextComposerShellMode,
+} from "@t3tools/client-runtime/user-shell-command";
+import { isShellCommandPrompt, withoutSpaceAfterShellPrefix } from "@t3tools/shared/shellCommand";
+import {
   composerFileAttachmentMimeType,
   composerImageDedupKey,
   rememberComposerImageBytes,
@@ -351,6 +356,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   modelSelectionExplicit: Schema.optionalKey(Schema.Boolean),
   runtimeMode: Schema.optionalKey(RuntimeMode),
   interactionMode: Schema.optionalKey(ProviderInteractionMode),
+  shellMode: Schema.optionalKey(Schema.Boolean),
 });
 type PersistedComposerThreadDraftState = typeof PersistedComposerThreadDraftState.Type;
 
@@ -481,6 +487,8 @@ export interface ComposerThreadDraftState {
   modelSelectionExplicit?: boolean;
   runtimeMode: RuntimeMode | null;
   interactionMode: ProviderInteractionMode | null;
+  /** The prompt is a `! cmd` shell command. Read it through `composerDraftIsShellCommand`. */
+  shellMode?: boolean;
 }
 
 export function composerDraftHasUserContent(
@@ -642,7 +650,17 @@ interface ComposerDraftStoreState {
   finalizePromotedDraftThread: (threadRef: ComposerThreadTarget) => void;
   clearDraftThread: (threadRef: ComposerThreadTarget) => void;
   setStickyModelSelection: (modelSelection: ModelSelection | null | undefined) => void;
-  setPrompt: (threadRef: ComposerThreadTarget, prompt: string) => void;
+  /**
+   * Without `shellMode`, the mode follows the edit (see `nextComposerShellMode`), and only where
+   * the caller says shell commands are available; anywhere else a leading `!` stays prose. Pass
+   * `shellMode` when the caller decides, such as for a recalled or queued command, and only once
+   * it has checked that availability itself.
+   */
+  setPrompt: (
+    threadRef: ComposerThreadTarget,
+    prompt: string,
+    options?: { readonly shellMode?: boolean; readonly shellCommandsAvailable?: boolean },
+  ) => void;
   setTerminalContexts: (threadRef: ComposerThreadTarget, contexts: TerminalContextDraft[]) => void;
   setModelSelection: (
     threadRef: ComposerThreadTarget,
@@ -2332,6 +2350,7 @@ function normalizePersistedDraftsByThreadId(
         : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
       ...(interactionMode ? { interactionMode } : {}),
+      ...(draftCandidate.shellMode === true ? { shellMode: true } : {}),
     };
   }
 
@@ -2501,6 +2520,7 @@ export function partializeComposerDraftStoreState(
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
+      ...(composerDraftIsShellCommand(draft) ? { shellMode: true } : {}),
     };
     persistedDraftsByThreadKey[threadKey] = persistedDraft;
   }
@@ -2779,6 +2799,7 @@ function toHydratedThreadDraft(
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
+    ...(persistedDraft.shellMode === true ? { shellMode: true } : {}),
   };
 }
 
@@ -2825,6 +2846,28 @@ function toHydratedDraftThreadState(
           persistedDraftThread.promotedTo.threadId as ThreadId,
         )
       : null,
+  };
+}
+
+function withShellModePrompt(
+  existing: ComposerThreadDraftState,
+  prompt: string,
+  options: { readonly shellMode?: boolean; readonly shellCommandsAvailable?: boolean } | undefined,
+): ComposerThreadDraftState {
+  const shellMode =
+    isShellCommandPrompt(prompt) &&
+    (options?.shellMode ??
+      nextComposerShellMode({
+        previousPrompt: existing.prompt,
+        previousShellMode: existing.shellMode === true,
+        nextPrompt: prompt,
+        available: options?.shellCommandsAvailable === true,
+      }));
+  const { shellMode: _previousShellMode, ...rest } = existing;
+  return {
+    ...rest,
+    prompt: shellMode ? withoutSpaceAfterShellPrefix(prompt) : prompt,
+    ...(shellMode ? { shellMode: true } : {}),
   };
 }
 
@@ -3312,17 +3355,22 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             return { draftsByThreadKey: nextDraftsByThreadKey };
           });
         },
-        setPrompt: (threadRef, prompt) => {
+        setPrompt: (threadRef, prompt, options) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
           if (threadKey.length === 0) {
             return;
           }
           set((state) => {
             const existing = state.draftsByThreadKey[threadKey] ?? createEmptyThreadDraft();
-            const nextDraft: ComposerThreadDraftState = {
-              ...existing,
-              prompt,
-            };
+            // Shell mode is out of play unless commands are available, the caller asks for it, or
+            // the draft is already in it; the prompt is then stored exactly as given.
+            const shellModeInPlay =
+              options?.shellMode === true ||
+              options?.shellCommandsAvailable === true ||
+              existing.shellMode === true;
+            const nextDraft: ComposerThreadDraftState = shellModeInPlay
+              ? withShellModePrompt(existing, prompt, options)
+              : { ...existing, prompt };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
             if (shouldRemoveDraft(nextDraft)) {
               delete nextDraftsByThreadKey[threadKey];
@@ -4516,8 +4564,15 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   parseScopedThreadKey(toKey)?.environmentId ??
                   null)
                 : to.environmentId;
+            // The destination's mode goes with the prompt this replaces.
+            const { shellMode: _replacedShellMode, ...destinationRest } = destination;
+            const { shellMode: _sourceShellMode, ...movedContent } = composerDraftContent(source);
             const nextDestination = clearStaleFileUploadMetadata(
-              { ...destination, ...composerDraftContent(source) },
+              {
+                ...destinationRest,
+                ...movedContent,
+                ...(composerDraftIsShellCommand(source) ? { shellMode: true } : {}),
+              },
               destinationEnvironmentId,
             );
             // Moved images still use these blob URLs at the destination; do not revoke them.

@@ -37,6 +37,7 @@ import {
   type ClaudeModelLedger,
 } from "../../provider/ClaudeTurnTokenUsage.ts";
 import { toMcpElicitationResponse } from "../../provider/CodexMcpElicitation.ts";
+import { makeClaudeTurnHold } from "./ClaudeTurnHold.ts";
 import {
   type CanUseTool,
   type ElicitationRequest,
@@ -1377,6 +1378,7 @@ export function loggedClaudeQueryOptions(
       ? { allowDangerouslySkipPermissions: true }
       : {}),
     ...(options.canUseTool === undefined ? {} : { hasCanUseTool: true }),
+    ...(options.hooks === undefined ? {} : { hasHooks: true }),
     ...(options.env === undefined ? {} : { hasEnvironment: true }),
     ...(options.mcpServers === undefined ? {} : { hasMcpServers: true }),
   };
@@ -2478,6 +2480,7 @@ export function makeClaudeQueryOptions(input: {
   readonly disallowedTools?: ReadonlyArray<string>;
   readonly permissionMode?: PermissionMode;
   readonly canUseTool?: CanUseTool;
+  readonly hooks?: ClaudeQueryOptions["hooks"];
   readonly onUserDialog?: ClaudeQueryOptions["onUserDialog"];
   readonly onElicitation?: ClaudeQueryOptions["onElicitation"];
   readonly onStop?: HookCallback;
@@ -2599,6 +2602,7 @@ export function makeClaudeQueryOptions(input: {
     ...(input.allowedTools === undefined ? {} : { allowedTools: [...input.allowedTools] }),
     ...(input.disallowedTools === undefined ? {} : { disallowedTools: [...input.disallowedTools] }),
     ...(input.canUseTool === undefined ? {} : { canUseTool: input.canUseTool }),
+    ...(input.hooks === undefined ? {} : { hooks: input.hooks }),
     ...(input.allowDangerouslySkipPermissions === true
       ? { allowDangerouslySkipPermissions: true }
       : {}),
@@ -2649,10 +2653,14 @@ export function makeClaudeQueryOptions(input: {
     ...(deviceInstructions || input.onStop !== undefined
       ? {
           hooks: {
+            ...input.hooks,
             ...(deviceInstructions
               ? { SubagentStart: [{ hooks: [subagentDeviceInstructions] }] }
               : {}),
-            ...(input.onStop === undefined ? {} : { Stop: [{ hooks: [input.onStop] }] }),
+            // The session's turn-hold Stop hook runs beside this one.
+            ...(input.onStop === undefined
+              ? {}
+              : { Stop: [...(input.hooks?.Stop ?? []), { hooks: [input.onStop] }] }),
           },
         }
       : {}),
@@ -5508,6 +5516,8 @@ interface ClaudeLiveQueryContext {
   // Root messages this process streamed; what it holds beyond the history it resumed.
   readonly emittedMessageUuids: Set<string>;
   transcriptPath: string | undefined;
+  // Whether this process got the turn-hold hooks, so `pauseTurn` can hold it.
+  readonly turnHoldHooks: boolean;
 }
 
 interface ActiveClaudeToolCall {
@@ -6200,6 +6210,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         );
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
+        // Holds the active turn at a steering window while steered `! cmd` commands run.
+        const turnHold = makeClaudeTurnHold();
         const taskOutputTails = new Map<
           string,
           { readonly fiber: Fiber.Fiber<void>; readonly stop: Deferred.Deferred<void> }
@@ -9766,6 +9778,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? { ...requested, status: "failed" as const, failure: retryBudgetFailure }
               : requested;
           input.context.steersClosed = true;
+          yield* turnHold.turnEnded(input.context.providerTurnId);
           yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
           if (input.status === "completed") {
             yield* assistantDeltas.flushTurn(input.context.nativeTurnId);
@@ -13580,6 +13593,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
           }
 
+          // The turn-hold hooks run on every tool batch, so a process gets them only while the
+          // environment has shell commands on. One opened before the setting was turned on holds
+          // nothing: `pauseTurn` reports it unsupported and steered commands interrupt instead.
+          const turnHoldHooks = Option.isSome(serverSettings)
+            ? yield* serverSettings.value.getSettings.pipe(
+                Effect.map((settings) => settings.enableShellCommands),
+                Effect.orElseSucceed(() => false),
+              )
+            : false;
           const openedWithResume = (yield* Ref.get(openedNativeThreads)).has(nativeThreadId);
           // Idle release loses openedNativeThreads; persisted turns still require resume to avoid "already in use".
           const hasPersistedProviderTurn =
@@ -13629,6 +13651,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   allowDangerouslySkipPermissions: queryPolicy.allowDangerouslySkipPermissions,
                 }),
             canUseTool,
+            ...(turnHoldHooks ? { hooks: turnHold.hooks } : {}),
             onUserDialog,
             onElicitation,
             onStop,
@@ -13723,6 +13746,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
             emittedMessageUuids: new Set(),
             transcriptPath: undefined,
+            turnHoldHooks,
           };
           // One step, so the replaced process cannot exit between the install and the handoff.
           yield* Ref.update(queryContext, (replaced) => {
@@ -14623,6 +14647,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
         );
 
+        const pauseTurn = Effect.fn("ClaudeAdapterV2.pauseTurn")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2PauseInput,
+        ) {
+          if ((yield* Ref.get(activeTurn))?.providerTurnId !== turnInput.providerTurnId) {
+            return "turn_ended" as const;
+          }
+          if ((yield* Ref.get(queryContext))?.turnHoldHooks !== true) return "unsupported" as const;
+          return yield* turnHold.pause(turnInput.providerTurnId);
+        });
+
+        const releaseTurn = (turnInput: ProviderAdapter.ProviderAdapterV2ReleaseInput) =>
+          turnHold.release(turnInput.providerTurnId, turnInput.text);
+
         const closeSession = Effect.fnUntraced(function* () {
           const existing = yield* Ref.get(queryContext);
           if (existing !== null) {
@@ -15076,6 +15113,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 );
             }),
           },
+          pauseTurn,
+          releaseTurn,
           stopTask: Effect.fn("ClaudeAdapterV2.stopTask")(function* ({ providerThread, taskId }) {
             const liveQuery = yield* Ref.get(queryContext);
             const task = (yield* Ref.get(sessionSubagentsByTaskId)).get(taskId);
