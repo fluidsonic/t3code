@@ -96,6 +96,7 @@ import { selectThreadModel } from "../../state/thread-model-selection";
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import { providerWorkspaceSnapshotRefresh } from "../../state/provider-workspace-snapshot-refresh";
+import { useCanRunShellCommands } from "../../state/shell-commands";
 import { threadAllowsProviderSwitch } from "../../state/thread-provider-switching";
 import { environmentServerConfigsAtom, serverEnvironment } from "../../state/server";
 import { mobilePreferencesAtom } from "../../state/preferences";
@@ -1508,6 +1509,9 @@ export function ExistingThreadSettingsRouteScreen({
   const draftSettings = useComposerDraftSettings(draftKey);
   const threadDraftSettings = useComposerDraftSettings(threadKey);
   const prompt = useComposerDraft(draftKey).text;
+  // Matches the composer: a queued message's `!` stays prose.
+  const canRunShellCommands =
+    useCanRunShellCommands(route.params.environmentId) && queuedRunEdit?.shellCommand !== false;
 
   if (!selectedThread) {
     return <View className="flex-1 bg-sheet" />;
@@ -1549,7 +1553,7 @@ export function ExistingThreadSettingsRouteScreen({
       providerGroups={groupByProvider(modelOptions)}
       selectedModel={modelSelection}
       prompt={prompt}
-      onPromptChange={(text) => setComposerDraftText(draftKey, text)}
+      onPromptChange={(text) => setComposerDraftText(draftKey, text, { canRunShellCommands })}
       reportedModelSelection={reportedModelSelection}
       onSelectModel={(option) =>
         updateModelSelection(

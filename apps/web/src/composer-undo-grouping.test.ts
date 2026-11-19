@@ -8,6 +8,7 @@ import {
   COMPOSER_UNDO_GROUP_DELAY,
   type ComposerChangeKind,
   groupUndoByChangeKind,
+  joinPreviousUndoStep,
   markAsClipboardEdit,
 } from "./composer-undo-grouping";
 
@@ -81,6 +82,12 @@ function composer(text = "") {
       }
       return api;
     },
+    /** A store-driven follow-up to the last edit, landing after a pause. */
+    follow: (s: string) => {
+      clock += COMPOSER_UNDO_GROUP_DELAY * 2;
+      dispatch(joinPreviousUndoStep(markAsClipboardEdit(state.tr.insertText(s), "paste")));
+      return api;
+    },
     undo: () => (undo(state, dispatch), api),
   };
   return api;
@@ -114,6 +121,15 @@ describe("composer undo grouping", () => {
     expect(editor.undo().text()).toBe("hello w");
     expect(editor.undo().text()).toBe("hello worl");
     expect(editor.undo().text()).toBe("hello world");
+  });
+
+  it("undoes a joined follow-up together with the edit before it", () => {
+    const editor = composer()
+      .type("echo ")
+      .wait(COMPOSER_UNDO_GROUP_DELAY * 2)
+      .type("hi");
+    expect(editor.follow("!").text()).toBe("echo hi!");
+    expect(editor.undo().text()).toBe("echo ");
   });
 
   it("keeps IME composition as one run of typing", () => {

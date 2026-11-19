@@ -90,6 +90,7 @@ import {
   parseThreadLinkHref,
   threadLinkRefs,
 } from "@t3tools/shared/threadLinks";
+import { shellCommandFromMessageText } from "@t3tools/shared/shellCommand";
 import { PROMPT_LINK_MAX_PROMPT_LENGTH } from "@t3tools/shared/promptLinks";
 import {
   parseComposerContextHref,
@@ -273,6 +274,19 @@ import {
   type GroupedThreadFeedRow,
   type ThreadFeedRow,
 } from "./pending-thread-feed";
+import {
+  ShellCommandActionsSheet,
+  ShellCommandsCodeBlock,
+  ThreadShellCommandMessage,
+} from "./thread-shell-command";
+import {
+  type CodeBlockShellActions,
+  codeBlockRunnableCommand,
+  linkInlineShellCommands,
+  markdownMayHaveShellCommand,
+  shellCommandFromLink,
+  splitShellCommandMarkdown,
+} from "./threadShellCommandPresentation";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
 import { resolveThreadFeedFixedItemSize } from "./thread-feed-item-size";
 import { htmlRenderFrameHeight } from "@t3tools/shared/htmlRender";
@@ -398,6 +412,8 @@ export interface ThreadFeedProps {
   readonly latestRun: ThreadFeedLatestRun | null;
   readonly activeWorkStartedAt: string | null;
   readonly runlessWorkActive?: boolean;
+  /** See `userShellCommandOwnsWorkingSlot`. */
+  readonly userShellCommandOwnsWorkingSlot?: boolean;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
   readonly anchorMessageId: MessageId | null;
@@ -419,6 +435,8 @@ export interface ThreadFeedProps {
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;
   readonly onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
   readonly onCiteAssistantText?: (citation: AssistantCitation) => void;
+  /** What a tapped runnable code block in an assistant message offers. */
+  readonly codeBlockShellActions?: CodeBlockShellActions;
 }
 
 const USER_MESSAGE_COPY_MENU_ACTIONS = [
@@ -1306,6 +1324,12 @@ function ArtifactTemplateCard(props: {
   );
 }
 
+/** What a command in an assistant message can do; `onMore` opens its actions. */
+interface ShellCommandBlockActions {
+  readonly actions: CodeBlockShellActions;
+  readonly onMore: (command: string) => void;
+}
+
 const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
   readonly markdown: string;
   readonly environmentId: EnvironmentId;
@@ -1317,6 +1341,8 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
   readonly onUseArtifactTemplate?: ((template: CodexArtifactTemplate) => void) | undefined;
   readonly renderImage: MarkdownImageRenderer;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill> | undefined;
+  readonly streaming?: boolean;
+  readonly shellBlockActions?: ShellCommandBlockActions | null;
 }) {
   const gt = useGT();
   const liveMarkdown = useLiveThreadLinkLabels(
@@ -1347,15 +1373,37 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
   const threadIcons = useThreadChipIcons(props.environmentId, liveMarkdown);
   const withGallery = useFilePreviewGallery();
   const onImagePress = props.linkHandlers.onImagePress;
+  const { shellBlockActions = null, streaming = false } = props;
+  const onShellCommandPress = shellBlockActions?.onMore ?? null;
   const linkHandlers: MarkdownLinkHandlers = {
     ...props.linkHandlers,
     ...(onImagePress ? { onImagePress: (href: string) => onImagePress(href, withGallery) } : {}),
-    onLinkPress: (href) => props.linkHandlers.onLinkPress(href, props.reply),
+    onLinkPress: (href) => {
+      const command = shellCommandFromLink(href);
+      if (command === null) props.linkHandlers.onLinkPress(href, props.reply);
+      else onShellCommandPress?.(command);
+    },
     onFileContextMenuAction: (href, actionId) =>
       props.linkHandlers.onFileContextMenuAction(href, actionId, props.reply),
     linkCustomization: (href) =>
       withChipIcon(props.linkHandlers.linkCustomization?.(href), threadIcons.get(href)),
   };
+  // Arms block taps only on finished messages that may hold a command.
+  const onCodeBlockPress = useMemo(
+    () =>
+      onShellCommandPress === null || streaming || !markdownMayHaveShellCommand(liveMarkdown)
+        ? undefined
+        : (block: { readonly code: string; readonly language: string }) => {
+            const command = codeBlockRunnableCommand({
+              code: block.code,
+              language: block.language,
+              streaming,
+              markdown: liveMarkdown,
+            });
+            if (command !== null) onShellCommandPress(command);
+          },
+    [liveMarkdown, onShellCommandPress, streaming],
+  );
 
   return (
     <>
@@ -1393,6 +1441,8 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
         renderImage={props.renderImage}
         skills={props.skills}
         models={models}
+        onCodeBlockPress={onCodeBlockPress}
+        shellBlockActions={shellBlockActions}
       />
       {quoteChoices.length > 0 && props.onCiteAssistantText ? (
         <Sheet title={gt("Choose quote source")} onClose={() => setQuoteSelection(null)}>
@@ -1435,8 +1485,18 @@ function AssistantMarkdownBlocks(props: {
   readonly renderImage: MarkdownImageRenderer;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill> | undefined;
   readonly models: ReturnType<typeof useModelMentions>;
+  readonly onCodeBlockPress?:
+    | ((block: { readonly code: string; readonly language: string }) => void)
+    | undefined;
+  readonly shellBlockActions: ShellCommandBlockActions | null;
 }) {
   const m = useMessages();
+  // Where blocks run, `! cmd` blocks render as command blocks, as on the web, and inline
+  // commands open their actions when tapped.
+  const blockActions =
+    props.onCodeBlockPress && props.shellBlockActions?.actions.runCommand
+      ? props.shellBlockActions
+      : null;
   const { blocks, definitions } = useMemo(() => {
     const blocks = splitMarkdownDetails(props.markdown, m).map((block) =>
       block.kind === "details"
@@ -1480,27 +1540,48 @@ function AssistantMarkdownBlocks(props: {
         );
       }
       if (segment.markdown.trim().length === 0) return null;
-      return (
-        <SelectableMarkdownText
-          key={`markdown:${offset}`}
-          markdown={renderCodexInlineDirectivesAsMarkdown(
-            withReferenceDefinitions(segment.markdown, definitions),
-          )}
-          skills={props.skills}
-          models={props.models}
-          textStyle={props.markdownStyles.nativeTextStyle}
-          onCiteText={
-            props.onCiteText
-              ? (text) =>
-                  props.onCiteText?.(
-                    text,
-                    `${props.citationPath ?? ""}${blockIndex}:${segmentIndex}`,
-                  )
-              : undefined
-          }
-          {...props.linkHandlers}
-          renderImage={props.renderImage}
-        />
+      const parts =
+        blockActions === null
+          ? [{ kind: "markdown" as const, markdown: segment.markdown }]
+          : splitShellCommandMarkdown(segment.markdown);
+      return parts.map((part, index) =>
+        part.kind === "markdown" ? (
+          <SelectableMarkdownText
+            // oxlint-disable-next-line react/no-array-index-key -- a segment's parts never reorder
+            key={`markdown:${offset}:${index}`}
+            markdown={renderCodexInlineDirectivesAsMarkdown(
+              withReferenceDefinitions(
+                blockActions === null ? part.markdown : linkInlineShellCommands(part.markdown),
+                definitions,
+              ),
+            )}
+            skills={props.skills}
+            models={props.models}
+            textStyle={props.markdownStyles.nativeTextStyle}
+            onCiteText={
+              props.onCiteText
+                ? (text) =>
+                    props.onCiteText?.(
+                      text,
+                      `${props.citationPath ?? ""}${blockIndex}:${segmentIndex}`,
+                    )
+                : undefined
+            }
+            {...props.linkHandlers}
+            renderImage={props.renderImage}
+            onCodeBlockPress={props.onCodeBlockPress}
+          />
+        ) : blockActions === null ? null : (
+          <ShellCommandsCodeBlock
+            // oxlint-disable-next-line react/no-array-index-key -- a segment's parts never reorder
+            key={`commands:${offset}:${index}`}
+            code={part.code}
+            commands={part.commands}
+            actions={blockActions.actions}
+            onMore={blockActions.onMore}
+            backgroundColor={props.markdownStyles.nativeTextStyle.codeBlockBackgroundColor}
+          />
+        ),
       );
     });
   });
@@ -2015,6 +2096,7 @@ function renderFeedEntry(
     readonly workflowOpening: WorkflowOpening | null;
     readonly userMessageGrouping: GroupedThreadFeedRow["userMessageGrouping"];
     readonly m: ReturnType<typeof useMessages>;
+    readonly shellBlockActions: ShellCommandBlockActions | null;
   },
 ) {
   const entry = info.item;
@@ -2299,6 +2381,80 @@ function renderFeedEntry(
           icon="arrow.down.right.and.arrow.up.left"
           iconColor={iconSubtleColor}
           active={active}
+        />
+      );
+    }
+    if (isUser && message.shellCommand === true) {
+      const rowId = `shell:${message.id}`;
+      const pending = entry.pendingMessage !== undefined && !entry.acknowledged;
+      return (
+        <ThreadShellCommandMessage
+          environmentId={props.environmentId}
+          command={shellCommandFromMessageText(message.text)}
+          result={message.shellCommandResult ?? null}
+          attachments={attachments}
+          expanded={props.expandedWorkRows[rowId] ?? false}
+          onToggleExpanded={() => props.onToggleWorkRow(rowId, entry.id)}
+          bubbleColor={userBubbleColor}
+          bubbleMaxWidth={props.duoColumns ? "85%" : props.userBubbleMaxWidth}
+          themeAppearance={props.themeAppearance}
+          renderAttachment={(attachment) =>
+            isFileAttachment(attachment) ? (
+              <MessageAttachmentFile
+                key={attachment.id}
+                environmentId={props.environmentId}
+                attachment={attachment}
+                onPressPreview={props.onPressPreview}
+                onPlaybackStart={props.onPlaybackStart}
+              />
+            ) : null
+          }
+          footer={
+            <View className="mt-1 flex-row items-center justify-end gap-1 pr-0.5">
+              <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
+                {pending ? m(msg("Pending", { $context: "message not yet sent" })) : timestampLabel}
+              </Text>
+              {props.onEditPendingMessage !== null &&
+              pending &&
+              entry.pendingMessage &&
+              !entry.pendingMessage.creation &&
+              // A Run all waits as one entry; its first command's row holds the edit for all.
+              entry.id === entry.pendingMessage.messageId &&
+              entry.pendingMessage.messageId !== props.dispatchingMessageId ? (
+                <Pressable
+                  accessibilityRole="button"
+                  // The composer holds one command, so a Run all's several can only be cancelled.
+                  accessibilityLabel={
+                    entry.pendingMessage.followingShellCommands === undefined
+                      ? m(msg("Edit pending command"))
+                      : m(msg("Cancel pending commands"))
+                  }
+                  hitSlop={8}
+                  className="size-7 items-center justify-center"
+                  onPress={() => {
+                    if (entry.pendingMessage && props.onEditPendingMessage) {
+                      props.onEditPendingMessage(entry.pendingMessage);
+                    }
+                  }}
+                >
+                  <SymbolView
+                    name={
+                      entry.pendingMessage.followingShellCommands === undefined ? "pencil" : "xmark"
+                    }
+                    size={14}
+                    tintColor={iconSubtleColor}
+                  />
+                </Pressable>
+              ) : null}
+              <CopyTextButton
+                accessibilityLabel={m(msg("Copy command"))}
+                text={shellCommandFromMessageText(message.text)}
+                tintColor={iconSubtleColor}
+                buttonSize={28}
+                iconSize={13}
+              />
+            </View>
+          }
         />
       );
     }
@@ -2680,6 +2836,10 @@ function renderFeedEntry(
               onUseArtifactTemplate={props.onUseArtifactTemplate}
               renderImage={props.renderMarkdownImage}
               skills={props.skills}
+              // Only an armed block tap reads streaming, so without one the row memoizes as before.
+              {...(props.shellBlockActions === null
+                ? {}
+                : { streaming: message.streaming, shellBlockActions: props.shellBlockActions })}
             />
           </MarkdownImageAvailableWidthContext>
         ) : null}
@@ -2990,6 +3150,7 @@ function useThreadFeedPresentation(
       { toolCallVisibility: props.toolCallVisibility ?? "showAll", revealedMessageId },
       messages,
       locale,
+      props.userShellCommandOwnsWorkingSlot ?? false,
     ),
     props.feed,
     props.queuedMessages,
@@ -3090,6 +3251,34 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const m = useMessages();
   const formatMessageTime = useMessageTimeFormatter();
   const { listRef, onIsAtEndChange, onHeaderMaterialVisibilityChange } = props;
+  const [shellActionCommand, setShellActionCommand] = useState<string | null>(null);
+  const hasShellCommandActions =
+    props.codeBlockShellActions?.runCommand !== undefined ||
+    props.codeBlockShellActions?.editCommand !== undefined;
+  // The actions are rebuilt with every thread update; the rows that render command blocks read
+  // them through stable callbacks, so an update doesn't re-render every message on screen.
+  const shellActionsRef = useRef(props.codeBlockShellActions);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed shell actions to the ref that command block callbacks read
+  useLayoutEffect(() => {
+    shellActionsRef.current = props.codeBlockShellActions;
+  });
+  const canRunShellCommand = props.codeBlockShellActions?.runCommand !== undefined;
+  const shellBlockActions = useMemo(
+    () =>
+      hasShellCommandActions
+        ? {
+            actions: canRunShellCommand
+              ? {
+                  runCommand: (command: string) => shellActionsRef.current?.runCommand?.(command),
+                  runCommands: (commands: ReadonlyArray<string>) =>
+                    shellActionsRef.current?.runCommands?.(commands),
+                }
+              : {},
+            onMore: setShellActionCommand,
+          }
+        : null,
+    [canRunShellCommand, hasShellCommandActions],
+  );
   const workflowOpening = useWorkflowOpening(props.detailRef);
   const guestShare = useThreadGuestShare(props.detailRef);
   const deviceType = useDeviceType();
@@ -4255,6 +4444,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             skills: props.skills,
             workspaceRoot: props.workspaceRoot,
             workflowOpening,
+            shellBlockActions,
           })}
           {props.worktreeSetup && info.index === setupAnchorIndex ? (
             <WorktreeSetupCard
@@ -4433,6 +4623,13 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           />
         ) : null}
         <FilePreviewModal source={expandedFile} onRequestClose={closeFilePreview} />
+        {shellActionCommand !== null && props.codeBlockShellActions ? (
+          <ShellCommandActionsSheet
+            command={shellActionCommand}
+            actions={props.codeBlockShellActions}
+            onClose={() => setShellActionCommand(null)}
+          />
+        ) : null}
       </View>
     </PresentationSource>
   );
