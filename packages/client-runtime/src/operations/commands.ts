@@ -28,6 +28,7 @@ import {
   type RuntimeRequestId,
   type ThreadId,
   type ThreadEnvMode,
+  type TurnItemId,
   type UploadChatAttachment,
   type GuestMessageId,
 } from "@t3tools/contracts";
@@ -196,6 +197,13 @@ export interface StartThreadTurnInput extends ThreadCommandInput {
     readonly messageId: MessageId;
     readonly role: "user";
     readonly text: string;
+    /** `text` is a shell command to run, as `! cmd` (see `shellCommandMessageText`). */
+    readonly shellCommand?: boolean;
+    /** More commands to run after this one, in order, as one group (a code block's Run all). */
+    readonly followingShellCommands?: ReadonlyArray<{
+      readonly messageId: MessageId;
+      readonly text: string;
+    }>;
     readonly attachments: ReadonlyArray<ChatAttachment | UploadChatAttachment>;
     readonly context?: import("@t3tools/contracts").OrchestrationMessageContext;
     readonly idleCompaction?: import("@t3tools/contracts").OrchestrationV2IdleCompaction;
@@ -283,6 +291,8 @@ export interface RetryWorkspacePreparationInput extends ThreadCommandInput {
 export interface EditQueuedRunInput extends ThreadCommandInput {
   readonly runId: RunId;
   readonly text: string;
+  /** Must match the queued message: the server rejects turning a message into a command. */
+  readonly shellCommand?: boolean;
   /**
    * Full replacement attachment list for the queued message. Omitted =
    * text-only edit that leaves attachments untouched.
@@ -292,6 +302,10 @@ export interface EditQueuedRunInput extends ThreadCommandInput {
     readonly attachments: ReadonlyArray<ChatAttachment | UploadChatAttachment>;
     readonly context?: import("@t3tools/contracts").OrchestrationMessageContext;
   };
+}
+
+export interface StopUserShellCommandInput extends ThreadCommandInput {
+  readonly turnItemId: TurnItemId;
 }
 
 const allocateCommandId = Effect.fn("EnvironmentCommands.allocateCommandId")(function* (
@@ -830,6 +844,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       initialMessage: {
         messageId: input.message.messageId,
         text: input.message.text,
+        ...(input.message.shellCommand === true ? { shellCommand: true } : {}),
         ...(context ? { context } : {}),
         attachments,
       },
@@ -856,6 +871,10 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
           attachments.length === 0
             ? MANUAL_CONTINUATION_FALLBACK_TEXT
             : input.message.text,
+        ...(input.message.shellCommand === true ? { shellCommand: true } : {}),
+        ...(input.message.followingShellCommands === undefined
+          ? {}
+          : { followingShellCommands: input.message.followingShellCommands }),
         ...(context ? { context } : {}),
         ...(input.message.idleCompaction === undefined
           ? {}
@@ -885,6 +904,10 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       threadId: input.threadId,
       messageId: input.message.messageId,
       text: input.message.text,
+      ...(input.message.shellCommand === true ? { shellCommand: true } : {}),
+      ...(input.message.followingShellCommands === undefined
+        ? {}
+        : { followingShellCommands: input.message.followingShellCommands }),
       ...(context ? { context } : {}),
       ...(input.message.idleCompaction === undefined
         ? {}
@@ -1188,6 +1211,17 @@ export const cancelQueuedRun = Effect.fn("EnvironmentCommands.cancelQueuedRun")(
   });
 });
 
+export const stopUserShellCommand = Effect.fn("EnvironmentCommands.stopUserShellCommand")(
+  function* (input: StopUserShellCommandInput) {
+    return yield* dispatch({
+      type: "user-shell-command.stop",
+      commandId: yield* allocateCommandId(input),
+      threadId: input.threadId,
+      turnItemId: input.turnItemId,
+    });
+  },
+);
+
 export const retryWorkspacePreparation = Effect.fn("EnvironmentCommands.retryWorkspacePreparation")(
   function* (input: RetryWorkspacePreparationInput) {
     return yield* dispatch({
@@ -1212,6 +1246,7 @@ export const editQueuedRun = Effect.fn("EnvironmentCommands.editQueuedRun")(func
     threadId: input.threadId,
     runId: input.runId,
     text: input.text,
+    ...(input.shellCommand === true ? { shellCommand: true } : {}),
     ...(attachments === undefined ? {} : { attachments }),
     ...(input.edit?.context && attachments
       ? {
