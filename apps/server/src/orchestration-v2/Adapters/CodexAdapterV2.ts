@@ -933,16 +933,28 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     readonly cyberAccess?: { readonly defaultProgram: string | undefined } | undefined;
     /** The user's `model_reasoning_summary` from the Codex config, when set. */
     readonly configuredReasoningSummary?: CodexSchema.V2TurnStartParams__ReasoningSummary;
+    /** The user's `[sandbox_workspace_write]` from the Codex config, when Codex applies it. */
+    readonly configuredWorkspaceWrite?: CodexSchema.V2ConfigReadResponse__SandboxWorkspaceWrite;
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
       input.runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
         : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
+    const configured = input.configuredWorkspaceWrite;
+    // A turn's sandbox policy replaces the thread's, so restate the configured settings.
     const baseSandboxPolicy =
-      input.runtimePolicy.sandboxPolicy === undefined
-        ? runtimeModeDefaults.sandboxPolicy
-        : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
+      input.runtimePolicy.sandboxPolicy !== undefined
+        ? yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy)
+        : runtimeModeDefaults.sandboxPolicy?.type === "workspaceWrite" && configured !== undefined
+          ? {
+              type: "workspaceWrite" as const,
+              writableRoots: configured.writable_roots ?? [],
+              networkAccess: configured.network_access ?? false,
+              excludeTmpdirEnvVar: configured.exclude_tmpdir_env_var ?? false,
+              excludeSlashTmp: configured.exclude_slash_tmp ?? false,
+            }
+          : runtimeModeDefaults.sandboxPolicy;
     const extraRoots = input.runtimePolicy.workspace?.extraRoots ?? [];
     const sandboxPolicy =
       baseSandboxPolicy?.type === "workspaceWrite" && extraRoots.length > 0
@@ -8147,8 +8159,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               .request("config/read", { cwd: turnInput.runtimePolicy.cwd, includeLayers: false })
               .pipe(
                 Effect.map((response) => response.config),
-                Effect.catch(() =>
-                  Effect.logDebug("Codex config read failed.").pipe(Effect.as(undefined)),
+                Effect.catch((cause) =>
+                  Effect.logWarning("orchestration-v2.codex-config-read-failed", { cause }).pipe(
+                    Effect.as(undefined),
+                  ),
                 ),
                 withAppServerDeadline("config/read"),
               );
@@ -8174,6 +8188,26 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }),
               }).pipe(withAppServerDeadline("thread/resume"));
             }
+            const workspaceWrite = config?.sandbox_workspace_write ?? undefined;
+            // A selected or managed permission profile makes Codex ignore the legacy table.
+            const configuredWorkspaceWrite =
+              workspaceWrite === undefined ||
+              config?.default_permissions != null ||
+              turnInput.runtimePolicy.sandboxPolicy !== undefined ||
+              codexRuntimeModeTurnDefaults(turnInput.runtimePolicy.runtimeMode).sandboxPolicy
+                .type !== "workspaceWrite"
+                ? undefined
+                : yield* client.request("configRequirements/read", undefined).pipe(
+                    Effect.timeout("5 seconds"),
+                    Effect.map(({ requirements }) =>
+                      requirements?.allowedPermissionProfiles == null ? workspaceWrite : undefined,
+                    ),
+                    Effect.catch((cause) =>
+                      Effect.logWarning("orchestration-v2.codex-config-requirements-read-failed", {
+                        cause,
+                      }).pipe(Effect.as(undefined)),
+                    ),
+                  );
             const turnStartParams = yield* buildCodexTurnStartParams({
               cyberAccess: codexCyberAccess(models, turnInput.modelSelection.model),
               nativeThreadId: threadId,
@@ -8187,6 +8221,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               subscriptionSharing: adapterOptions.resolveRuntime !== undefined,
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
               ...(configuredReasoningSummary === undefined ? {} : { configuredReasoningSummary }),
+              ...(configuredWorkspaceWrite === undefined ? {} : { configuredWorkspaceWrite }),
             });
             const pendingTurn = { turnInput, hasPrompt: codexInput.length > 0 };
             yield* Ref.update(pendingRootTurns, (current) => {
