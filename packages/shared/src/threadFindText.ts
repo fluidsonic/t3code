@@ -31,7 +31,6 @@ import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
 import {
-  shouldPreserveAssistantLineBreaks,
   remarkAssistantInsights,
   CHAT_MARKDOWN_REHYPE_PLUGINS,
   CHAT_MARKDOWN_REMARK_PLUGINS,
@@ -251,7 +250,11 @@ export function searchablePlanSegments(
 ): readonly string[] {
   return [
     proposedPlanTitle(markdown) ?? "Proposed plan",
-    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), { cwd, theme }),
+    ...markdownThreadFindText(stripDisplayedPlanMarkdown(markdown), {
+      cwd,
+      lineBreaks: true,
+      theme,
+    }),
   ];
 }
 
@@ -271,7 +274,7 @@ export function searchableMessageSegments(
   return markdownThreadFindText(message.text || (message.streaming ? "" : "(empty response)"), {
     cwd,
     skills,
-    lineBreaks: shouldPreserveAssistantLineBreaks(message.text),
+    lineBreaks: true,
     renderInsights: true,
     theme,
   });
