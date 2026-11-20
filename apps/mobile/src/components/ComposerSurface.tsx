@@ -173,6 +173,8 @@ export function ComposerSurface(props: {
   readonly children: ReactNode;
   readonly style: ViewStyle;
   readonly animateLayout?: boolean;
+  /** A faint wash over the surface, such as shell mode's. */
+  readonly tintColor?: string;
 }) {
   const colors = useUniwindTheme();
   const targetBorderRadius =
@@ -219,6 +221,15 @@ export function ComposerSurface(props: {
       >
         {null}
       </AnimatedGlassSurface>
+      {props.tintColor ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            { position: "absolute", inset: 0, backgroundColor: props.tintColor },
+            animatedShapeStyle,
+          ]}
+        />
+      ) : null}
       <Animated.View
         collapsable={false}
         layout={layoutTransition}
