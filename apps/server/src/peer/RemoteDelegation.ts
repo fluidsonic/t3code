@@ -328,10 +328,16 @@ const make = Effect.gen(function* () {
         input.runtimeMode === undefined || input.runtimeMode === "inherit"
           ? undefined
           : yield* resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode);
-      const interactionMode =
-        input.interactionMode === undefined || input.interactionMode === "inherit"
-          ? undefined
-          : yield* resolveInteractionMode(parent.thread.interactionMode, input.interactionMode);
+      // A task here launches a thread there, and launched threads never run in plan mode.
+      if (
+        (yield* resolveInteractionMode(parent.thread.interactionMode, input.interactionMode)) ===
+        "plan"
+      ) {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "A task in a linked environment cannot run in plan mode.",
+        });
+      }
       const projectId = yield* resolveRemoteProject(
         scope,
         target.environmentId,
@@ -353,7 +359,6 @@ const make = Effect.gen(function* () {
           title,
           modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
-          ...(interactionMode === undefined ? {} : { interactionMode }),
           message: task,
           clientRequestId: `delegate:${scope.thread.threadId}:${key}`,
           // The thread there shows it is this thread's subagent, with a way back.
