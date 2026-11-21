@@ -22,6 +22,7 @@ import {
   MessageId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
+  type OrchestrationMessageContext,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
@@ -85,6 +86,9 @@ import {
 import { environmentThreadShells, threadEnvironment, threadFamilies } from "./threads";
 import {
   appendComposerDraftAttachments,
+  ComposerDraftKindConflictError,
+  isComposerDraftKindConflictError,
+  composerDraftMergeMixesKinds,
   composerDraftsAtom,
   flushComposerDrafts,
   type ComposerDraft,
@@ -394,6 +398,16 @@ export const removeAcknowledgedExistingThreadMessage = Effect.fn(
   acknowledgedMessageIds.delete(queuedMessage.messageId);
 });
 
+/** The text a queued message is delivered with. A `! cmd` goes exactly as typed, without context. */
+export function queuedMessageServerContent(input: {
+  readonly text: string;
+  readonly shellCommand?: boolean | undefined;
+  readonly context: OrchestrationMessageContext | undefined;
+}): { text: string; shellCommand?: true; context?: OrchestrationMessageContext } {
+  if (input.shellCommand === true) return { text: input.text, shellCommand: true };
+  return serializeComposerMessageForServer(input.text, input.context);
+}
+
 /** Hands a new task edited after its launch back to the composer, then drops it from the queue. */
 export const recoverEditedCreationAfterDelivery = Effect.fn("ThreadOutbox.recoverEditedCreation")(
   function* (queuedMessage: QueuedThreadMessage) {
@@ -410,10 +424,12 @@ export const recoverEditedCreationAfterDelivery = Effect.fn("ThreadOutbox.recove
       yield* storage("hand-back-to-draft", kept.messageId, () =>
         mergeComposerDraftContent(draftKey, {
           text: kept.text,
+          ...(kept.shellCommand === true ? { shellCommand: true } : {}),
           context: kept.context,
           attachments: [],
         }),
       );
+      clearThreadComposerError(draftKey, kept.messageId);
       if (isEditingQueuedMessage(kept.messageId)) return "edited" as const;
       if (threadOutboxRevision(kept.messageId) !== keptRevision) return "changed" as const;
       const existingAttachmentIds = new Set(
@@ -433,12 +449,15 @@ export const recoverEditedCreationAfterDelivery = Effect.fn("ThreadOutbox.recove
       yield* storage("flush-drafts", kept.messageId, () => flushComposerDrafts());
       return "handed-back" as const;
     }).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning(
+      Effect.catch((error) => {
+        if (isComposerDraftKindConflictError(error.cause)) {
+          setThreadComposerError(draftKey, error.cause.message, kept.messageId);
+        }
+        return Effect.logWarning(
           "[thread-outbox] could not hand an edited pending task to the composer",
           error.cause,
-        ).pipe(Effect.as("failed" as const)),
-      ),
+        ).pipe(Effect.as("failed" as const));
+      }),
     );
     if (handedBack === "edited") return;
     if (handedBack !== "handed-back") return yield* retryDelivery;
@@ -466,6 +485,17 @@ export const restoreRejectedQueuedMessage = Effect.fn("ThreadOutbox.restoreRejec
     const draftKey = recoveryDraftKey(queuedMessage);
     const threadKey = scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId);
     const editing = () => isEditingQueuedMessage(queuedMessage.messageId);
+    // A code block's Run all can send its commands again; the composer holds one command, so they
+    // aren't put back there.
+    if (queuedMessage.followingShellCommands !== undefined) {
+      const removed = yield* storage("remove-restored", queuedMessage.messageId, () =>
+        removeThreadOutboxMessage(queuedMessage, threadOutboxRevision(queuedMessage.messageId)),
+      ).pipe(Effect.orElseSucceed(() => null));
+      if (removed === null) return "retry" as const;
+      if (!removed) return "deferred" as const;
+      setThreadComposerError(threadKey, message, queuedMessage.messageId);
+      return "restored" as const;
+    }
     // Until the queue drops the message, a failure undoes the merge, keeping concurrent edits.
     let rollback: { readonly snapshot: ComposerDraft; readonly merged: ComposerDraft } | null =
       null;
@@ -508,6 +538,18 @@ export const restoreRejectedQueuedMessage = Effect.fn("ThreadOutbox.restoreRejec
         );
         return "blocked" as const;
       }
+      if (composerDraftMergeMixesKinds(originalDraft, queuedMessage)) {
+        // Joined to the draft, prose would run as part of a command or a command would reach the
+        // agent as prose. It stays queued until the draft can take it.
+        setThreadComposerError(
+          threadKey,
+          new ComposerDraftKindConflictError({
+            incomingShellCommand: queuedMessage.shellCommand === true,
+          }).message,
+          queuedMessage.messageId,
+        );
+        return "blocked" as const;
+      }
 
       const withdraw = (merged: ComposerDraft) =>
         Effect.sync(() => clearThreadComposerError(threadKey, queuedMessage.messageId)).pipe(
@@ -522,6 +564,7 @@ export const restoreRejectedQueuedMessage = Effect.fn("ThreadOutbox.restoreRejec
       yield* storage("restore-to-draft", queuedMessage.messageId, () =>
         mergeComposerDraftContent(draftKey, {
           text: queuedMessage.text,
+          ...(queuedMessage.shellCommand === true ? { shellCommand: true } : {}),
           context: queuedMessage.context,
           attachments: queuedMessage.attachments,
         }),
@@ -842,10 +885,12 @@ export function createThreadOutboxDelivery(): {
     const blockedAttachments = currentDrafts[draftKey]?.attachments;
     const editorAttachments =
       editorDraftKey === null ? undefined : currentDrafts[editorDraftKey]?.attachments;
+    const blockedByKind = composerDraftMergeMixesKinds(currentDrafts[draftKey], queuedMessage);
     const unsubscribe = appAtomRegistry.subscribe(composerDraftsAtom, (drafts) => {
       if (
         drafts[draftKey]?.attachments === blockedAttachments &&
-        (editorDraftKey === null || drafts[editorDraftKey]?.attachments === editorAttachments)
+        (editorDraftKey === null || drafts[editorDraftKey]?.attachments === editorAttachments) &&
+        (!blockedByKind || composerDraftMergeMixesKinds(drafts[draftKey], queuedMessage))
       ) {
         return;
       }
@@ -1010,14 +1055,18 @@ export function createThreadOutboxDelivery(): {
         message: {
           messageId: queuedMessage.messageId,
           role: "user",
-          ...serializeComposerMessageForServer(
-            queuedMessage.text,
-            uploadedComposerContext(
+          ...(queuedMessage.followingShellCommands
+            ? { followingShellCommands: queuedMessage.followingShellCommands }
+            : {}),
+          ...queuedMessageServerContent({
+            text: queuedMessage.text,
+            shellCommand: queuedMessage.shellCommand,
+            context: uploadedComposerContext(
               queuedMessage.context,
               queuedMessage.attachments,
               prepared.attachments,
             ),
-          ),
+          }),
           attachments: prepared.attachments,
         },
         modelSelection: sendSettings.modelSelection,
@@ -1188,14 +1237,15 @@ export function createThreadOutboxDelivery(): {
         messageId: queuedMessage.messageId,
         createdAt: queuedMessage.createdAt,
         titleText: queuedMessage.text,
-        ...serializeComposerMessageForServer(
-          queuedMessage.text.trim(),
-          uploadedComposerContext(
+        ...queuedMessageServerContent({
+          text: queuedMessage.text.trim(),
+          shellCommand: queuedMessage.shellCommand,
+          context: uploadedComposerContext(
             queuedMessage.context,
             queuedMessage.attachments,
             prepared.attachments,
           ),
-        ),
+        }),
         uploadedAttachments: prepared.attachments,
         modelSelection: sendSettings.modelSelection,
         runtimeMode: sendSettings.runtimeMode,

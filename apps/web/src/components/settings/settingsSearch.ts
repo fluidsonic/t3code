@@ -816,6 +816,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "shell-commands",
+    title: msg("Shell commands (beta)"),
+    to: "/settings/chat",
+    scope: "environment-defaults",
+    searchTerms: [
+      msg("! bang run command terminal bash zsh composer code block script beta experimental"),
+    ],
+  },
+  {
     id: "provider-update-checks",
     title: msg("Provider update checks"),
     to: "/settings/maintenance",
