@@ -903,7 +903,7 @@ describe("MessagesTimeline messages", () => {
     );
     expect(user?.querySelector<HTMLElement>("[data-user-message-body]")?.innerText).toBe(source);
     expect(assistant?.querySelector<HTMLElement>(".chat-markdown")?.innerText).toBe(
-      "Plan Step one Detail",
+      "Plan\nStep one\nDetail",
     );
     const query = "   Step one";
     const indexed = searchableMessageSegments({ role: "user", text: source, streaming: false });
