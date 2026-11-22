@@ -12469,5 +12469,8 @@
   "b7df38b7d8792d78": "Open guide",
   "9e91e9a77b664e4e": "Could not start a review guide",
   "d8aaf932f90429c4": "Move this command to the front of the queue ({shortcut})",
-  "425ab15036aec8a4": "Move this command to the front of the queue"
+  "425ab15036aec8a4": "Move this command to the front of the queue",
+  "e7fb4bcd4c70fd94": "This page crashed.",
+  "4fc063fef1780a63": "This page crashed",
+  "67fc00623dd5fcb9": "Reload it in the desktop app."
 }

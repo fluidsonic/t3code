@@ -12455,5 +12455,8 @@
   "b7df38b7d8792d78": "Abrir guía",
   "9e91e9a77b664e4e": "No se pudo iniciar una guía de revisión",
   "d8aaf932f90429c4": "Mover este comando al principio de la cola ({shortcut})",
-  "425ab15036aec8a4": "Mover este comando al principio de la cola"
+  "425ab15036aec8a4": "Mover este comando al principio de la cola",
+  "e7fb4bcd4c70fd94": "Esta página se ha bloqueado.",
+  "4fc063fef1780a63": "Esta página se ha bloqueado",
+  "67fc00623dd5fcb9": "Recárgala en la aplicación de escritorio."
 }
