@@ -3265,9 +3265,10 @@ const make = Effect.gen(function* () {
                 request.runtimeMode,
                 target,
               );
+              // Agent-created threads never start in plan mode; a plan-mode caller cannot create them.
               const interactionMode = yield* resolveInteractionMode(
                 parent.thread.interactionMode,
-                request.interactionMode,
+                "default",
               );
               yield* assertTargetEnabledForProject(parent, commandId, target);
               const title = threadTitle({
