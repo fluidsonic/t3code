@@ -13,15 +13,19 @@ import {
   resolveQueuedEditExit,
   type QueuedRunsAtom,
 } from "@t3tools/client-runtime/queued-run-edit";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
+import { shellCommandMessageText } from "@t3tools/shared/shellCommand";
 
 import { m } from "../i18n/messages";
 import { uploadedComposerContext } from "../lib/composerContext";
+import { queuedShellCommandEditText } from "../lib/composerShellCommand";
 import { appAtomRegistry } from "./atom-registry";
 import { abortComposerDraftOperations } from "./composerDraftOperations";
 import { queuedEditDraftKey } from "./queued-edit-draft-key";
 import { setThreadComposerError } from "./thread-composer-error";
 import {
   clearComposerDraft,
+  composerDraftTextContent,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   setComposerDraftContext,
@@ -36,6 +40,8 @@ export interface QueuedRunEdit {
   readonly context?: OrchestrationMessageContext;
   /** Removing a server attachment changes the message even when the draft looks untouched. */
   readonly removedExistingAttachment?: true;
+  /** A `! cmd`; `originalText` is its message text, `! cmd`, and the kind can't change. */
+  readonly shellCommand?: boolean;
 }
 
 const queuedRunEdits = makeQueuedRunEditStore<QueuedRunEdit>({
@@ -76,10 +82,14 @@ function exitQueuedRunEdit(threadKey: string, edit: QueuedRunEdit): void {
   const editDraftKey = queuedEditDraftKey(threadKey, edit.runId);
   const editDraft = getComposerDraftSnapshot(editDraftKey);
   const threadDraft = getComposerDraftSnapshot(threadKey);
+  // A queued command stays one even if its `!` was deleted while editing.
+  const shellCommand = edit.shellCommand === true;
   const editRestorable = editDraft.text.trim().length > 0 || editDraft.attachments.length > 0;
   const recovery = resolveQueuedEditExit({
     editChanged:
-      editDraft.text !== edit.originalText ||
+      editDraft.text !==
+        composerPromptForMessage({ text: edit.originalText, shellCommand: edit.shellCommand })
+          .prompt ||
       editDraft.attachments.length > 0 ||
       edit.removedExistingAttachment === true,
     // A cleared edit has nothing to put back, so it can only be discarded.
@@ -91,7 +101,12 @@ function exitQueuedRunEdit(threadKey: string, edit: QueuedRunEdit): void {
   if (recovery === "kept") {
     // The merge publishes the draft before writing it, so a failed write only delays persistence to the next one.
     mergeComposerDraftContent(threadKey, {
-      text: editDraft.text,
+      ...(shellCommand
+        ? {
+            text: shellCommandMessageText(queuedShellCommandEditText(editDraft.text)),
+            shellCommand: true,
+          }
+        : composerDraftTextContent(editDraft)),
       attachments: editDraft.attachments,
       ...(editDraft.context ? { context: editDraft.context } : {}),
     }).catch((error: unknown) => {
@@ -103,12 +118,19 @@ function exitQueuedRunEdit(threadKey: string, edit: QueuedRunEdit): void {
   setThreadComposerError(
     threadKey,
     recovery === "kept"
-      ? m(msg("That message already started. Your edit is back in the composer."))
-      : m(msg("That message already started, so the edit was discarded.")),
+      ? shellCommand
+        ? m(msg("That command already started. Your edit is back in the composer."))
+        : m(msg("That message already started. Your edit is back in the composer."))
+      : shellCommand
+        ? m(msg("That command already started, so the edit was discarded."))
+        : m(msg("That message already started, so the edit was discarded.")),
   );
 }
 
-/** `runs` is the thread's runs; the edit ends when its run leaves the queue. */
+/**
+ * `runs` is the thread's runs; the edit ends when its run leaves the queue. A queued command comes
+ * back in shell mode even where commands can't be sent right now.
+ */
 export function beginQueuedRunEdit(
   threadKey: string,
   edit: QueuedRunEdit,
@@ -123,7 +145,11 @@ export function beginQueuedRunEdit(
   const draftKey = queuedEditDraftKey(threadKey, edit.runId);
   const originalText = stripAttachmentOnlyBootstrapPrompt(edit.originalText);
   clearComposerDraft(draftKey);
-  setComposerDraftText(draftKey, originalText);
+  const { prompt, shellMode } = composerPromptForMessage({
+    text: originalText,
+    shellCommand: edit.shellCommand,
+  });
+  setComposerDraftText(draftKey, prompt, { shellMode });
   setComposerDraftContext(draftKey, edit.context);
   queuedRunEdits.begin(
     threadKey,

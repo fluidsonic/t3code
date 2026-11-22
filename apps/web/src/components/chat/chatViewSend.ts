@@ -306,6 +306,7 @@ function withRestored<T>(
 export function restoreComposerDraft(
   draftTarget: ScopedThreadRef | DraftId,
   snapshot: ComposerSendSnapshot,
+  options: { readonly shellMode: boolean },
 ): ComposerImageAttachment[] {
   const store = useComposerDraftStore.getState();
   const current = store.getComposerDraft(draftTarget);
@@ -313,6 +314,7 @@ export function restoreComposerDraft(
   store.setPrompt(
     draftTarget,
     current?.prompt.trim() ? `${current.prompt}\n\n${snapshot.draftText}` : snapshot.draftText,
+    { shellMode: options.shellMode },
   );
   store.setReplyTo(draftTarget, current?.replyTo ?? snapshot.replyTo);
   store.addImages(draftTarget, images);
