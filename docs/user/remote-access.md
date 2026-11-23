@@ -586,7 +586,8 @@ bearer sessions get the standard client permissions, including managing access.
 Setting up or replacing a T3 Connect link requires the separate `relay:configure` permission.
 A terminal or a full-access agent on the host can reach those as well, so a
 client that should not manage access also needs to go without `terminal:operate`
-and `orchestration:operate`.
+and `orchestration:operate`. Running `!` shell commands from the composer also
+needs `terminal:operate`.
 
 To change an existing client's permissions, create a fresh pairing link with the
 scopes it needs. In a browser opened directly on the environment, open that link

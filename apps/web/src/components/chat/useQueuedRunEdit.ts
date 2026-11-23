@@ -29,6 +29,12 @@ import {
   restoreAttachmentOnlyBootstrapPrompt,
   stripAttachmentOnlyBootstrapPrompt,
 } from "@t3tools/shared/composerContextReferences";
+import {
+  isShellCommandPrompt,
+  shellCommandFromPrompt,
+  shellCommandMessageText,
+} from "@t3tools/shared/shellCommand";
+import { composerPromptForMessage } from "@t3tools/client-runtime/user-shell-command";
 import { Atom } from "effect/reactivity";
 import type { RefObject } from "react";
 import { useAssetUrls } from "../../assets/assetUrls";
@@ -80,10 +86,12 @@ interface EditingQueuedRun {
   readonly threadId: ThreadId;
   readonly runId: RunId;
   readonly messageId: MessageId;
+  /** The composer text the edit opened with, which tells a clean edit from a dirty one. */
   readonly originalText: string;
   readonly originalAttachments: ReadonlyArray<ChatAttachment>;
   readonly existingAttachments: ReadonlyArray<ChatAttachment>;
   readonly context?: OrchestrationMessageContext | undefined;
+  readonly shellCommand: boolean;
 }
 
 // Keyed by the route thread, so an edit survives navigating away and back.
@@ -107,6 +115,12 @@ interface QueuedRunEditContent {
 const isDraftOwnedRecord = (record: ComposerContextRecord) =>
   record.kind === "thread" || record.kind === "environment";
 
+/** The text a queued edit saves; a command's is bare. A command stays one even without its `!`. */
+function queuedEditText(prompt: string, shellCommand: boolean): string {
+  if (!shellCommand) return prompt.trim();
+  return isShellCommandPrompt(prompt) ? (shellCommandFromPrompt(prompt) ?? "") : prompt.trim();
+}
+
 async function submitQueuedRunEdit(input: {
   readonly environmentId: EnvironmentId;
   readonly draftTarget: ComposerThreadTarget;
@@ -116,7 +130,7 @@ async function submitQueuedRunEdit(input: {
   readonly draftChanged: () => boolean;
 }): Promise<string | null> {
   const { environmentId, draftTarget, editing, content } = input;
-  const editText = content.prompt.trim();
+  const editText = queuedEditText(content.prompt, editing.shellCommand);
   const newAttachments = [...content.images, ...content.files];
   const uploadFiles = async (files: ReadonlyArray<ComposerFileAttachment>) => {
     const validateFiles = () => {
@@ -176,7 +190,10 @@ async function submitQueuedRunEdit(input: {
       input: {
         threadId: editing.threadId,
         runId: editing.runId,
-        text: restoreAttachmentOnlyBootstrapPrompt(editText, uploads.length > 0),
+        text: editing.shellCommand
+          ? shellCommandMessageText(editText)
+          : restoreAttachmentOnlyBootstrapPrompt(editText, uploads.length > 0),
+        ...(editing.shellCommand ? { shellCommand: true } : {}),
         edit: {
           messageId: editing.messageId,
           attachments: uploads,
@@ -293,7 +310,8 @@ export function useQueuedRunEdit(input: {
     const text = reply ? removeInlineContextReference(sentText, reply.contextId).prompt : sentText;
     const store = useComposerDraftStore.getState();
     store.clearComposerContent(target);
-    store.setPrompt(target, text);
+    const { prompt, shellMode } = composerPromptForMessage({ ...request, text });
+    store.setPrompt(target, prompt, { shellMode });
     store.setThreadContexts(
       target,
       records.filter((record): record is ThreadContextRecord => record.kind === "thread"),
@@ -310,8 +328,9 @@ export function useQueuedRunEdit(input: {
         threadId: activeThreadId,
         runId: request.runId,
         messageId: request.messageId,
-        originalText: text,
+        originalText: prompt,
         originalAttachments: request.attachments,
+        shellCommand: request.shellCommand,
         existingAttachments: request.attachments,
         context,
       },
@@ -465,6 +484,16 @@ export function useQueuedRunEdit(input: {
     ) {
       return;
     }
+    if (
+      editing.shellCommand &&
+      (newAttachments.length > 0 || queuedEditText(content.prompt, true).length === 0)
+    ) {
+      setThreadError(
+        editing.threadId,
+        m(msg("A command needs text and can't include attachments.")),
+      );
+      return;
+    }
     // The save's result decides the edit's fate, even if the run starts meanwhile.
     const finishSave = queuedRunEdits.startSave(editKey);
     if (finishSave === null) return;
@@ -529,6 +558,7 @@ export function useQueuedRunEdit(input: {
   return {
     editingRunId: editing?.runId ?? null,
     isEditing: editing !== null,
+    isEditingShellCommand: editing?.shellCommand === true,
     isSaving,
     draftTarget,
     editingAttachments,
