@@ -643,6 +643,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ? [gt("Delete confirmation")]
       : []),
     ...(settings.confirmQuit !== DEFAULT_UNIFIED_SETTINGS.confirmQuit ? [gt("Quit shortcut")] : []),
+    ...(settings.swipeNavigationEnabled !== DEFAULT_UNIFIED_SETTINGS.swipeNavigationEnabled
+      ? [gt("Swipe navigation")]
+      : []),
     ...(isTextGenerationModelDirty ? [gt("Text generation model")] : []),
     ...(settings.threadTitleInstructions !== DEFAULT_UNIFIED_SETTINGS.threadTitleInstructions
       ? [gt("Thread title instructions")]
@@ -758,6 +761,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       confirmThreadDelete: DEFAULT_UNIFIED_SETTINGS.confirmThreadDelete,
       confirmThreadUnpin: DEFAULT_UNIFIED_SETTINGS.confirmThreadUnpin,
       confirmQuit: DEFAULT_UNIFIED_SETTINGS.confirmQuit,
+      swipeNavigationEnabled: DEFAULT_UNIFIED_SETTINGS.swipeNavigationEnabled,
       textGenerationModelSelection: DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
       threadTitleInstructions: DEFAULT_UNIFIED_SETTINGS.threadTitleInstructions,
       fontFamilySans: DEFAULT_UNIFIED_SETTINGS.fontFamilySans,
@@ -1222,6 +1226,42 @@ export function GeneralSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      {isElectron && isMacPlatform(navigator.platform) ? (
+        <SettingsSection id="navigation" title={gt("Navigation")}>
+          <SettingsRow
+            {...setting("swipe-navigation")}
+            description={
+              <T>
+                Swipe sideways with two fingers on a trackpad to go back or forward. Turn off if a
+                mouse&apos;s horizontal scroll wheel switches threads by accident.
+              </T>
+            }
+            resetAction={
+              settings.swipeNavigationEnabled !==
+              DEFAULT_UNIFIED_SETTINGS.swipeNavigationEnabled ? (
+                <SettingResetButton
+                  ariaLabel={gt("Reset swipe navigation to default")}
+                  onClick={() =>
+                    updateSettings({
+                      swipeNavigationEnabled: DEFAULT_UNIFIED_SETTINGS.swipeNavigationEnabled,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.swipeNavigationEnabled}
+                onCheckedChange={(checked) =>
+                  updateSettings({ swipeNavigationEnabled: Boolean(checked) })
+                }
+                aria-label={gt("Swipe navigation")}
+              />
+            }
+          />
+        </SettingsSection>
+      ) : null}
     </SettingsPageContainer>
   );
 }
