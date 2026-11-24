@@ -27,6 +27,14 @@ export function markAsCompositionReplace(tr: Transaction): Transaction {
   return closeHistory(tr).setMeta(COMPOSITION_REPLACE_META, true);
 }
 
+/**
+ * Folds `tr` into the undo step before it, as ProseMirror's history does for a transaction a
+ * plugin appends. For a change that follows from the edit before it but is dispatched later.
+ */
+export function joinPreviousUndoStep(tr: Transaction): Transaction {
+  return tr.setMeta("appendedTransaction", tr);
+}
+
 function changeKindOf(tr: Transaction): ComposerChangeKind | null {
   if (!tr.docChanged) return null;
   const uiEvent = tr.getMeta("uiEvent");
@@ -52,6 +60,7 @@ export function groupUndoByChangeKind(
   previous: ComposerChangeKind | null,
 ): ComposerChangeKind | null {
   if (isHistoryTransaction(tr)) return "other";
+  if (tr.getMeta("appendedTransaction")) return previous;
   const kind = changeKindOf(tr);
   if (kind === null) return previous;
   if (previous !== null && (kind !== previous || kind === "other")) closeHistory(tr);

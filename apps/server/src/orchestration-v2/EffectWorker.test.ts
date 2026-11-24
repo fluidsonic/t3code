@@ -103,6 +103,8 @@ function layerExecutorFor(input: {
         steer: () => Effect.void,
         applyModelSelection: () => Effect.void,
         applyThreadTitle: () => Effect.void,
+        pause: () => Effect.succeed("unsupported"),
+        release: () => Effect.succeed(true),
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined
