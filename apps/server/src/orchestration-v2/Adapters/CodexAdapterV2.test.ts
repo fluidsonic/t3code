@@ -196,6 +196,8 @@ describe("CodexAdapterV2 runtime policy", () => {
     Effect.gen(function* () {
       const build = (
         runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access",
+        overrides: Partial<ProviderAdapter.ProviderAdapterV2RuntimePolicy> = {},
+        configuredWorkspaceWrite: CodexSchema.V2ConfigReadResponse__SandboxWorkspaceWrite = CODEX_TEST_WORKSPACE_WRITE_CONFIG,
       ) =>
         CodexAdapterV2.buildCodexTurnStartParams({
           nativeThreadId: `native-${runtimeMode}`,
@@ -204,11 +206,13 @@ describe("CodexAdapterV2 runtime policy", () => {
             runtimeMode,
             interactionMode: "default",
             cwd: null,
+            ...overrides,
           },
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5.4",
           },
+          configuredWorkspaceWrite,
         });
 
       const approvalRequired = yield* build("approval-required");
@@ -218,13 +222,24 @@ describe("CodexAdapterV2 runtime policy", () => {
 
       assert.equal(approvalRequired.approvalPolicy, "untrusted");
       assert.equal(approvalRequired.approvalsReviewer, "user");
-      assert.equal(approvalRequired.sandboxPolicy?.type, "readOnly");
+      assert.deepEqual(approvalRequired.sandboxPolicy, { type: "readOnly" });
       assert.equal(autoAcceptEdits.approvalPolicy, "on-request");
       assert.equal(autoAcceptEdits.approvalsReviewer, "user");
-      assert.equal(autoAcceptEdits.sandboxPolicy?.type, "workspaceWrite");
+      assert.deepEqual(autoAcceptEdits.sandboxPolicy, CODEX_TEST_CONFIGURED_WORKSPACE_WRITE);
       assert.equal(auto.approvalPolicy, "on-request");
       assert.equal(auto.approvalsReviewer, "auto_review");
-      assert.equal(auto.sandboxPolicy?.type, "workspaceWrite");
+      assert.deepEqual(auto.sandboxPolicy, CODEX_TEST_CONFIGURED_WORKSPACE_WRITE);
+      assert.deepEqual(
+        (yield* build("auto", { sandboxPolicy: { type: "workspaceWrite" } })).sandboxPolicy,
+        { type: "workspaceWrite" },
+      );
+      assert.deepEqual((yield* build("auto", {}, { writable_roots: [] })).sandboxPolicy, {
+        type: "workspaceWrite",
+        writableRoots: [],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+      });
       assert.deepEqual(fullAccess.approvalPolicy, {
         granular: {
           mcp_elicitations: true,
@@ -235,7 +250,7 @@ describe("CodexAdapterV2 runtime policy", () => {
         },
       });
       assert.equal(fullAccess.approvalsReviewer, "user");
-      assert.equal(fullAccess.sandboxPolicy?.type, "dangerFullAccess");
+      assert.deepEqual(fullAccess.sandboxPolicy, { type: "dangerFullAccess" });
     }),
   );
 
@@ -604,6 +619,20 @@ const CODEX_TEST_RUNTIME_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy
   interactionMode: "default",
   cwd: "/workspace",
 });
+/** `[sandbox_workspace_write]` as Codex's config/read reports it. */
+const CODEX_TEST_WORKSPACE_WRITE_CONFIG = {
+  writable_roots: ["/cache"],
+  network_access: true,
+  exclude_tmpdir_env_var: true,
+  exclude_slash_tmp: true,
+} satisfies CodexSchema.V2ConfigReadResponse__SandboxWorkspaceWrite;
+const CODEX_TEST_CONFIGURED_WORKSPACE_WRITE = {
+  type: "workspaceWrite",
+  writableRoots: ["/cache"],
+  networkAccess: true,
+  excludeTmpdirEnvVar: true,
+  excludeSlashTmp: true,
+} as const;
 const T3_THREAD_ENV_KEY = "shell_environment_policy.set.T3CODE_THREAD_ID";
 const threadEnvOf = (params: unknown) =>
   Predicate.hasProperty(params, "config") && Predicate.hasProperty(params.config, T3_THREAD_ENV_KEY)
@@ -700,7 +729,7 @@ function codexReplayPreamble(input: {
   readonly effort?: string;
   readonly turnPolicy?: Pick<
     typeof CodexClient.V2TurnStartParams.Type,
-    "approvalPolicy" | "sandboxPolicy"
+    "approvalPolicy" | "approvalsReviewer" | "sandboxPolicy"
   >;
 }): Array<CodexReplay.CodexAppServerReplayEntry> {
   return [
@@ -837,8 +866,8 @@ function codexReplayPreamble(input: {
 /**
  * Every turn/start follows a config/read, and a thread's first turn on a connection names it
  * unless the transcript names it itself. A thread start, resume or fork follows a config/read
- * unless it retries a failed request or the transcript reads config itself. Inserts those
- * exchanges and shifts later client ids.
+ * unless it retries a failed request. A config/read the transcript scripts stands in for the
+ * next inserted one. Inserts those exchanges and shifts later client ids.
  */
 function withConfigReadBeforeTurnStart(
   entries: ReadonlyArray<CodexReplay.CodexAppServerReplayEntry>,
@@ -888,11 +917,14 @@ function withConfigReadBeforeTurnStart(
           namedThreads.add(params.threadId);
           exchanges.push(["thread/name/set", { threadId: params.threadId, name: threadName }, {}]);
         }
-        exchanges.push([
-          "config/read",
-          { cwd: params.cwd, includeLayers: false },
-          { config: {}, origins: {} },
-        ]);
+        if (transcriptReads > 0) transcriptReads -= 1;
+        else {
+          exchanges.push([
+            "config/read",
+            { cwd: params.cwd, includeLayers: false },
+            { config: {}, origins: {} },
+          ]);
+        }
       }
       for (const [method, requestParams, response] of exchanges) {
         const id = frame.id + offset;
@@ -2087,6 +2119,142 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ["completed"],
         );
       }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  const configured = { sandbox_workspace_write: CODEX_TEST_WORKSPACE_WRITE_CONFIG };
+  const readError = { error: { code: -32603, message: "invalid configuration" } };
+  it.effect.each([
+    {
+      name: "keeps the configured workspace-write settings",
+      config: { result: { config: configured, origins: {} } },
+      requirements: { result: { requirements: null } },
+      sandboxPolicy: CODEX_TEST_CONFIGURED_WORKSPACE_WRITE,
+    },
+    {
+      name: "keeps the bare policy under a selected permission profile",
+      config: {
+        result: { config: { ...configured, default_permissions: ":workspace" }, origins: {} },
+      },
+      sandboxPolicy: { type: "workspaceWrite" },
+    },
+    {
+      name: "keeps the bare policy under managed permission profiles",
+      config: { result: { config: configured, origins: {} } },
+      requirements: {
+        result: { requirements: { allowedPermissionProfiles: { ":workspace": true } } },
+      },
+      sandboxPolicy: { type: "workspaceWrite" },
+    },
+    {
+      name: "keeps the bare policy when the config is unreadable",
+      config: readError,
+      sandboxPolicy: { type: "workspaceWrite" },
+    },
+    {
+      name: "keeps the bare policy when the requirements are unreadable",
+      config: { result: { config: configured, origins: {} } },
+      requirements: readError,
+      sandboxPolicy: { type: "workspaceWrite" },
+    },
+  ] as const)("auto turns $name", ({ config, sandboxPolicy, ...row }) =>
+    Effect.gen(function* () {
+      const nativeThreadId = "workspace-write-thread";
+      const nativeTurnId = "workspace-write-turn";
+      const preamble = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId,
+        prompt: "fetch",
+        turnPolicy: {
+          approvalPolicy: "on-request",
+          approvalsReviewer: "auto_review",
+          sandboxPolicy,
+        },
+      });
+      const reads: Array<CodexReplay.CodexAppServerReplayEntry> = [
+        {
+          type: "expect_outbound",
+          label: "thread/name/set",
+          frame: {
+            id: 3,
+            method: "thread/name/set",
+            params: { threadId: nativeThreadId, name: "Codex continuation test" },
+          },
+        },
+        { type: "emit_inbound", label: "thread/name/set", frame: { id: 3, result: {} } },
+        {
+          type: "expect_outbound",
+          label: "config/read",
+          frame: {
+            id: 4,
+            method: "config/read",
+            params: { cwd: "/workspace", includeLayers: false },
+          },
+        },
+        { type: "emit_inbound", label: "config/read", frame: { id: 4, ...config } },
+        ...("requirements" in row
+          ? ([
+              {
+                type: "expect_outbound",
+                label: "configRequirements/read",
+                frame: { id: 5, method: "configRequirements/read" },
+              },
+              {
+                type: "emit_inbound",
+                label: "configRequirements/read",
+                frame: { id: 5, ...row.requirements },
+              },
+            ] as const)
+          : []),
+      ];
+      const turnStartId = "requirements" in row ? 6 : 5;
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "workspace-write-config",
+          entries: [
+            ...preamble.slice(0, 5),
+            ...reads,
+            ...preamble.slice(5, 7).map((entry) => withReplayRequestId(entry, turnStartId)),
+            ...preamble.slice(7),
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        }),
+      );
+      const turnInput = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("workspace-write-attempt"),
+        text: "fetch",
+      });
+      yield* harness.runtime.startTurn({
+        ...turnInput,
+        runtimePolicy: { ...turnInput.runtimePolicy, runtimeMode: "auto" },
+      });
+      yield* harness.firstTerminal;
+      assert.deepEqual(
+        harness.terminalEvents().map((event) => event.status),
+        ["completed"],
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(
