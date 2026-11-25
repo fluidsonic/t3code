@@ -117,7 +117,7 @@ function BrowserPreviewScreen({
   };
   const live = (focused && foreground) || pictureInPicture.active;
 
-  const ready = streaming && canControl;
+  const ready = canControl && (streaming || tab?.navStatus._tag === "LoadFailed");
   const command: PreviewStreamRef["command"] = (input) => streamRef.current?.command(input);
   const showPictureInPicture =
     // Android WebView cannot play video in picture in picture.
@@ -207,6 +207,9 @@ function BrowserPreviewScreen({
                 threadId={threadId}
                 tabId={tab.tabId}
                 pdfUri={pdfUri}
+                pageFailure={
+                  tab.navStatus._tag === "LoadFailed" ? tab.navStatus.description : undefined
+                }
                 ref={streamRef}
                 interactive
                 background={themeVariables["--color-sheet-solid"]}
