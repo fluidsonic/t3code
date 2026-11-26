@@ -3,3 +3,7 @@
 skips the primary native probe for cross-architecture Windows payloads
 DesktopLinuxUrlHandler theme icons
 excludes sandboxes reached through a symlink into the worktrees dir
+a page's title change without navigation reaches its session
+stops an agent's server through its job's group
+whether the keyboard opened it
+a shortcut conditioned on rightPanelOpen sees the thread's open right panel
