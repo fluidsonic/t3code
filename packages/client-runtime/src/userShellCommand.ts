@@ -422,10 +422,18 @@ const SHELL_FENCE_LANGUAGES: ReadonlySet<string> = new Set(["sh", "bash", "zsh",
 // A `$ ` or `> ` line is a prompt shown with its output: an example to read, not a command.
 const TRANSCRIPT_LINE = /^[$>] /m;
 
+// A shell reads `!` as negation only before a space, so one against a block's first command is
+// the `!` of `!cmd`.
+const UNSPACED_PREFIX_BLOCK = /^(?:[ \t]*(?:#.*)?\n)*[ \t]*![\w./~]/;
+
+// Without the space, an inline command needs a lowercase name and arguments, so code such as
+// `!user`, `!important`, `!isReady && go()` or `!x === y` stays code.
+const UNSPACED_INLINE_COMMAND = /^![a-z0-9._~/-]+ (?![&|?=<>])/;
+
 /**
  * The command a closed assistant code block runs as a `! cmd` message, or null when it offers
  * none. An untagged block runs when written as `! cmd`, without the prefix; an sh, bash, zsh or
- * shell block runs verbatim; any other language never does.
+ * shell block runs as written, unless written as `!cmd`; any other language never does.
  */
 export function userShellCommandFromCodeBlock(
   code: string,
@@ -435,6 +443,7 @@ export function userShellCommandFromCodeBlock(
   const fenceLanguage = language?.trim().split(/\s/, 1)[0]?.toLowerCase() ?? "";
   if (fenceLanguage.length === 0) return shellCommandFromCodeBlock(code);
   if (!SHELL_FENCE_LANGUAGES.has(fenceLanguage)) return null;
+  if (UNSPACED_PREFIX_BLOCK.test(code)) return shellCommandFromCodeBlock(code);
   const command = code.trim();
   return command.length === 0 ? null : command;
 }
@@ -458,11 +467,12 @@ export function shellCommandsFromUntaggedCodeBlock(code: string): ReadonlyArray<
 }
 
 /**
- * The command of an inline `` `! cmd` `` span in prose, or null. Only a `!` and a space make one,
- * so code such as `!isReady`, `!=` or `!important` stays code. Whitespace runs in `code` count as
- * one space, as markdown renders a soft-wrapped span.
+ * The command of an inline `` `! cmd` `` or `` `!cmd args` `` span in prose, or null. Whitespace
+ * runs in `code` count as one space, as markdown renders a soft-wrapped span.
  */
 export function shellCommandFromInlineCode(code: string): string | null {
   const text = code.replace(/\s+/g, " ").trim();
-  return text.startsWith("! ") ? userShellCommandFromCodeBlock(text, null) : null;
+  return text.startsWith("! ") || UNSPACED_INLINE_COMMAND.test(text)
+    ? userShellCommandFromCodeBlock(text, null)
+    : null;
 }
