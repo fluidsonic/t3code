@@ -26,8 +26,8 @@ const SHELL_LANGUAGE_FENCE = /^[ \t>]*(?:`{3,}|~{3,})[ \t]*(?:sh|bash|zsh|shell)
 const UNTAGGED_COMMAND_FENCE =
   /^[ \t>]*(?:`{3,}|~{3,})[ \t]*\r?\n(?:[ \t>]*(?:#.*)?\r?\n)*[ \t>]*!/m;
 
-// An inline `! cmd` span; see `linkInlineShellCommands`.
-const INLINE_COMMAND = /`! \S/;
+// An inline `! cmd` or `!cmd args` span; see `linkInlineShellCommands`.
+const INLINE_COMMAND = /`!(?: \S|[a-z0-9._~/-]+ )/;
 
 export function markdownMayHaveShellCommand(markdown: string): boolean {
   return (
@@ -116,8 +116,8 @@ export function splitShellCommandMarkdown(
 }
 
 const SHELL_COMMAND_LINK = "t3-shell-command://v1/";
-// A single-backtick `! cmd` span: not part of a longer backtick run, escaped, or a link's text.
-const INLINE_COMMAND_SPAN = /(^|[^`\\[])(`(! [^`]+)`)(?!`|\]\()/g;
+// A single-backtick `!` span: not part of a longer backtick run, escaped, or a link's text.
+const INLINE_COMMAND_SPAN = /(^|[^`\\[])(`(![^`]+)`)(?!`|\]\()/g;
 
 /**
  * `markdown` with each inline `! cmd` span outside code blocks made a link to its command, so the

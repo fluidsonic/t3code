@@ -643,7 +643,7 @@ describe("userShellCommandFromCodeBlock", () => {
     expect(userShellCommandFromCodeBlock("npm test\n", "")).toBeNull();
   });
 
-  it("runs a shell-language block verbatim, keeping a leading `!`", () => {
+  it("runs a shell-language block as written, keeping a negating `! `", () => {
     for (const language of ["sh", "bash", "zsh", "shell", "Bash", "bash title=setup.sh"]) {
       expect(userShellCommandFromCodeBlock("npm test\n", language)).toBe("npm test");
     }
@@ -653,6 +653,8 @@ describe("userShellCommandFromCodeBlock", () => {
     expect(userShellCommandFromCodeBlock("cd web\nnpm run build\n", "sh")).toBe(
       "cd web\nnpm run build",
     );
+    // Against the command, a `!` can't be negation.
+    expect(userShellCommandFromCodeBlock("# check\n!git status\n", "bash")).toBe("git status");
   });
 
   it("never runs a block in another language, even written as `! cmd`", () => {
@@ -682,13 +684,25 @@ describe("userShellCommandFromCodeBlock", () => {
 describe("shellCommandFromInlineCode", () => {
   it("reads an inline `! cmd` span, its soft wraps as spaces", () => {
     expect(shellCommandFromInlineCode("! npm test")).toBe("npm test");
+    expect(shellCommandFromInlineCode("!git status")).toBe("git status");
     expect(shellCommandFromInlineCode(" ! git push origin\n  a:production ")).toBe(
       "git push origin a:production",
     );
   });
 
   it("leaves code that only starts with `!`", () => {
-    for (const code of ["!isReady", "!=", "!important", "!", "! ", "npm test"]) {
+    for (const code of [
+      "!isReady",
+      "!=",
+      "!important",
+      "!",
+      "! ",
+      "npm test",
+      "!pwd",
+      "!user && retry()",
+      "!isReady && go()",
+      "!x === y",
+    ]) {
       expect(shellCommandFromInlineCode(code)).toBeNull();
     }
   });
