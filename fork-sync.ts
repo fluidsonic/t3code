@@ -5,6 +5,10 @@
 //
 //   node fork-sync.ts              sync, check, push, build, release
 //   node fork-sync.ts --dry-run    sync and check only; push and build nothing
+//   node fork-sync.ts review [<upstream commit>]
+//                                  pin upstream main (or that commit) and tracked PR heads, and print
+//                                  what they add since the last release, to scan before anything runs it
+//   node fork-sync.ts --reviewed   sync onto exactly what `review` pinned, not the latest upstream
 //   node fork-sync.ts install      install the newest local build now, quitting and reopening the app
 //   node fork-sync.ts serve        serve feed/ on 127.0.0.1 for builds from before the GitHub feed
 //
@@ -41,8 +45,12 @@ const FEED_URL = `https://github.com/${FORK_REPO}/releases/latest/download`;
 const SIGNING_KEYCHAIN = join(META, "signing.keychain-db");
 const SIGNING_NAME = "T3 Code Marc Local Signing";
 
+// What `review` pinned: `upstream` and `pr-<number>`.
+const REVIEW_REFS = "refs/fork-review";
+
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
+const reviewed = args.includes("--reviewed");
 const report: string[] = [];
 let pushed = false;
 // Homebrew installs rustup keg-only; the desktop build needs cargo. T3 Code sets ELECTRON_RUN_AS_NODE
@@ -146,8 +154,13 @@ function sync() {
   if (!repoSync.ok) report.push(`couldn't sync ${FORK_REPO} main: ${repoSync.err}`);
   git("fetch", "--quiet", "upstream", "main");
   git("fetch", "--quiet", "--prune", "origin");
-  const upstreamMain = git("rev-parse", "upstream/main");
-  updateMainCheckout();
+  const upstreamMain = reviewed ? reviewedCommit("upstream") : git("rev-parse", "upstream/main");
+  // A topic or PR on newer upstream would bring in upstream commits past the pin.
+  const checkUpstreamBase = (entry: Entry, tip: string) => {
+    if (!isAncestor(git("merge-base", tip, "upstream/main"), upstreamMain))
+      fail(`${entry.branch} sits on upstream newer than the reviewed ${upstreamMain.slice(0, 12)}; run review again`);
+  };
+  updateMainCheckout(upstreamMain);
   const entries = listEntries();
 
   for (const entry of entries) {
@@ -158,10 +171,15 @@ function sync() {
         entry.dropped = `PR #${entry.pr} is ${state.out.toLowerCase()}`;
         continue;
       }
-      git("fetch", "--quiet", "upstream", `pull/${entry.pr}/head`);
-      entry.newTip = git("rev-parse", "FETCH_HEAD");
+      if (reviewed) entry.newTip = reviewedCommit(`pr-${entry.pr}`);
+      else {
+        git("fetch", "--quiet", "upstream", `pull/${entry.pr}/head`);
+        entry.newTip = git("rev-parse", "FETCH_HEAD");
+      }
+      checkUpstreamBase(entry, entry.newTip);
       continue;
     }
+    checkUpstreamBase(entry, entry.oldTip);
     const parent = parentOf(entry, entries);
     const base = parent?.newTip ?? upstreamMain;
     // Detached, since another worktree of this repo may have the topic branch checked out.
@@ -215,6 +233,49 @@ function sync() {
   report.push(`released v${version} on ${FORK_REPO}`);
   if (isRunning(APP_ID)) report.push(`${PRODUCT_NAME} offers the update to restart into within a few minutes`);
   else copyApp(newestFeedZip());
+  // A pin serves one sync; the next --reviewed run needs a fresh review.
+  clearReview();
+}
+
+const isAncestor = (commit: string, of: string) => exec("git", ["merge-base", "--is-ancestor", commit, of]).ok;
+
+const reviewedCommit = (name: string) => {
+  const ref = exec("git", ["rev-parse", "--verify", "--quiet", `${REVIEW_REFS}/${name}^{commit}`]);
+  return ref.ok ? ref.out : fail(`nothing reviewed for ${name}; run \`node fork-sync.ts review\` first`);
+};
+
+const clearReview = () => {
+  for (const ref of lines(git("for-each-ref", "--format=%(refname)", `${REVIEW_REFS}/`))) git("update-ref", "-d", ref);
+};
+
+/**
+ * Pins upstream main (or an older upstream commit) and every tracked PR head for `--reviewed`, and
+ * prints what they add since the last release. Reads git only, so none of the new code runs.
+ */
+function review(upstreamCommit = "upstream/main") {
+  git("fetch", "--quiet", "upstream", "main");
+  git("fetch", "--quiet", "--prune", "origin");
+  const last = lastBuild();
+  const { base, merges } = buildParts(`${last}^{commit}`);
+  const upstream = git("rev-parse", "--verify", `${upstreamCommit}^{commit}`);
+  if (!isAncestor(upstream, "upstream/main")) fail(`${upstreamCommit} isn't on upstream main`);
+  clearReview();
+  git("update-ref", `${REVIEW_REFS}/upstream`, upstream);
+  const short = (sha: string) => sha.slice(0, 12);
+  console.log(`New code since ${last}, pinned for --reviewed:`);
+  console.log(`- upstream main, ${git("rev-list", "--count", `${base}..${upstream}`)} commits: git log -p ${short(base)}..${short(upstream)}`);
+  for (const entry of listEntries()) {
+    if (entry.pr === undefined) continue;
+    git("fetch", "--quiet", "upstream", `pull/${entry.pr}/head`);
+    const head = git("rev-parse", "FETCH_HEAD");
+    git("update-ref", `${REVIEW_REFS}/pr-${entry.pr}`, head);
+    const released = merges.get(entry.branch);
+    console.log(
+      released && git("rev-parse", `${released}^2`) === head
+        ? `- ${entry.branch}: PR #${entry.pr} is unchanged`
+        : `- ${entry.branch}: PR #${entry.pr}: git diff ${short(upstream)}...${short(head)}`,
+    );
+  }
 }
 
 /** The upstream commit a build starts from and the merge commit of each topic in it. */
@@ -233,10 +294,7 @@ function buildParts(build: string) {
  * patch-id, so rebases don't count). The updater lists the last lines first, so fork changes lead.
  */
 function releaseNotes(entries: Entry[]): string {
-  const latest = exec("gh", ["release", "view", "-R", FORK_REPO, "--json", "tagName", "-q", ".tagName"]);
-  if (latest.ok) git("fetch", "--quiet", "origin", "tag", latest.out);
-  // Before the first release, compare with the last pushed build.
-  const before = buildParts(latest.ok ? `${latest.out}^{commit}` : `origin/${INTEGRATION}`);
+  const before = buildParts(`${lastBuild()}^{commit}`);
   const after = buildParts(INTEGRATION);
   const upstream = lines(git("log", "--reverse", "--first-parent", "--format=- %s", `${before.base}..${after.base}`));
   const fork: string[] = [];
@@ -264,6 +322,14 @@ function releaseNotes(entries: Entry[]): string {
 
 const lines = (output: string) => output.split("\n").filter(Boolean);
 
+/** The latest release's tag; before the first release, the last pushed build. */
+function lastBuild(): string {
+  const latest = exec("gh", ["release", "view", "-R", FORK_REPO, "--json", "tagName", "-q", ".tagName"]);
+  if (!latest.ok) return `origin/${INTEGRATION}`;
+  git("fetch", "--quiet", "origin", "tag", latest.out);
+  return latest.out;
+}
+
 function stripNotes(branch: string, base: string) {
   for (;;) {
     const notes = git("log", "--format=%H", "--fixed-strings", `--grep=${NOTES_SUBJECT}`, `${base}..HEAD`)
@@ -276,12 +342,12 @@ function stripNotes(branch: string, base: string) {
   }
 }
 
-function updateMainCheckout() {
+function updateMainCheckout(upstreamMain: string) {
   const inMain = (...argv: string[]) => exec("git", ["-C", MAIN_CHECKOUT, ...argv]);
   if (inMain("branch", "--show-current").out !== "main") return report.push(`${MAIN_CHECKOUT} isn't on main; left as is`);
   if (inMain("status", "--porcelain", "--untracked-files=no").out) return report.push(`${MAIN_CHECKOUT} has uncommitted changes; main left as is`);
-  if (inMain("merge-base", "--is-ancestor", "upstream/main", "HEAD").ok) return;
-  if (!inMain("rebase", "upstream/main").ok) {
+  if (inMain("merge-base", "--is-ancestor", upstreamMain, "HEAD").ok) return;
+  if (!inMain("rebase", upstreamMain).ok) {
     inMain("rebase", "--abort");
     return report.push(`couldn't rebase ${MAIN_CHECKOUT} main onto upstream; left as is`);
   }
@@ -478,6 +544,7 @@ try {
   if (args[0] === "serve") serve();
   else {
     if (args[0] === "install") install();
+    else if (args[0] === "review") review(args[1]);
     else sync();
     console.log(`\nfork-sync: ok\n${report.map((line) => `- ${line}`).join("\n")}`);
   }

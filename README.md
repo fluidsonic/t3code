@@ -11,7 +11,15 @@
 node fork-sync.ts            # sync, check, push, build, and release on fluidsonic/t3code
 node fork-sync.ts --dry-run  # sync and check only
 node fork-sync.ts install    # install the newest local build now, quitting and reopening the app
+node fork-sync.ts review     # pin upstream main and tracked PR heads; print the new code since the last release
+node fork-sync.ts --reviewed # sync onto exactly what review pinned
 ```
+
+The daily task scans the new code `review` prints for security and privacy problems before it syncs
+with `--reviewed`. Nothing it hasn't read gets installed, run by git hooks or tests, pushed, or built,
+even when upstream moves during an hour-long sync. A severe finding stops the sync and asks Marc.
+`review <upstream commit>` pins an older commit, such as the one before a severe change. A pin serves
+one sync.
 
 Each sync builds a newer `<version>-marc.<UTC minute>` and creates a `fluidsonic/t3code` GitHub release
 with its zip, a dmg, and `latest-mac.yml`, listing the upstream commits and changed fork topics since
