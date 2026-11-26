@@ -1,5 +1,5 @@
 import { userShellCommandFromCodeBlock } from "@t3tools/client-runtime/user-shell-command";
-import { canEditInTerminal } from "@t3tools/shared/projectScripts";
+import { canEditInTerminal, oneTerminalCommand } from "@t3tools/shared/projectScripts";
 import { T, useGT } from "gt-react";
 import { CheckIcon, CopyIcon, EllipsisIcon, PlayIcon, WrapTextIcon } from "lucide-react";
 import { toHtml } from "hast-util-to-html";
@@ -349,9 +349,10 @@ function ShellCommandMenu(props: {
   const gt = useGT();
   const { command, shellActions } = props;
   const [canCopyToTerminal, setCanCopyToTerminal] = useState(false);
-  // A multi-line command would run as it reaches the prompt (see `canEditInTerminal`), and a
-  // control character such as a tab would act there (completion) instead of showing.
-  const typeableInTerminal = canEditInTerminal(command) && !/[\p{Cc}\p{Cf}]/u.test(command);
+  // A control character such as a tab would act on the prompt (completion) instead of showing,
+  // and only a single line can wait there to be edited (see `canEditInTerminal`).
+  const plainInTerminal = !/[\p{Cc}\p{Cf}]/u.test(command.replaceAll("\n", ""));
+  const typeableInTerminal = plainInTerminal && canEditInTerminal(command);
   const copyCommand = () => {
     if (typeof navigator === "undefined" || navigator.clipboard == null) return;
     void navigator.clipboard.writeText(command).catch((cause) => {
@@ -389,8 +390,8 @@ function ShellCommandMenu(props: {
             <T>Edit in terminal</T>
           </MenuItem>
         ) : null}
-        {shellActions.runInTerminal && typeableInTerminal && !command.endsWith("\\") ? (
-          <MenuItem onClick={() => shellActions.runInTerminal?.(command)}>
+        {shellActions.runInTerminal && plainInTerminal && !command.endsWith("\\") ? (
+          <MenuItem onClick={() => shellActions.runInTerminal?.(oneTerminalCommand(command))}>
             <T>Run in terminal</T>
           </MenuItem>
         ) : null}

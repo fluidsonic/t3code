@@ -592,14 +592,16 @@ describe("ChatMarkdown streaming", () => {
     await menuAction("Run in terminal");
     expect(actions.runInTerminal).toHaveBeenLastCalledWith("! grep -q x f && echo missing");
 
-    // A multi-line script would run line by line as it reached a terminal's prompt.
+    // A multi-line script would run line by line as it reached a terminal's prompt: it can't wait
+    // there to be edited, and runs as one group.
     await rerender(message("```sh\ncd web\nnpm run build\n```"));
     await act(async () => runCommandButtons()[0]!.click());
     expect(actions.runCommand).toHaveBeenLastCalledWith("cd web\nnpm run build");
     await userEvent.click(menuButtons(container)[0]!);
     await expect.element(page.getByRole("menuitem", { name: "Copy command" })).toBeVisible();
-    expect(page.getByRole("menuitem", { name: "Run in terminal" }).query()).toBeNull();
-    await userEvent.keyboard("{Escape}");
+    expect(page.getByRole("menuitem", { name: "Edit in terminal" }).query()).toBeNull();
+    await userEvent.click(page.getByRole("menuitem", { name: "Run in terminal" }));
+    expect(actions.runInTerminal).toHaveBeenLastCalledWith("{\ncd web\nnpm run build\n}");
 
     for (const text of [
       "```text\n! npm test\n```",
