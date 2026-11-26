@@ -21,6 +21,9 @@ When an agent below **Full access** opens a PR using T3 Code's built-in pull req
 - Providers that can't show this prompt push without running hooks and inform the agent.
 - Direct shell commands (`git push`, `gh pr create`) follow the provider's normal command approval rules instead.
 
+Permission modes apply to the agent. A [shell command you run yourself](./composer.md#run-a-shell-command)
+with `!` runs as you: it asks for no approval in **Supervised**, and Plan mode doesn't stop it.
+
 ## Provider differences
 
 Providers enforce permissions differently, and some read-only actions proceed even in **Supervised**:
