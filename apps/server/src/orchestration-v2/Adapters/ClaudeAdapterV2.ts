@@ -9835,6 +9835,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly parentNodeId?: OrchestrationV2ExecutionNode["id"];
           readonly requestKind: OrchestrationV2RuntimeRequest["kind"];
           readonly prompt?: string;
+          /** The agent's own description of the call, shown under the command. */
+          readonly title?: string;
           readonly appName?: string;
           readonly pushHooks?: ProviderApprovalPushHooks | undefined;
           readonly options?: ReadonlyArray<ProviderApprovalOption>;
@@ -9919,7 +9921,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             parentItemId: null,
             ordinal,
             status: "waiting",
-            title: null,
+            title: input.title ?? null,
             startedAt: createdAt,
             completedAt: null,
             updatedAt: createdAt,
@@ -13596,12 +13598,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             callbackOptions.description ??
             callbackOptions.decisionReason ??
             summarizeClaudeToolRequest(toolName, nativeToolInput);
+          const inputDescription = inputRecordValue(nativeToolInput, "description");
+          const explanation = [
+            typeof inputDescription === "string" ? inputDescription : undefined,
+            callbackOptions.description,
+          ]
+            .map((text) => text?.trim())
+            .find((text) => text !== undefined && text !== "" && text !== prompt.trim());
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
             nativeRequestId,
             requestKind,
             prompt,
+            ...(explanation === undefined ? {} : { title: explanation }),
             presentation: claudeApprovalPresentation({
               permissionMode: context.queryPolicy.permissionMode,
               prompt,

@@ -1326,7 +1326,10 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
         Stream.runCollect,
         Effect.forkScoped,
       );
-      const command = { command: "node -e 'console.log(42)'" };
+      const command = {
+        command: "node -e 'console.log(42)'",
+        description: "Print the answer with Node",
+      };
       const decision = yield* Effect.promise(() =>
         canUseTool!("Bash", command, {
           signal: new AbortController().signal,
@@ -1348,6 +1351,7 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
         approval?.turnItem.type === "approval_request" ? approval.turnItem.prompt : undefined,
         command.command,
       );
+      assert.equal(approval?.turnItem.title, command.description);
 
       yield* runtime.respondToRuntimeRequest({
         requestId: event!.runtimeRequest.id,

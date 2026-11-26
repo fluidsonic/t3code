@@ -142,7 +142,11 @@ describe("a push hooks approval", () => {
     files: [".husky/pre-push"],
     commands: [{ name: "checks", command: "pnpm run checks" }],
   };
-  const pending = (item: { readonly pushHooks: typeof pushHooks } | { readonly appName: string }) =>
+  const pending = (
+    item:
+      | { readonly pushHooks: typeof pushHooks }
+      | { readonly appName: string; readonly title?: string },
+  ) =>
     derivePendingThreadRequests({
       runtimeRequests: [{ ...projection.runtimeRequests[0]!, kind: "mcp-elicitation" }],
       turnItems: [
@@ -178,8 +182,9 @@ describe("a push hooks approval", () => {
       "Push feature/greeting and run this repository's hook file .husky/pre-push?",
     );
 
-    const other = pending({ appName: "deploys" });
+    const other = pending({ appName: "deploys", title: "Deploy the docs site" });
     expect(other.appName).toBe("deploys");
+    expect(other.explanation).toBe("Deploy the docs site");
     expect(other).not.toHaveProperty("pushHooks");
   });
 
