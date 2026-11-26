@@ -164,7 +164,8 @@ function sync() {
     }
     const parent = parentOf(entry, entries);
     const base = parent?.newTip ?? upstreamMain;
-    git("switch", "--quiet", "--force-create", entry.branch, entry.oldTip);
+    // Detached, since another worktree of this repo may have the topic branch checked out.
+    git("switch", "--quiet", "--detach", entry.oldTip);
     // A stacked topic sits on its parent's previous tip; move only its own commits.
     const oldBase = parent ? git("merge-base", entry.oldTip, parent.oldTip) : undefined;
     const rebase = exec("git", oldBase ? ["rebase", "--onto", base, oldBase] : ["rebase", base], {
