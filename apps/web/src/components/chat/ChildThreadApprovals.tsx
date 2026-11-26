@@ -44,6 +44,9 @@ function ChildApproval({ entry }: { entry: ChildThreadApproval }) {
       ) : (
         <ApprovalText text={approval.detail || approval.requestKind} />
       )}
+      {approval.explanation ? (
+        <p className="mt-2 whitespace-pre-wrap text-muted-foreground">{approval.explanation}</p>
+      ) : null}
       {approval.appName ? <p className="mt-2 text-muted-foreground">{approval.appName}</p> : null}
       {approval.responseCapability !== "live" ? (
         <p className="mt-2 text-warning">

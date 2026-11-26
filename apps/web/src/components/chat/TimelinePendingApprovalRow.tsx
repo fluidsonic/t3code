@@ -85,6 +85,11 @@ export const TimelinePendingApprovalRow = memo(function TimelinePendingApprovalR
     >
       <div className="ms-7.5 flex min-w-0 flex-col gap-1 pb-1 text-xs">
         {pushHooks ? <PushHooksApprovalDetails pushHooks={pushHooks} /> : null}
+        {approval.explanation ? (
+          <span className="whitespace-pre-wrap text-muted-foreground select-text wrap-anywhere">
+            {approval.explanation}
+          </span>
+        ) : null}
         {approval.appName ? (
           <span className="whitespace-pre-wrap text-muted-foreground wrap-anywhere">
             {approval.appName}
