@@ -135,6 +135,7 @@ function projectDesktopNavStatus(
         title: status.title,
         code: status.code,
         description: status.description,
+        ...(status.crashed ? { crashed: true as const } : {}),
       };
     default:
       return { _tag: status.kind, url: status.url, title: status.title };
