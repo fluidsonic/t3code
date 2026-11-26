@@ -78,3 +78,12 @@ export function projectScriptTerminalInput(command: string): string {
 export function canEditInTerminal(command: string): boolean {
   return !/[\r\n]/.test(command);
 }
+
+/**
+ * `command` as one shell input. A terminal runs each line of a multi-line one as it reaches the
+ * prompt, so a later line would be typed into an earlier one's prompt, such as a `[y/N]`; in a
+ * `{ }` group the shell reads every line before it runs any.
+ */
+export function oneTerminalCommand(command: string): string {
+  return canEditInTerminal(command) ? command : `{\n${command}\n}`;
+}
