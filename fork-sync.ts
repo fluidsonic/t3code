@@ -385,7 +385,12 @@ function publish({ app, version }: { app: string; version: string }, notes: stri
   try {
     step("ditto", [app, join(stage, basename(app))]);
     symlinkSync("/Applications", join(stage, "Applications"));
-    step("hdiutil", ["create", "-volname", PRODUCT_NAME, "-srcfolder", stage, "-format", "UDZO", "-ov", dmg]);
+    const createDmg = ["create", "-volname", PRODUCT_NAME, "-srcfolder", stage, "-format", "UDZO", "-ov", dmg];
+    // hdiutil sometimes fails with "Directory not empty" on a fine stage; a second try succeeds.
+    if (spawnSync("hdiutil", createDmg, { cwd: REPO, stdio: "inherit", env }).status !== 0) {
+      rmSync(dmg, { force: true });
+      step("hdiutil", createDmg);
+    }
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
