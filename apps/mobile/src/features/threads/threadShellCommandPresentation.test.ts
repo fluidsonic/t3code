@@ -49,6 +49,7 @@ describe("code block commands", () => {
     expect(markdownMayHaveShellCommand("```fish\n! npm test\n```")).toBe(false);
     expect(markdownMayHaveShellCommand("```ts\nconst x = 1;\n```\nDone!")).toBe(false);
     expect(markdownMayHaveShellCommand("Run `! git push` now.")).toBe(true);
+    expect(markdownMayHaveShellCommand("Run `!git push` now.")).toBe(true);
     expect(markdownMayHaveShellCommand("Unless `!isReady`, wait.")).toBe(false);
   });
 
@@ -84,10 +85,10 @@ describe("code block commands", () => {
   it("links inline `! cmd` spans outside code blocks to their command", () => {
     expect(
       linkInlineShellCommands(
-        "Run `! npm test`, then `! git push origin (main)`, unless `!isReady`.\n\n```\n`! npm test`\n```",
+        "Run `!npm test`, then `! git push origin (main)`, unless `!isReady`.\n\n```\n`! npm test`\n```",
       ),
     ).toBe(
-      "Run [`! npm test`](t3-shell-command://v1/npm%20test), then [`! git push origin (main)`](t3-shell-command://v1/git%20push%20origin%20%28main%29), unless `!isReady`.\n\n```\n`! npm test`\n```",
+      "Run [`!npm test`](t3-shell-command://v1/npm%20test), then [`! git push origin (main)`](t3-shell-command://v1/git%20push%20origin%20%28main%29), unless `!isReady`.\n\n```\n`! npm test`\n```",
     );
     expect(shellCommandFromLink("t3-shell-command://v1/git%20push%20origin%20%28main%29")).toBe(
       "git push origin (main)",

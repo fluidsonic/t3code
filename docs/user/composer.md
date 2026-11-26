@@ -188,10 +188,10 @@ You can also run an agent's finished code block with **Run**, which runs
 it in the thread's workspace and sends the result to the agent, or edit or copy
 it from its **…** menu. In the mobile app, a shell-tagged block, or a `! command` block in a list or quote, runs when you tap it. This works
 for blocks tagged `sh`, `bash`, `zsh` or `shell`, which run as written with your
-shell, and for untagged blocks written as `! command`. In an untagged block with a `!`
+shell (a `!` right before the command, as in `!npm test`, is dropped), and for untagged blocks written as `! command` or `!command`. In an untagged block with a `!`
 on every line (comments aside), each line is its own command with its own **Run**, and **Run all** runs them in order; with a `!` only on the first line, the block is one command. If you stop one, the rest don't run either. Blocks in other languages, and
 blocks that show a prompt such as `$ npm test` with its output, are examples
-and can't be run. An inline `` `! command` `` in the agent's text gets the same **Run** and **…**;
+and can't be run. An inline `` `! command` `` in the agent's text, or `` `!command` `` with arguments such as `` `!npm test` ``, gets the same **Run** and **…**;
 in the mobile app, tap it.
 
 Running commands requires terminal access to the environment; without it, or
