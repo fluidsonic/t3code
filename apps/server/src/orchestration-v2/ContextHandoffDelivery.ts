@@ -19,7 +19,9 @@ const SLASH_COMMAND = /^\s*\/[^\s/]+(?:\s|$)/u;
 export const isSlashCommandMessage = (message: {
   readonly role: string;
   readonly text: string;
-}): boolean => message.role === "user" && SLASH_COMMAND.test(message.text);
+  readonly shellCommand?: boolean | undefined;
+}): boolean =>
+  message.role === "user" && message.shellCommand !== true && SLASH_COMMAND.test(message.text);
 
 /** The provider prompt for a turn that carries inline context ahead of the user's text. */
 export const withInlineContext = (context: string, userText: string): string =>
