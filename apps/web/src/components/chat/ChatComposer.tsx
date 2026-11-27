@@ -17,6 +17,7 @@ import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useRightPanelStore } from "~/rightPanelStore";
 import {
+  markComposerPasteAsPlainText,
   importPastedComposerText,
   type PastedComposerClipboard,
   readPastedComposerClipboard,
@@ -3195,6 +3196,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
     }
     const bypassAutoAttachment = consumePasteAsTextShortcut(pasteAsTextShortcutUntilRef);
+    if (bypassAutoAttachment) markComposerPasteAsPlainText(event.nativeEvent);
     const paste = readClipboard(bypassAutoAttachment);
     const pastedContext = Boolean(paste.context?.records.length);
     const canAttachFiles = !pastedContext && activeThreadId !== null && files.length > 0;
@@ -3507,10 +3509,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         const shortcutArmed = consumePasteAsTextShortcut(pasteAsTextShortcutUntilRef);
         const bypassAutoAttachment = options.bypassAutoAttachment || shortcutArmed;
         if (composerEditorRef.current?.pasteAtCodeBlockEnd(clipboardData)) return true;
-        const paste = readPastedComposerClipboard(
-          clipboardData,
-          bypassAutoAttachment || isLiteralPendingAnswer,
-        );
+        if (bypassAutoAttachment) {
+          const { text } = readPastedComposerClipboard(clipboardData, true);
+          return composerEditorRef.current?.pastePlainTextAtEnd(text) ?? false;
+        }
+        const paste = readPastedComposerClipboard(clipboardData, isLiteralPendingAnswer);
         if (paste.context?.records.length) {
           return insertComposerTextAtEndStable(paste.text, { clipboardPaste: paste });
         }
