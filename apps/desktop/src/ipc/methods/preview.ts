@@ -74,6 +74,9 @@ export const installPreviewEventForwarding = Effect.fn(
   yield* tunnel.subscribeForwards((forwards) =>
     electronWindow.sendAll(IpcChannels.PORT_FORWARD_CHANGE_CHANNEL, forwards),
   );
+  yield* manager.subscribeTabShortcuts((event) =>
+    electronWindow.sendAll(IpcChannels.PREVIEW_TAB_SHORTCUT_CHANNEL, event),
+  );
 });
 
 const setForwardedShortcuts = DesktopIpc.makeIpcMethod({
