@@ -21,6 +21,17 @@ import { readThreadShell } from "~/state/entities";
 
 const threadTitle = (ref: ScopedThreadRef) => readThreadShell(ref)?.title;
 
+const plainTextPasteEvents = new WeakSet<Event>();
+
+// Capture consumes the shortcut before ProseMirror handles the same native paste event.
+export function markComposerPasteAsPlainText(event: Event): void {
+  plainTextPasteEvents.add(event);
+}
+
+export function isComposerPlainTextPaste(event: Event): boolean {
+  return plainTextPasteEvents.has(event);
+}
+
 // Matches ProseMirror's default clipboard parser, which a custom handlePaste bypasses. A leading
 // BOM is not content, and kept it would stop a first-line fence from opening a code block.
 export function readPastedPlainText(clipboardData: Pick<DataTransfer, "getData">): string {
