@@ -67,6 +67,11 @@ import { splitTransferredFiles } from "./workspaceFileDrop";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import {
+  droppedShellPrefixSpaces,
+  selectionAfterDroppedShellPrefixSpaces,
+  withoutSpaceAfterShellPrefix,
+} from "@t3tools/shared/shellCommand";
+import {
   memo,
   use,
   useEffect,
@@ -94,7 +99,10 @@ import {
   extendReplacementRangeForTrailingSpace,
   replaceTextRange,
 } from "../../composer-logic";
-import { DEFAULT_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
+import {
+  DEFAULT_COMPOSER_PLACEHOLDER,
+  SHELL_COMPOSER_PLACEHOLDER,
+} from "../../composerPlaceholder";
 import { deriveComposerSendState, getAntigravitySendBlockReason } from "../ChatView.logic";
 import { threadHasStarted } from "../../lib/chatThreadActions";
 import {
@@ -121,6 +129,7 @@ import {
   useComposerThreadDraft,
 } from "../../composerDraftStore";
 import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../../threadRoutes";
+import { useComposerShellMode } from "./useComposerShellMode";
 import { ComposerStashBadge } from "./ComposerStashBadge";
 import { ComposerStashMenu } from "./ComposerStashMenu";
 import { useComposerTriggerState } from "./useComposerTriggerState";
@@ -267,7 +276,7 @@ import { useManagedPolicy } from "../../state/managedPolicy";
 import { hasProviderSetup } from "./ProviderStatusBanner";
 import { type AppModelOption, getAppModelOptionsForInstance } from "../../modelSelection";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
-import { isVideoAttachment, type SessionPhase, type Thread } from "../../types";
+import { type ChatMessage, isVideoAttachment, type SessionPhase, type Thread } from "../../types";
 import { type ComposerPromptHistoryPosition } from "./composerPromptHistory";
 import { usePendingUserInputDraft } from "./usePendingThreadRequests";
 import type { PendingApproval, PendingUserInput, TimelineEntry } from "../../session-logic";
@@ -317,6 +326,7 @@ import { ComposerControlsBar } from "./ComposerControlsBar";
 import { composerCommandKeyHandler } from "./composerCommandKey";
 import { promptSuggestionToAccept, usePromptSuggestion } from "./usePromptSuggestion";
 import { useFreshSessionArmed } from "./freshSessionArms";
+import { SHELL_COMMAND_TINT } from "./ShellCommandText";
 
 function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
   const armed = Date.now() <= deadline.current;
@@ -326,6 +336,8 @@ function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
 
 export interface ChatComposerHandle {
   focusAtEnd: () => void;
+  /** How Enter would send right now: the person's queue or steer default. */
+  defaultDispatchMode: () => ComposerDispatchMode;
   focusAt: (cursor: number) => void;
   addDroppedFiles: (files: File[]) => void;
   addDroppedFolders: (folders: File[]) => void;
@@ -365,6 +377,8 @@ export interface ChatComposerHandle {
   getSendContext: () => {
     answeringPendingUserInput: boolean;
     prompt: string;
+    /** `prompt` is a `! cmd` shell command. */
+    shellMode: boolean;
     images: ComposerImageAttachment[];
     files: ComposerFileAttachment[];
     terminalContexts: TerminalContextDraft[];
@@ -389,6 +403,11 @@ export interface ChatComposerProps {
   composerDraftTarget: ScopedThreadRef | DraftId;
   environmentId: EnvironmentId;
   canOperateThread: boolean;
+  /**
+   * Why `! cmd` shell commands can't run here (the environment's setting is off or the connection
+   * lacks terminal access), or null when they can; while set, `!` is plain text.
+   */
+  shellCommandsUnavailableReason: string | null;
   attachmentUploadsCapabilityKnown: boolean;
   supportsAttachmentUploads: boolean;
   supportsQuestionAttachments: boolean;
@@ -406,6 +425,8 @@ export interface ChatComposerProps {
   activeThread: Thread | undefined;
   activeThreadRuns: ReadonlyArray<OrchestrationV2Run>;
   promptHistoryEntries: ReadonlyArray<TimelineEntry>;
+  /** Adds the shell commands Stop returned to the composer, which the timeline no longer shows. */
+  withStoppedShellCommands: (messages: ReadonlyArray<ChatMessage>) => ReadonlyArray<ChatMessage>;
   forceExpandedOnMobile: boolean;
   projectSelectionRequired: boolean;
 
@@ -483,6 +504,8 @@ export interface ChatComposerProps {
   removedEditingQueuedAttachments?: ReadonlyArray<QueuedAttachmentContextBinding> | undefined;
   onRemoveEditingQueuedAttachment: (attachmentId: string) => void;
   onRestoreEditingQueuedAttachment?: ((attachment: ContractChatAttachment) => void) | undefined;
+  /** Editing a queued message keeps its kind: a command stays a command, prose stays prose. */
+  editingQueuedShellCommand: boolean;
 
   onCompactContext: () => void;
   onSend: (
@@ -543,6 +566,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerDraftTarget,
     environmentId,
     canOperateThread,
+    shellCommandsUnavailableReason,
     attachmentUploadsCapabilityKnown,
     supportsAttachmentUploads,
     supportsQuestionAttachments,
@@ -557,6 +581,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeThread,
     activeThreadRuns,
     promptHistoryEntries,
+    withStoppedShellCommands,
     forceExpandedOnMobile,
     projectSelectionRequired,
     phase,
@@ -626,6 +651,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     removedEditingQueuedAttachments,
     onRemoveEditingQueuedAttachment,
     onRestoreEditingQueuedAttachment,
+    editingQueuedShellCommand,
   } = props;
   const {
     activePendingProgress: incomingPendingProgress,
@@ -669,6 +695,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const isEditingQueuedMessage = editingQueuedAttachments !== null;
   const applyThreadModelPick = useApplyThreadModelPick();
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
+  const composerEditorRef = useRef<ComposerPromptEditorHandle>(null);
+  const canRunShellCommands = shellCommandsUnavailableReason === null;
+  const shellMode = useComposerShellMode({
+    composerDraftTarget,
+    unavailableReason: shellCommandsUnavailableReason,
+    answeringQuestion: activePendingProgress !== null,
+    editingQueuedShellCommand: isEditingQueuedMessage ? editingQueuedShellCommand : null,
+    promptRef,
+    editorRef: composerEditorRef,
+  });
+  const isShellMode = shellMode.isShellMode;
+  // A shell command, like a literal question answer, is plain text: no menus, chips, or Markdown.
+  const isLiteralPrompt = isLiteralPendingAnswer || isShellMode;
   const composerDraftTargetKeyRef = useRef("");
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed draft target key to a ref read by async handlers
   useLayoutEffect(() => {
@@ -1051,6 +1090,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const sendDisabledReason =
     externalSendDisabledReason ??
+    shellMode.sendBlockedReason ??
     (multipleModelSelections?.length === 0 ? gt("Select at least one model.") : null) ??
     (activePendingProgress
       ? attachmentBlockReason
@@ -1101,18 +1141,20 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const [composerCursor, setComposerCursor] = useState(() => {
     const value = isLiteralPendingAnswer ? (activePendingProgress?.customAnswer ?? prompt) : prompt;
-    return collapseExpandedComposerCursor(value, value.length, isLiteralPendingAnswer);
+    return collapseExpandedComposerCursor(value, value.length, isLiteralPrompt);
   });
   const {
-    trigger: composerTrigger,
+    trigger: composerTriggerState,
     setTrigger: setComposerTrigger,
     followCaret: followComposerCaret,
     resolveTrigger: resolveComposerTrigger,
     dismissTrigger: dismissComposerTrigger,
     resetTrigger: resetComposerTrigger,
   } = useComposerTriggerState(() =>
-    isLiteralPendingAnswer ? null : detectComposerTrigger(prompt, prompt.length),
+    isLiteralPrompt ? null : detectComposerTrigger(prompt, prompt.length),
   );
+  // The editor reports a trigger before a pasted `!` flips the mode; a command never opens a menu.
+  const composerTrigger = isShellMode ? null : composerTriggerState;
   const [composerHighlightedItemId, setComposerHighlightedItemId] = useState<string | null>(null);
   const composerSuggestionId = useId();
   const composerSuggestionListId = `${composerSuggestionId}-${encodeURIComponent(draftId ?? activeThreadId ?? "new")}-suggestions`;
@@ -1146,7 +1188,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     !hasMultilinePrompt &&
     pendingUserInputs.length === 0;
 
-  const composerEditorRef = useRef<ComposerPromptEditorHandle>(null);
   const pasteAsTextShortcutUntilRef = useRef(0);
   const composerFormRef = useRef<HTMLFormElement>(null);
   const composerAttachInputRef = useRef<HTMLInputElement>(null);
@@ -1226,6 +1267,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerReviewComments.length +
       composerThreadContexts.length +
       composerEnvironmentContexts.length,
+    ...(isShellMode ? { shellCommand: true } : {}),
   });
   const composerTriggerKind = composerTrigger?.kind ?? null;
   const compactSlashCommandAvailable =
@@ -1315,7 +1357,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       return;
     }
     promptRef.current = nextPrompt;
-    setComposerDraftPrompt(composerDraftTarget, nextPrompt);
+    if (shellMode.active) {
+      setComposerDraftPrompt(composerDraftTarget, nextPrompt, {
+        shellCommandsAvailable: shellMode.canEnterShellMode,
+      });
+    } else {
+      setComposerDraftPrompt(composerDraftTarget, nextPrompt);
+    }
     const nextCursor = collapseExpandedComposerCursor(nextPrompt, nextPrompt.length);
     setComposerCursor(nextCursor);
     setComposerTrigger(detectComposerTrigger(nextPrompt, nextPrompt.length));
@@ -1376,8 +1424,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
 
-  const setPrompt = (nextPrompt: string) => {
-    setComposerDraftPrompt(composerDraftTarget, nextPrompt);
+  const setPrompt = (nextPrompt: string, options?: { readonly shellMode?: boolean }) => {
+    if (!shellMode.active) {
+      setComposerDraftPrompt(composerDraftTarget, nextPrompt);
+      return;
+    }
+    setComposerDraftPrompt(composerDraftTarget, nextPrompt, {
+      ...options,
+      shellCommandsAvailable: shellMode.canEnterShellMode,
+    });
   };
 
   const addComposerImage = (image: ComposerImageAttachment) =>
@@ -1530,13 +1585,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (isLiteralPendingAnswer) return;
     promptRef.current = prompt;
   }, [isLiteralPendingAnswer, prompt, promptRef]);
-  const [cursorClampedFor, setCursorClampedFor] = useState({ prompt, isLiteralPendingAnswer });
-  if (
-    cursorClampedFor.prompt !== prompt ||
-    cursorClampedFor.isLiteralPendingAnswer !== isLiteralPendingAnswer
-  ) {
-    setCursorClampedFor({ prompt, isLiteralPendingAnswer });
-    if (!isLiteralPendingAnswer) {
+  const [cursorClampedFor, setCursorClampedFor] = useState({ prompt, isLiteralPrompt });
+  if (cursorClampedFor.prompt !== prompt || cursorClampedFor.isLiteralPrompt !== isLiteralPrompt) {
+    setCursorClampedFor({ prompt, isLiteralPrompt });
+    if (!isLiteralPrompt) {
       setComposerCursor((existing) => clampCollapsedComposerCursor(prompt, existing));
     }
   }
@@ -1648,7 +1700,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const pendingAnswer = activePendingProgress?.customAnswer;
     const { cursor, trigger } = composerStateAtPromptEnd(
       typeof pendingAnswer === "string" ? pendingAnswer : prompt,
-      isLiteralPendingAnswer,
+      isLiteralPrompt,
     );
     setComposerCursor(cursor);
     resetComposerTrigger(trigger);
@@ -1729,6 +1781,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     contextIds: string[],
     textChanged: boolean,
     fromHistory = false,
+    restoredShellCommand?: boolean,
   ) => {
     refreshWorkspaceSnapshotOnTyping();
     const trigger = cursorAdjacentToMention
@@ -1750,7 +1803,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     onTypingGuardDraftChange();
     promptRef.current = nextPrompt;
-    setPrompt(nextPrompt);
+    setPrompt(
+      nextPrompt,
+      restoredShellCommand === undefined ? undefined : { shellMode: restoredShellCommand },
+    );
     if (promptHistoryPositionRef.current?.position.recalled !== nextPrompt) {
       promptHistoryPositionRef.current = null;
     }
@@ -1907,47 +1963,105 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ) {
       return false;
     }
-    const next = replaceTextRange(promptRef.current, rangeStart, rangeEnd, replacement);
-    const nextCursor = collapseExpandedComposerCursor(
-      next.text,
-      options?.expandedCursorAfterReplace ?? next.cursor,
-      isLiteralPendingAnswer,
-    );
-    const nextExpandedCursor = expandCollapsedComposerCursor(
-      next.text,
-      nextCursor,
-      isLiteralPendingAnswer,
-    );
+    if (!shellMode.active) {
+      const next = replaceTextRange(promptRef.current, rangeStart, rangeEnd, replacement);
+      const nextCursor = collapseExpandedComposerCursor(
+        next.text,
+        options?.expandedCursorAfterReplace ?? next.cursor,
+        isLiteralPendingAnswer,
+      );
+      const nextExpandedCursor = expandCollapsedComposerCursor(
+        next.text,
+        nextCursor,
+        isLiteralPendingAnswer,
+      );
+      if (options?.citationComment) {
+        composerEditorRef.current?.requestCitationComment({
+          previousValue: currentText,
+          value: next.text,
+          citationStart: options.citationComment.start,
+          sourceAnchor: options.citationComment.sourceAnchor,
+          insertedSpaces: options.citationComment.insertedSpaces,
+        });
+      }
+      promptRef.current = next.text;
+      const activePendingQuestion = activePendingProgress?.activeQuestion;
+      if (activePendingQuestion && activePendingUserInput) {
+        onChangeActivePendingUserInputCustomAnswer(
+          activePendingQuestion.id,
+          next.text,
+          nextCursor,
+          nextExpandedCursor,
+          isLiteralPendingAnswer,
+        );
+      } else {
+        setPrompt(next.text);
+        onTypingGuardDraftChange();
+      }
+      setComposerCursor(nextCursor);
+      setComposerTrigger(
+        isLiteralPendingAnswer ? null : detectComposerTrigger(next.text, nextExpandedCursor),
+      );
+      if (options?.focusEditorAfterReplace !== false) {
+        window.requestAnimationFrame(() => {
+          if (promptRef.current !== next.text) return;
+          composerEditorRef.current?.focusAt(nextCursor);
+        });
+      }
+      return true;
+    }
+    const replaced = replaceTextRange(promptRef.current, rangeStart, rangeEnd, replacement);
     if (options?.citationComment) {
       composerEditorRef.current?.requestCitationComment({
         previousValue: currentText,
-        value: next.text,
+        value: replaced.text,
         citationStart: options.citationComment.start,
         sourceAnchor: options.citationComment.sourceAnchor,
         insertedSpaces: options.citationComment.insertedSpaces,
       });
     }
-    promptRef.current = next.text;
     const activePendingQuestion = activePendingProgress?.activeQuestion;
-    if (activePendingQuestion && activePendingUserInput) {
+    const pendingAnswer =
+      activePendingQuestion && activePendingUserInput ? activePendingQuestion : null;
+    if (pendingAnswer === null) setPrompt(replaced.text);
+    // A replacement that makes the prompt a command loses the spaces after its `!`, which the
+    // editor draws instead; the caret follows the text the draft kept.
+    const dropped =
+      pendingAnswer === null
+        ? droppedShellPrefixSpaces({
+            typedText: replaced.text,
+            storedText: getComposerDraft(composerDraftTarget)?.prompt ?? replaced.text,
+          })
+        : 0;
+    const nextText = dropped > 0 ? withoutSpaceAfterShellPrefix(replaced.text) : replaced.text;
+    const literal = isLiteralPrompt || dropped > 0;
+    const replacedCursor = options?.expandedCursorAfterReplace ?? replaced.cursor;
+    const nextCursor = collapseExpandedComposerCursor(
+      nextText,
+      selectionAfterDroppedShellPrefixSpaces(
+        { start: replacedCursor, end: replacedCursor },
+        dropped,
+      ).start,
+      literal,
+    );
+    const nextExpandedCursor = expandCollapsedComposerCursor(nextText, nextCursor, literal);
+    promptRef.current = nextText;
+    if (pendingAnswer === null) {
+      onTypingGuardDraftChange();
+    } else {
       onChangeActivePendingUserInputCustomAnswer(
-        activePendingQuestion.id,
-        next.text,
+        pendingAnswer.id,
+        nextText,
         nextCursor,
         nextExpandedCursor,
         isLiteralPendingAnswer,
       );
-    } else {
-      setPrompt(next.text);
-      onTypingGuardDraftChange();
     }
     setComposerCursor(nextCursor);
-    setComposerTrigger(
-      isLiteralPendingAnswer ? null : detectComposerTrigger(next.text, nextExpandedCursor),
-    );
+    setComposerTrigger(literal ? null : detectComposerTrigger(nextText, nextExpandedCursor));
     if (options?.focusEditorAfterReplace !== false) {
       window.requestAnimationFrame(() => {
-        if (promptRef.current !== next.text) return;
+        if (promptRef.current !== nextText) return;
         composerEditorRef.current?.focusAt(nextCursor);
       });
     }
@@ -1971,9 +2085,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       expandedCursor: expandCollapsedComposerCursor(
         promptRef.current,
         composerCursor,
-        isLiteralPendingAnswer,
+        isLiteralPrompt,
       ),
-      contextIds: isLiteralPendingAnswer ? [] : collectInlineContextIds(promptRef.current),
+      contextIds: isLiteralPrompt ? [] : collectInlineContextIds(promptRef.current),
     };
   };
   const readComposerSnapshotStable = useStableCallback(readComposerSnapshot);
@@ -2074,7 +2188,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const snapshot = readComposerSnapshot();
     return {
       snapshot,
-      trigger: isLiteralPendingAnswer
+      trigger: isLiteralPrompt
         ? null
         : resolveComposerTrigger(detectComposerTrigger(snapshot.value, snapshot.expandedCursor)),
     };
@@ -2573,6 +2687,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const freshSessionArmed = useFreshSessionArmed(scopedThreadKey(routeThreadRef));
   // Offered only where the default placeholder would show, so it never hides a pending question.
   const offeredPromptSuggestion =
+    !isShellMode &&
     phase !== "running" &&
     !isSendBusy &&
     !freshSessionArmed &&
@@ -2599,9 +2714,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       canSteer,
       followUpBehavior,
       isSoftwareKeyboardOpen,
-      isLiteralPendingAnswer,
+      isLiteralPendingAnswer: isLiteralPrompt,
       pendingUserInputs,
+      shellCommandsAvailable: shellMode.canEnterShellMode,
+      shellModeActive: shellMode.active,
       promptHistoryEntries,
+      withStoppedShellCommands,
       promptHistoryPositionRef,
       composerDraftTarget,
       promptRef,
@@ -2935,7 +3053,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       activePendingIsResponding,
       pendingUserInputs,
       supportsQuestionAttachments,
-      isLiteralPendingAnswer,
+      isLiteralPendingAnswer: isLiteralPrompt,
+      isShellMode,
       projectSelectionRequired,
       questionAttachmentTarget,
       attachmentTargetKey,
@@ -2954,7 +3073,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       insertAttachmentReferences,
     });
 
-  const onComposerCommandKeyStable = useStableCallback(onComposerCommandKey);
+  const onComposerKey = shellMode.active
+    ? (key: string, event: KeyboardEvent, isTaskItem?: boolean) =>
+        shellMode.leaveOnBackspace(key, event) || onComposerCommandKey(key, event, isTaskItem)
+    : onComposerCommandKey;
+  const onComposerCommandKeyStable = useStableCallback(onComposerKey);
   const isPathQueryActiveStable = useStableCallback(
     () => resolveActiveComposerTrigger().trigger?.kind === "path",
   );
@@ -3046,6 +3169,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   ) => {
     const { files, folders } = splitTransferredFiles(event.clipboardData);
     const plainText = event.clipboardData.getData("text/plain");
+    if (shellMode.active) {
+      if (isShellMode) {
+        // Commands take no attachments; text pastes literally, however long.
+        if (plainText.length === 0) {
+          event.preventDefault();
+          if (files.length > 0 || folders.length > 0) {
+            toastManager.add({
+              type: "info",
+              title: resolveMessage(msg("Commands can't include attachments.")),
+            });
+          }
+        }
+        return;
+      }
+      const commandPaste = shellMode.commandPasteRange(plainText);
+      if (commandPaste !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        applyPromptReplacement(commandPaste.start, commandPaste.end, plainText);
+        return;
+      }
+    }
     const bypassAutoAttachment = consumePasteAsTextShortcut(pasteAsTextShortcutUntilRef);
     const paste = readClipboard(bypassAutoAttachment);
     const pastedContext = Boolean(paste.context?.records.length);
@@ -3334,6 +3479,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       focusAtEnd: () => {
         composerEditorRef.current?.focusAtEnd();
       },
+      defaultDispatchMode: () =>
+        resolveComposerDispatchMode({
+          running: phase === "running",
+          alternateModifier: false,
+          activeTurnDefault: followUpBehavior,
+          canSteer,
+        }),
       focusAt: (cursor: number) => {
         composerEditorRef.current?.focusAt(cursor);
       },
@@ -3461,12 +3613,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         const cursor = clampCollapsedComposerCursor(
           promptForState,
           options?.cursor ?? 0,
-          isLiteralPendingAnswer,
+          isLiteralPrompt,
         );
         setComposerHighlightedItemId(null);
         setComposerCursor(cursor);
         resetComposerTrigger(
-          options?.detectTrigger && !isLiteralPendingAnswer
+          options?.detectTrigger && !isLiteralPrompt
             ? detectComposerTrigger(
                 promptForState,
                 expandCollapsedComposerCursor(promptForState, cursor),
@@ -3488,6 +3640,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           });
           return;
         }
+        if (isShellMode) return;
         const snapshot = readComposerSnapshotStable();
         const context = {
           id: randomUUID(),
@@ -3524,6 +3677,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           .map((approval) => approval.requestId)
           .filter((requestId) => !heldRequestIds.has(requestId)),
         prompt: promptRef.current,
+        shellMode: isShellMode,
         images: composerImagesRef.current,
         files: composerFilesRef.current,
         terminalContexts: composerTerminalContextsRef.current,
@@ -3591,6 +3745,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       environmentId,
       primaryEnvironmentId,
       isLiteralPendingAnswer,
+      isLiteralPrompt,
+      isShellMode,
+      phase,
+      followUpBehavior,
+      canSteer,
       pendingUserInputs.length,
       projectSelectionRequired,
       speechInput.freezesEditor,
@@ -3773,7 +3932,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         <ComposerSurface.Main
           ref={composerMainSurfaceRef}
           data-inline-resting-controls="true"
-          className={composerProviderState.composerFrameClassName}
+          className={
+            isShellMode ? SHELL_COMMAND_TINT : composerProviderState.composerFrameClassName
+          }
         >
           <div
             ref={composerSurfaceRef}
@@ -3784,7 +3945,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               "in-data-[thread-context-over]:bg-accent/45 in-data-[thread-context-over]:ring-1 in-data-[thread-context-over]:ring-inset in-data-[thread-context-over]:ring-primary/70",
               isDragOverComposer ? "bg-accent/45 ring-1 ring-inset ring-primary/70" : null,
               projectSelectionRequired ? "opacity-75" : null,
-              composerProviderState.composerSurfaceClassName,
+              isShellMode ? null : composerProviderState.composerSurfaceClassName,
             )}
           >
             {showCollapsedMobilePromptRow ? (
@@ -3954,6 +4115,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onPreviewFileIdChange={setPreviewFileId}
                   />
                 ) : null}
+                {/* Screen readers only hear changes to it, so the mode is read out as it flips. */}
+                {shellMode.active ? (
+                  <div role="status" className="sr-only">
+                    {isShellMode ? <T>Shell mode</T> : <T>Message mode</T>}
+                  </div>
+                ) : null}
                 <ComposerContextActionsContext value={composerContextActions}>
                   <ComposerPromptEditor
                     draftKey={composerDraftTargetKey}
@@ -3974,7 +4141,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     }
                     editorRef={composerEditorRef}
                     richTextEnabled={settings.composerRichTextEnabled}
-                    literalText={isLiteralPendingAnswer}
+                    literalText={isLiteralPrompt}
+                    shellFeatureActive={shellMode.active}
+                    shellCommand={isShellMode}
                     isPathQueryActive={isPathQueryActiveStable}
                     value={activePendingProgress ? activePendingProgress.customAnswer : prompt}
                     cursor={composerCursor}
@@ -3982,7 +4151,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     buildContextClipboardFragment={buildContextClipboardFragmentStable}
                     importContextFragment={importContextFragmentStable}
                     skills={selectedProviderSkills}
-                    className={cn(showMobilePendingAnswerActions && "max-sm:pb-12")}
+                    className={cn(
+                      isShellMode && "font-mono",
+                      showMobilePendingAnswerActions && "max-sm:pb-12",
+                    )}
+                    placeholderClassName={cn(isShellMode && "font-mono")}
                     onChange={onPromptChangeStable}
                     onCommandKeyDown={onComposerCommandKeyStable}
                     onPageScrollKeyDown={onPageScrollKeyDown}
@@ -3992,23 +4165,30 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onCitationDraftSave={saveCitationDraftToPromptStable}
                     onPaste={onComposerPasteStable}
                     placeholder={
-                      isComposerApprovalState
-                        ? activePendingApproval?.supportsFeedback
-                          ? gt("Send feedback to decline this request")
-                          : gt("Send a message to decline and redirect the agent")
-                        : activePendingProgress
-                          ? isChoiceOnlyPendingQuestion
-                            ? gt("Choose an option above")
-                            : activePendingProgress.activeQuestion?.options.length === 0
-                              ? gt("Type your answer")
-                              : gt(
-                                  "Type your own answer, or leave this blank to use the selected option",
-                                )
-                          : projectSelectionRequired
-                            ? gt("Choose a project above to start a thread")
-                            : showProviderUnavailable
-                              ? gt("Enable a provider in Settings to send a message")
-                              : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
+                      isShellMode
+                        ? gt("Run in shell…")
+                        : isComposerApprovalState
+                          ? activePendingApproval?.supportsFeedback
+                            ? gt("Send feedback to decline this request")
+                            : gt("Send a message to decline and redirect the agent")
+                          : activePendingProgress
+                            ? isChoiceOnlyPendingQuestion
+                              ? gt("Choose an option above")
+                              : activePendingProgress.activeQuestion?.options.length === 0
+                                ? gt("Type your answer")
+                                : gt(
+                                    "Type your own answer, or leave this blank to use the selected option",
+                                  )
+                            : projectSelectionRequired
+                              ? gt("Choose a project above to start a thread")
+                              : showProviderUnavailable
+                                ? gt("Enable a provider in Settings to send a message")
+                                : (offeredPromptSuggestion ??
+                                  m(
+                                    canRunShellCommands
+                                      ? SHELL_COMPOSER_PLACEHOLDER
+                                      : DEFAULT_COMPOSER_PLACEHOLDER,
+                                  ))
                     }
                     placeholderSuffix={
                       offeredPromptSuggestion !== null ? (
@@ -4067,6 +4247,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             <ComposerPromptLengthValidation
               message={providerInputSubmissionError ?? composerSubmissionError}
             />
+            {shellMode.sendBlockedReason === null ? null : (
+              <p
+                className="px-3 pb-2 text-xs text-muted-foreground sm:px-4"
+                data-chat-composer-shell-unavailable="true"
+              >
+                {shellMode.sendBlockedReason}
+              </p>
+            )}
 
             {speechInput.preview ? (
               // column-reverse pins the scroll to the bottom; the single inner div keeps the text in normal order.

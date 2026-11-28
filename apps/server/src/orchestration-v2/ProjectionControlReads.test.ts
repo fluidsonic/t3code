@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   EventId,
@@ -32,6 +33,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import * as ServerConfig from "../config.ts";
 
 const threadId = ThreadId.make("thread:control-reads");
 const providerThreadId = ProviderThreadId.make("provider-thread:control-reads");
@@ -400,6 +402,11 @@ it.effect.each(storageCases)(
           Layer.merge(ProviderTurnControlService.layer, RuntimeRequestService.layer).pipe(
             Layer.provide(
               Layer.mergeAll(layerSessions, layerEvents, McpAppModelContext.layerEmpty),
+            ),
+            Layer.provide(
+              ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-reads-" }).pipe(
+                Layer.provide(NodeServices.layer),
+              ),
             ),
           ),
         ),
